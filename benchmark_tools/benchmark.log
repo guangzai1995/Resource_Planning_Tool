@@ -1,0 +1,122 @@
+开始性能测试...
+None of PyTorch, TensorFlow >= 2.0, or Flax have been found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+2025-08-28 13:43:05,135 - __main__ - INFO - Namespace(backend='openai', host='0.0.0.0', port=8080, url='', app_code=None, tokenizer='/work/project/Resource_Planning_Tool/model/Qwen2___5-0___5B-Instruct', best_of=1, use_beam_search=False, request_rate=inf, epochs=2, parallel_num=[8, 4, 25], output_tokens=[500, 128], prompt_tokens=[2048, 3000], benchmark_csv='benchmark_parallel_20250828_134303.csv', seed=0, served_model_name='qwen', num_scheduler_steps=1, enable_prefix_caching=True, prefix_caching_num=1024, use_spec_decode=False, num_speculative_tokens=-1, dataset_type='random', dataset_path='', use_real_dataset_output_tokens=False, api_key='123456')
+2025-08-28 13:43:11,443 - __main__ - INFO - Warmup ...
+Running benchmark with args: Namespace(backend='openai', host='0.0.0.0', port=8080, url='', app_code=None, tokenizer='/work/project/Resource_Planning_Tool/model/Qwen2___5-0___5B-Instruct', best_of=1, use_beam_search=False, request_rate=inf, epochs=2, parallel_num=[8, 4, 25], output_tokens=[500, 128], prompt_tokens=[2048, 3000], benchmark_csv='benchmark_parallel_20250828_134303.csv', seed=0, served_model_name='qwen', num_scheduler_steps=1, enable_prefix_caching=True, prefix_caching_num=1024, use_spec_decode=False, num_speculative_tokens=-1, dataset_type='random', dataset_path='', use_real_dataset_output_tokens=False, api_key='123456')
+theory_return_num: 501, return_num: 500, allowed range: [500, 501]
+
+epoch:   0%|          | 0/1 [00:00<?, ?it/s]
+epoch: 100%|██████████| 1/1 [00:05<00:00,  5.62s/it]
+epoch: 100%|██████████| 1/1 [00:05<00:00,  5.62s/it]
+2025-08-28 13:43:17,106 - __main__ - INFO - Benchmark running with parallel_num: 8, prompt_tokens: 2048, output_tokens: 500
+
+epoch:   0%|          | 0/2 [00:00<?, ?it/s]
+epoch:  50%|█████     | 1/2 [00:06<00:06,  6.27s/it]
+epoch: 100%|██████████| 2/2 [00:12<00:00,  6.07s/it]
+epoch: 100%|██████████| 2/2 [00:12<00:00,  6.10s/it]
+2025-08-28 13:43:29,821 - benchmark_utils - INFO - 所有请求耗时: 12.1996 s
+2025-08-28 13:43:29,821 - benchmark_utils - INFO - 请求吞吐: 1.3115 requests/s
+2025-08-28 13:43:29,821 - benchmark_utils - INFO - 输出tokens总吞吐: 655.7607 tokens/s
+2025-08-28 13:43:29,821 - benchmark_utils - INFO - 首tokens时延TP90: 372.9759 ms
+2025-08-28 13:43:29,822 - benchmark_utils - INFO - 首tokens时延TP99: 401.5718 ms
+2025-08-28 13:43:29,822 - benchmark_utils - INFO - 最大首tokens时延: 401.6155 ms
+2025-08-28 13:43:29,822 - benchmark_utils - INFO - 平均首tokens时延: 185.6135 ms
+2025-08-28 13:43:29,833 - benchmark_utils - INFO - 增量时延TP90: 17.0348 ms
+2025-08-28 13:43:29,834 - benchmark_utils - INFO - 增量时延TP99: 21.7538 ms
+2025-08-28 13:43:29,835 - benchmark_utils - INFO - 最大增量时延: 24.4 ms
+2025-08-28 13:43:29,835 - benchmark_utils - INFO - 平均增量时延: 11.7 ms
+2025-08-28 13:43:39,845 - __main__ - INFO - Benchmark running with parallel_num: 8, prompt_tokens: 3000, output_tokens: 128
+
+epoch:   0%|          | 0/2 [00:00<?, ?it/s]
+epoch:  50%|█████     | 1/2 [00:02<00:02,  2.34s/it]
+epoch: 100%|██████████| 2/2 [00:03<00:00,  1.79s/it]
+epoch: 100%|██████████| 2/2 [00:03<00:00,  1.87s/it]
+2025-08-28 13:43:44,350 - benchmark_utils - INFO - 所有请求耗时: 3.7447 s
+2025-08-28 13:43:44,350 - benchmark_utils - INFO - 请求吞吐: 4.2727 requests/s
+2025-08-28 13:43:44,350 - benchmark_utils - INFO - 输出tokens总吞吐: 546.9060 tokens/s
+2025-08-28 13:43:44,351 - benchmark_utils - INFO - 首tokens时延TP90: 877.4877 ms
+2025-08-28 13:43:44,351 - benchmark_utils - INFO - 首tokens时延TP99: 992.6964 ms
+2025-08-28 13:43:44,351 - benchmark_utils - INFO - 最大首tokens时延: 1004.6543 ms
+2025-08-28 13:43:44,351 - benchmark_utils - INFO - 平均首tokens时延: 391.6720 ms
+2025-08-28 13:43:44,354 - benchmark_utils - INFO - 增量时延TP90: 13.3604 ms
+2025-08-28 13:43:44,354 - benchmark_utils - INFO - 增量时延TP99: 16.6951 ms
+2025-08-28 13:43:44,354 - benchmark_utils - INFO - 最大增量时延: 19.6 ms
+2025-08-28 13:43:44,354 - benchmark_utils - INFO - 平均增量时延: 10.4 ms
+2025-08-28 13:43:54,359 - __main__ - INFO - Benchmark running with parallel_num: 4, prompt_tokens: 2048, output_tokens: 500
+
+epoch:   0%|          | 0/2 [00:00<?, ?it/s]
+epoch:  50%|█████     | 1/2 [00:05<00:05,  5.63s/it]
+epoch: 100%|██████████| 2/2 [00:10<00:00,  5.30s/it]
+epoch: 100%|██████████| 2/2 [00:10<00:00,  5.35s/it]
+2025-08-28 13:44:05,349 - benchmark_utils - INFO - 所有请求耗时: 10.7070 s
+2025-08-28 13:44:05,350 - benchmark_utils - INFO - 请求吞吐: 0.7472 requests/s
+2025-08-28 13:44:05,350 - benchmark_utils - INFO - 输出tokens总吞吐: 373.5887 tokens/s
+2025-08-28 13:44:05,350 - benchmark_utils - INFO - 首tokens时延TP90: 465.2954 ms
+2025-08-28 13:44:05,350 - benchmark_utils - INFO - 首tokens时延TP99: 465.7276 ms
+2025-08-28 13:44:05,350 - benchmark_utils - INFO - 最大首tokens时延: 465.7756 ms
+2025-08-28 13:44:05,350 - benchmark_utils - INFO - 平均首tokens时延: 236.3740 ms
+2025-08-28 13:44:05,354 - benchmark_utils - INFO - 增量时延TP90: 14.2837 ms
+2025-08-28 13:44:05,354 - benchmark_utils - INFO - 增量时延TP99: 17.5811 ms
+2025-08-28 13:44:05,355 - benchmark_utils - INFO - 最大增量时延: 19.6 ms
+2025-08-28 13:44:05,355 - benchmark_utils - INFO - 平均增量时延: 10.2 ms
+2025-08-28 13:44:15,365 - __main__ - INFO - Benchmark running with parallel_num: 4, prompt_tokens: 3000, output_tokens: 128
+
+epoch:   0%|          | 0/2 [00:00<?, ?it/s]
+epoch:  50%|█████     | 1/2 [00:01<00:01,  1.76s/it]
+epoch: 100%|██████████| 2/2 [00:03<00:00,  1.49s/it]
+epoch: 100%|██████████| 2/2 [00:03<00:00,  1.53s/it]
+2025-08-28 13:44:18,798 - benchmark_utils - INFO - 所有请求耗时: 3.0655 s
+2025-08-28 13:44:18,798 - benchmark_utils - INFO - 请求吞吐: 2.6097 requests/s
+2025-08-28 13:44:18,798 - benchmark_utils - INFO - 输出tokens总吞吐: 334.0444 tokens/s
+2025-08-28 13:44:18,799 - benchmark_utils - INFO - 首tokens时延TP90: 396.0354 ms
+2025-08-28 13:44:18,799 - benchmark_utils - INFO - 首tokens时延TP99: 441.0325 ms
+2025-08-28 13:44:18,799 - benchmark_utils - INFO - 最大首tokens时延: 446.0322 ms
+2025-08-28 13:44:18,799 - benchmark_utils - INFO - 平均首tokens时延: 196.0392 ms
+2025-08-28 13:44:18,800 - benchmark_utils - INFO - 增量时延TP90: 12.8081 ms
+2025-08-28 13:44:18,800 - benchmark_utils - INFO - 增量时延TP99: 16.9690 ms
+2025-08-28 13:44:18,800 - benchmark_utils - INFO - 最大增量时延: 18.3 ms
+2025-08-28 13:44:18,800 - benchmark_utils - INFO - 平均增量时延: 10.1 ms
+2025-08-28 13:44:28,809 - __main__ - INFO - Benchmark running with parallel_num: 25, prompt_tokens: 2048, output_tokens: 500
+
+epoch:   0%|          | 0/2 [00:00<?, ?it/s]
+epoch:  50%|█████     | 1/2 [00:08<00:08,  8.51s/it]
+epoch: 100%|██████████| 2/2 [00:18<00:00,  9.66s/it]
+epoch: 100%|██████████| 2/2 [00:18<00:00,  9.49s/it]
+2025-08-28 13:44:49,420 - benchmark_utils - INFO - 所有请求耗时: 18.9776 s
+2025-08-28 13:44:49,420 - benchmark_utils - INFO - 请求吞吐: 2.6347 requests/s
+2025-08-28 13:44:49,420 - benchmark_utils - INFO - 输出tokens总吞吐: 1317.3404 tokens/s
+2025-08-28 13:44:49,420 - benchmark_utils - INFO - 首tokens时延TP90: 943.3288 ms
+2025-08-28 13:44:49,421 - benchmark_utils - INFO - 首tokens时延TP99: 1141.8502 ms
+2025-08-28 13:44:49,421 - benchmark_utils - INFO - 最大首tokens时延: 1154.2946 ms
+2025-08-28 13:44:49,421 - benchmark_utils - INFO - 平均首tokens时延: 401.1798 ms
+2025-08-28 13:44:49,530 - benchmark_utils - INFO - 增量时延TP90: 25.8970 ms
+2025-08-28 13:44:49,532 - benchmark_utils - INFO - 增量时延TP99: 35.8898 ms
+2025-08-28 13:44:49,533 - benchmark_utils - INFO - 最大增量时延: 58.4 ms
+2025-08-28 13:44:49,534 - benchmark_utils - INFO - 平均增量时延: 17.7 ms
+2025-08-28 13:44:59,543 - __main__ - INFO - Benchmark running with parallel_num: 25, prompt_tokens: 3000, output_tokens: 128
+
+epoch:   0%|          | 0/2 [00:00<?, ?it/s]
+epoch:  50%|█████     | 1/2 [00:05<00:05,  5.61s/it]
+epoch: 100%|██████████| 2/2 [00:08<00:00,  4.08s/it]
+epoch: 100%|██████████| 2/2 [00:08<00:00,  4.31s/it]
+2025-08-28 13:45:12,196 - benchmark_utils - INFO - 所有请求耗时: 8.6152 s
+2025-08-28 13:45:12,196 - benchmark_utils - INFO - 请求吞吐: 5.8037 requests/s
+2025-08-28 13:45:12,196 - benchmark_utils - INFO - 输出tokens总吞吐: 742.8713 tokens/s
+2025-08-28 13:45:12,196 - benchmark_utils - INFO - 首tokens时延TP90: 2404.9312 ms
+2025-08-28 13:45:12,197 - benchmark_utils - INFO - 首tokens时延TP99: 2975.6171 ms
+2025-08-28 13:45:12,197 - benchmark_utils - INFO - 最大首tokens时延: 3010.9087 ms
+2025-08-28 13:45:12,197 - benchmark_utils - INFO - 平均首tokens时延: 896.5940 ms
+2025-08-28 13:45:12,224 - benchmark_utils - INFO - 增量时延TP90: 25.4364 ms
+2025-08-28 13:45:12,225 - benchmark_utils - INFO - 增量时延TP99: 37.2740 ms
+2025-08-28 13:45:12,225 - benchmark_utils - INFO - 最大增量时延: 52.3 ms
+2025-08-28 13:45:12,226 - benchmark_utils - INFO - 平均增量时延: 20.8 ms
+2025-08-28 13:45:22,236 - benchmark_utils - INFO - ['输入长度', '输出长度', '并发数', '输出tokens总吞吐', '首tokens时延TP90（ms）', '首tokens时延TP99（ms）', '最大首tokens时延（ms）', '平均首tokens时延（ms）', '增量时延TP90（ms）', '增量时延TP99（ms）', '最大增量时延（ms）', '平均增量时延（ms）']
+2025-08-28 13:45:22,246 - benchmark_utils - INFO - [2048.0, 500.0, 4, 373.5887, 465.2954, 465.7276, 465.7756, 236.374, 14.2837, 17.5811, 19.6368, 10.2058]
+2025-08-28 13:45:22,246 - benchmark_utils - INFO - [2048.0, 500.0, 8, 655.7607, 372.9759, 401.5718, 401.6155, 185.6135, 17.0348, 21.7538, 24.431, 11.7067]
+2025-08-28 13:45:22,246 - benchmark_utils - INFO - [2048.0, 500.0, 25, 1317.3404, 943.3288, 1141.8502, 1154.2946, 401.1798, 25.897, 35.8898, 58.3913, 17.6506]
+2025-08-28 13:45:22,246 - benchmark_utils - INFO - [3000.0, 128.0, 4, 334.0444, 396.0354, 441.0325, 446.0322, 196.0392, 12.8081, 16.969, 18.2809, 10.052]
+2025-08-28 13:45:22,246 - benchmark_utils - INFO - [3000.0, 128.0, 8, 546.906, 877.4877, 992.6964, 1004.6543, 391.672, 13.3604, 16.6951, 19.5534, 10.4354]
+2025-08-28 13:45:22,246 - benchmark_utils - INFO - [3000.0, 128.0, 25, 742.8713, 2404.9312, 2975.6171, 3010.9087, 896.594, 25.4364, 37.274, 52.3009, 20.7542]
+2025-08-28 13:45:22,249 - __main__ - INFO - Benchmark parallel finished
+测试完成，退出码: 0
+结果文件: benchmark_parallel_20250828_134303.csv

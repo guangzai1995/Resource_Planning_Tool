@@ -1,0 +1,13 @@
+python3 benchmark_parallel.py --backend openai\
+    --host 10.31.242.32 \
+	--port 30022 \
+	--tokenizer /work/development-code/iboss/benchmark_tools/model  \
+	--epochs 3 \
+	--parallel-num 96 64 48 1  \
+	--prompt-tokens 32000 24000 16000 8000 4000 2000 1000  \
+	--output-tokens 1000 1000 1000 1000 1000 1000 1000 \
+	--max-avg-first-token-latency 2000 \
+	--min-per-parallel-throughput 5 \
+	--served-model-name  MiniMax \
+	--api-key '123456' \
+	--benchmark-csv test1.csv

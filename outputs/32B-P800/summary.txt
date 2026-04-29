@@ -1,0 +1,11 @@
+xlsx=/work/dev-code/Resource_Planning_Tool/高价值场景-66@算力和部署评估表@260112.xlsx
+sheet=32B-P800测试数据
+max_delay_s(<)=3.0
+user_throughput(>=)=15.0
+plots=6
+/work/dev-code/Resource_Planning_Tool/outputs/32B-P800/input512_output1024_delay3.0_tps15.0.png
+/work/dev-code/Resource_Planning_Tool/outputs/32B-P800/input1024_output1024_delay3.0_tps15.0.png
+/work/dev-code/Resource_Planning_Tool/outputs/32B-P800/input2048_output1024_delay3.0_tps15.0.png
+/work/dev-code/Resource_Planning_Tool/outputs/32B-P800/input4096_output1024_delay3.0_tps15.0.png
+/work/dev-code/Resource_Planning_Tool/outputs/32B-P800/input6144_output1024_delay3.0_tps15.0.png
+/work/dev-code/Resource_Planning_Tool/outputs/32B-P800/input8192_output1024_delay3.0_tps15.0.png
