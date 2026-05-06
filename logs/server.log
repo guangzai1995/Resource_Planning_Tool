@@ -1,5 +1,0 @@
-[2025-11-11 06:31:59,169] [INFO] resource_planning - Health check
-[2025-11-11 06:40:19,493] [INFO] resource_planning - Health check
-[2025-11-11 06:40:31,747] [INFO] resource_planning - List tokenizers: count=5
-[2025-11-11 06:40:42,303] [INFO] resource_planning - Options query gpu=4090 model=32B cards=8
-[2025-11-11 06:43:06,346] [INFO] resource_planning - Concurrency failure gpu=4090 model=32B cards=8 input=999999 reason=data_missing
