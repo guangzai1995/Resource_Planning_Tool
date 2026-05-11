@@ -1,3 +1,116 @@
+# 资源规划工具 (Resource Planning Tool)
+
+LLM 推理资源规划工具，支持并发估算、成本优化与 Token 统计。
+
+---
+
+## Docker 部署
+
+### 一键构建镜像
+
+```bash
+# 仅构建镜像 rpt:latest
+bash build.sh
+
+# 构建并立即启动服务（推荐）
+bash build.sh --run
+
+# 不重新构建，直接用已有镜像启动
+bash build.sh --run-only
+
+# 指定镜像名和标签，构建后启动
+bash build.sh -t myrepo/rpt:1.0.0 --run
+
+# 构建并推送至远端仓库
+bash build.sh -t myrepo/rpt:1.0.0 --push
+
+# 无缓存强制重新构建
+bash build.sh --no-cache --run
+
+# 停止并删除容器
+bash build.sh --stop
+
+# 跟踪容器日志
+bash build.sh --logs
+```
+
+| 参数 | 说明 |
+|------|------|
+| `-t / --tag <name:tag>` | 指定镜像名和标签，默认 `rpt:latest` |
+| `-p / --port <port>` | 宿主机端口，默认 `8000` |
+| `-n / --name <name>` | 容器名称，默认 `rpt` |
+| `--run` | 构建完成后自动启动容器 |
+| `--run-only` | 跳过构建，直接启动已有镜像 |
+| `--stop` | 停止并删除容器 |
+| `--logs` | 跟踪容器输出日志 |
+| `--push` | 构建后推送至远端仓库 |
+| `--no-cache` | 禁用 Docker 构建缓存 |
+
+### 运行容器
+
+**推荐方式（持久化数据）：**
+
+```bash
+docker run -d \
+  -p 8000:8000 \
+  -v $(pwd)/backend/data:/data \
+  -v $(pwd)/model:/model \
+  -e EXCEL_DATA_PATH=/data/资源规划工具.xlsx \
+  --name rpt \
+  rpt:latest
+```
+
+**仅测试用（数据不持久化）：**
+
+```bash
+docker run -d -p 8000:8000 --name rpt rpt:latest
+```
+
+### 数据持久化说明
+
+| 挂载路径 | 容器内路径 | 内容 | 必须挂载 |
+|----------|-----------|------|---------|
+| `./backend/data` | `/data` | SQLite 数据库 `rpt.db`、Excel 数据文件 | **是**，否则重启后数据丢失 |
+| `./model` | `/model` | 本地分词器目录（Qwen* 等） | 否，仅使用分词器功能时需要 |
+
+> **重要**：若未挂载 `/data`，容器重启后所有导入的基准数据与用户配置将**全部丢失**。
+
+### 环境变量
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `SQLITE_PATH` | `/data/rpt.db` | SQLite 数据库路径 |
+| `EXCEL_DATA_PATH` | `./资源规划工具.xlsx` | 基准数据 Excel 路径 |
+| `MODEL_DIR` | `./model` | 分词器目录 |
+| `PREDICTION_CACHE_TTL` | `3600` | 推理缓存 TTL（秒） |
+
+### 健康检查与日志
+
+```bash
+# 检查服务状态
+curl http://localhost:8000/healthz
+
+# 查看实时日志
+docker logs -f rpt
+
+# 停止并删除容器
+docker rm -f rpt
+```
+
+---
+
+## 本地开发启动
+
+```bash
+# 一键启动前后端（开发模式）
+bash start.sh
+
+# 停止所有服务
+bash stop.sh
+```
+
+---
+
 ## server.py 服务说明
 
 本说明文档面向 `server.py` 提供的 FastAPI 服务，涵盖目录结构、功能说明、使用方法与依赖配置，便于快速本地启动与集成调用。

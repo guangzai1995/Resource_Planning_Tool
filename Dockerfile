@@ -47,6 +47,11 @@ COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 # Copy data (optional, may be mounted at runtime)
 RUN mkdir -p /data /model
 
+# ── 持久化目录声明 ─────────────────────────────────────────
+# /data  → SQLite 数据库（rpt.db）和上传的 Excel 文件
+# /model → 本地分词器目录（Qwen* 等）
+VOLUME ["/data", "/model"]
+
 # Healthcheck
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/healthz || exit 1
