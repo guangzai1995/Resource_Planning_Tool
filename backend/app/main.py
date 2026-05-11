@@ -2,7 +2,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
@@ -93,5 +93,26 @@ def startup():
 # ── 前端静态文件（生产构建后）──────────────────────────────────
 _frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
 if _frontend_dist.exists():
-    app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="static")
+    # 只挂载 /assets 目录，避免 StaticFiles 拦截所有路由
+    _assets_dir = _frontend_dist / "assets"
+    if _assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
     logger.info("frontend_static_mounted", path=str(_frontend_dist))
+
+
+# ── SPA 兜底路由（必须在所有 API 路由之后注册）──────────────────
+@app.get("/{full_path:path}", include_in_schema=False)
+async def spa_fallback(full_path: str):
+    """
+    对所有非 API 路径：
+    1. 若是真实存在的静态文件（favicon、robots.txt 等）直接返回
+    2. 否则返回 index.html，让前端 Router 处理
+    """
+    if _frontend_dist.exists():
+        file_path = _frontend_dist / full_path
+        if file_path.is_file():
+            return FileResponse(str(file_path))
+        index = _frontend_dist / "index.html"
+        if index.exists():
+            return FileResponse(str(index))
+    return JSONResponse({"error": "not found"}, status_code=404)
