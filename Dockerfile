@@ -21,7 +21,7 @@ WORKDIR /app
 
 # Install Python deps
 COPY backend/pyproject.toml ./
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple ".[prod]" 2>/dev/null || \
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple "." 2>/dev/null || \
     pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
         fastapi>=0.115 \
         "uvicorn[standard]>=0.30" \
@@ -36,7 +36,8 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple ".[pr
         openpyxl \
         structlog \
         python-multipart \
-        aiofiles
+        aiofiles \
+        httpx>=0.27
 
 # Copy backend source
 COPY backend/app ./app

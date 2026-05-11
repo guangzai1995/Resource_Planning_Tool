@@ -16,7 +16,7 @@ set -euo pipefail
 IMAGE_NAME="rpt"
 IMAGE_TAG="latest"
 CONTAINER_NAME="rpt"
-HOST_PORT="8000"
+HOST_PORT="15421"
 CONTAINER_PORT="8000"
 PUSH=false
 RUN_AFTER_BUILD=false
