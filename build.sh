@@ -235,7 +235,7 @@ BUILD_FLAGS=()
 
 docker build \
     --progress=plain \
-    "${BUILD_FLAGS[@]}" \
+    "${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}" \
     -t "${FULL_IMAGE}" \
     -f Dockerfile \
     .
