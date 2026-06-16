@@ -212,8 +212,10 @@ def _extract_row(
     total_out = _i('total_output_tokens')
 
     # ── 真实平均 token 数（来自服务端上报的总量）─────────────────────────────
-    avg_in = round(total_in / completed, 1) if completed > 0 else in_len
-    avg_out = round(total_out / completed, 1) if completed > 0 else out_len
+    # 注意：completed==0（全部失败）时回退 0.0，【不】回退 requested 值——
+    # 否则会把零成功伪装成"按指定长度输出"，复发 Bug①。
+    avg_in = round(total_in / completed, 1) if completed > 0 else 0.0
+    avg_out = round(total_out / completed, 1) if completed > 0 else 0.0
 
     # ── token 计数来源 ────────────────────────────────────────────────────────
     token_source = decide_token_usage_source(
@@ -223,7 +225,9 @@ def _extract_row(
     )
 
     # ── 长度合规：实测输出 / 请求输出 ──────────────────────────────────────────
-    output_compliance = round(avg_out / out_len * 100, 1) if out_len > 0 else 0.0
+    # 基于未取整的真实均值算合规，避免 round(avg_out) 在阈值边界引入误差。
+    raw_avg_out = total_out / completed if completed > 0 else 0.0
+    output_compliance = round(raw_avg_out / out_len * 100, 1) if out_len > 0 else 0.0
     finish_reason_length_pct = (
         round(_i('finish_reason_length') / completed * 100, 1)
         if completed > 0 else 0.0
@@ -554,6 +558,7 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
             # 约束检查：输出长度合规偏低（服务端未按指定长度输出）则跳过更高并发
             compliance_frac = row['output_compliance'] / 100.0
             if (not skip_higher_parallel
+                    and out_len > 0
                     and row['n_success'] > 0
                     and our_args.min_output_compliance is not None
                     and compliance_frac < our_args.min_output_compliance):

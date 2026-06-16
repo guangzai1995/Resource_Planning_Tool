@@ -79,6 +79,33 @@ def test_token_source_tokenizer_when_no_usage():
     assert row["token_source"] == "tokenizer"
 
 
+def test_extract_row_completed_zero_not_faking_compliance():
+    """全部失败（completed==0）时：avg 应为 0、合规应为 0，不能回显 requested
+    伪装成 100% 合规（Bug① 在零成功路径上的复发点）。"""
+    row = m._extract_row(
+        _result(total_in=0, total_out=0, completed=0, usage_reported=0,
+                finish_reason_length=0),
+        in_len=10, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+    assert row["avg_input_tokens"] == 0.0
+    assert row["avg_output_tokens"] == 0.0
+    assert row["output_compliance"] == 0.0
+    assert row["token_source"] == "none"
+
+
+def test_output_compliance_uses_unrounded_mean():
+    """合规应基于未取整的真实均值，而非已 round 到 1 位的 avg_out。
+    total_out=23, completed=3, out_len=8 → raw mean=7.667 → 95.8%；
+    若误用 round 后的 avg_out=7.7 会算成 96.2%。二者不同，锁定用 raw。"""
+    row = m._extract_row(
+        _result(total_in=30, total_out=23, completed=3),
+        in_len=10, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+    assert row["avg_output_tokens"] == 7.7          # 展示值取整
+    assert row["output_compliance"] == 95.8          # 合规用未取整均值
+
+
+
 def test_csv_headers_match_row_keys():
     """CSV_HEADERS 的每一列都必须能在 row 中取到；且新列必须已进表头（会被落盘）。"""
     row = m._extract_row(
