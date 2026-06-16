@@ -65,3 +65,34 @@ def test_completions_usage_in_same_chunk_as_choices():
     assert out.output_tokens == 8, "completions 在 choices+usage 同帧时漏读了 usage"
     assert out.finish_reason == "length"
 
+
+def test_chat_choice_without_delta_does_not_crash():
+    """健壮性：chat 帧的 choice 缺 delta 键（如仅带 finish_reason 的终止帧变体）不应
+    抛 KeyError 把整请求判失败；finish_reason 与 usage 仍应正确解析。"""
+    completions_fn, chat_fn, RequestFuncInput = _load()
+    chunks = sse(
+        {"choices": [{"delta": {"content": "Hi"}}]},
+        {"choices": [{"finish_reason": "length"}]},   # choice 无 delta 键
+        {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 5}},
+        "[DONE]",
+    )
+    out = _run(chat_fn, RequestFuncInput, "/v1/chat/completions", chunks)
+    assert out.success
+    assert out.finish_reason == "length"
+    assert out.output_tokens == 5
+
+
+def test_usage_without_completion_tokens_keeps_zero():
+    """健壮性：usage 帧缺 completion_tokens 时 output_tokens 应保持 0（int），不能被赋成 None。"""
+    completions_fn, chat_fn, RequestFuncInput = _load()
+    chunks = sse(
+        {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
+        {"choices": [], "usage": {"prompt_tokens": 3}},   # 无 completion_tokens
+        "[DONE]",
+    )
+    out = _run(chat_fn, RequestFuncInput, "/v1/chat/completions", chunks)
+    assert out.success
+    assert out.output_tokens == 0          # 不是 None
+    assert out.prompt_len == 3
+
+

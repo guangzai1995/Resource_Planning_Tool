@@ -264,7 +264,8 @@ async def async_request_openai_completions(
                                 if (fr := choices[0].get("finish_reason")) is not None:
                                     output.finish_reason = fr
                             if usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
+                                if (ct := usage.get("completion_tokens")) is not None:
+                                    output.output_tokens = ct
                                 if (pt := usage.get("prompt_tokens")) is not None:
                                     output.prompt_len = pt
                 if first_chunk_received:
@@ -419,7 +420,7 @@ async def async_request_openai_chat_completions(
                             data = json.loads(chunk)
 
                             if choices := data.get("choices"):
-                                delta = choices[0]["delta"]
+                                delta = choices[0].get("delta") or {}
                                 content = delta.get("content") or ""
                                 # 兼容带思考模型:
                                 #   MiniMax m2.7  → delta.reasoning
@@ -431,26 +432,29 @@ async def async_request_openai_chat_completions(
                                 )
                                 token_text = reasoning + content
 
-                                # TTFT: 跳过空 role 首帧，仅在收到真实 token 时计时
-                                if ttft == 0.0 and token_text:
-                                    ttft = timestamp - st
-                                    output.ttft = ttft
-                                # 解码阶段：有实际 token 才计入 ITL
-                                elif ttft != 0.0 and token_text:
-                                    output.itl.append(timestamp - most_recent_timestamp)
+                                # TTFT/ITL：仅在收到真实 token（token_text 非空）时计时，
+                                # 并推进 most_recent_timestamp。空 role 首帧 / 仅 finish_reason
+                                # 的帧 / 纯 usage 帧都不推进——否则空帧的停留时间会被并入
+                                # 相邻真实 token 的 ITL，扭曲思考模型的 ITL/TPOT 分布。
+                                if token_text:
+                                    if ttft == 0.0:
+                                        ttft = timestamp - st
+                                        output.ttft = ttft
+                                    else:
+                                        output.itl.append(timestamp - most_recent_timestamp)
+                                    most_recent_timestamp = timestamp
+                                    generated_text += token_text
 
-                                generated_text += token_text
                                 if (fr := choices[0].get("finish_reason")) is not None:
                                     output.finish_reason = fr
 
                             # usage 可能随 choices 同帧携带（MiniMax 等），
                             # 也可能在单独的最终帧中出现，用 if 而非 elif 确保都能读到
                             if usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
+                                if (ct := usage.get("completion_tokens")) is not None:
+                                    output.output_tokens = ct
                                 if (pt := usage.get("prompt_tokens")) is not None:
                                     output.prompt_len = pt
-
-                            most_recent_timestamp = timestamp
 
                 output.generated_text = generated_text
                 output.success = True
