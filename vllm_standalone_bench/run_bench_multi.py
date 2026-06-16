@@ -276,10 +276,11 @@ def _extract_row(
 
 CSV_HEADERS = [
     'model', 'backend',
-    'input_len', 'output_len', 'prefix_ratio', 'prefix_tokens',
+    'input_len', 'output_len', 'total_input_len', 'prefix_ratio', 'prefix_tokens',
     'parallel_num', 'epochs', 'num_prompts',
     'n_success', 'n_failed',
     'avg_input_tokens', 'avg_output_tokens',
+    'output_compliance', 'finish_reason_length_pct', 'token_source',
     'throughput_req_s', 'throughput_tok_s',
     'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
     'tpot_mean_ms', 'tpot_p50_ms', 'tpot_p90_ms', 'tpot_p99_ms',
@@ -289,10 +290,11 @@ CSV_HEADERS = [
 
 CSV_HEADERS_ZH = [
     '模型', '接口类型',
-    '输入长度(token)', '输出长度(token)', '前缀比例', '前缀tokens数',
+    '输入长度(token)', '输出长度(token)', '总输入长度(token)', '前缀比例', '前缀tokens数',
     '并发数', '测试轮数', '总请求数',
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
+    '长度合规(%)', 'length停止占比(%)', 'token来源',
     '请求吞吐(req/s)', '输出Token吞吐(tok/s)',
     'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
     'TPOT均值(ms)', 'TPOT_P50(ms)', 'TPOT_P90(ms)', 'TPOT_P99(ms)',
@@ -549,6 +551,22 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                 )
                 skip_higher_parallel = True
 
+            # 约束检查：输出长度合规偏低（服务端未按指定长度输出）则跳过更高并发
+            compliance_frac = row['output_compliance'] / 100.0
+            if (not skip_higher_parallel
+                    and row['n_success'] > 0
+                    and our_args.min_output_compliance is not None
+                    and compliance_frac < our_args.min_output_compliance):
+                logger.warning(
+                    "  output_compliance (%.1f%%) < 约束下限 (%.1f%%)，"
+                    "token_source=%s —— 服务端可能未按指定长度输出"
+                    "（ignore_eos 未生效/被截断），"
+                    "跳过 input=%d output=%d 的更高并发测试",
+                    row['output_compliance'], our_args.min_output_compliance * 100,
+                    row['token_source'], in_len, out_len,
+                )
+                skip_higher_parallel = True
+
             # 配置间隔等待
             if our_args.sleep_between > 0 and config_count < total_configs:
                 logger.info("  等待 %.1fs 让服务稳定...", our_args.sleep_between)
@@ -652,6 +670,11 @@ def _parse_args() -> argparse.Namespace:
                             '(input,output) 组合的更高并发测试。\n'
                             '通常在 parallel=1（单用户）时触发：若单用户吞吐已低于预期，'
                             '说明服务在该请求规格下性能不达标，无需继续测试更高并发。')
+    limit.add_argument('--min-output-compliance', type=float, default=0.95,
+                       help='最低输出长度合规比例（0~1，avg_output_measured/requested）。'
+                            '低于此值告警并跳过该 (input,output) 组合的更高并发测试。'
+                            'ignore_eos 生效时合规应≈1.0；偏低通常意味服务端提前停止'
+                            '（如 ignore_eos 未生效/被截断）。默认 0.95。')
 
     # ── 输出配置 ────────────────────────────────────────────────────────────
     out = p.add_argument_group('输出配置')
