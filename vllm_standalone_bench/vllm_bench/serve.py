@@ -1098,7 +1098,7 @@ async def benchmark(
             print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
             result[f"p{p_word}_{metric_attribute_name}_ms"] = value
 
-    if task_type == TaskType.GENERATION and tokenizer:
+    if task_type == TaskType.GENERATION:
         process_one_metric("ttft", "TTFT", "Time to First Token")
         process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
         process_one_metric("itl", "ITL", "Inter-token Latency")
