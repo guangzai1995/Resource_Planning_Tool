@@ -263,7 +263,7 @@ async def async_request_openai_completions(
                                 generated_text += text or ""
                                 if (fr := choices[0].get("finish_reason")) is not None:
                                     output.finish_reason = fr
-                            elif usage := data.get("usage"):
+                            if usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
                                 if (pt := usage.get("prompt_tokens")) is not None:
                                     output.prompt_len = pt

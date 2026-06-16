@@ -49,3 +49,19 @@ def test_completions_finish_reason_and_usage():
     assert out.success
     assert out.finish_reason == "length"
     assert out.output_tokens == 8
+
+
+def test_completions_usage_in_same_chunk_as_choices():
+    """回归 Bug ②：choices 与 usage 出现在同一帧时，completions 不能漏读 completion_tokens。"""
+    completions_fn, chat_fn, RequestFuncInput = _load()
+    chunks = sse(
+        # 服务端在最后一块同时带 choices（finish_reason）和 usage
+        {"choices": [{"text": "ab", "finish_reason": "length"}],
+         "usage": {"prompt_tokens": 3, "completion_tokens": 8}},
+        "[DONE]",
+    )
+    out = _run(completions_fn, RequestFuncInput, "/v1/completions", chunks)
+    assert out.success
+    assert out.output_tokens == 8, "completions 在 choices+usage 同帧时漏读了 usage"
+    assert out.finish_reason == "length"
+
