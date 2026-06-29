@@ -100,13 +100,21 @@ def write_context_files(
     )
 
 
-def write_h200_csv(path: Path, throughput: float, tpot_ms: float):
+def write_h200_csv(
+    path: Path,
+    throughput: float,
+    tpot_ms: float,
+    *,
+    input_len: int = 512,
+    output_len: int = 1024,
+    concurrency: int = 1,
+):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join(
             [
                 "输入长度,输出长度,并发数,输出tokens总吞吐,首tokens时延TP90（ms）,首tokens时延TP99（ms）,最大首tokens时延（ms）,平均首tokens时延（ms）,增量时延TP90（ms）,增量时延TP99（ms）,最大增量时延（ms）,平均增量时延（ms）",
-                f"512,1024,1,{throughput},1,1,1,10,1,1,1,{tpot_ms}",
+                f"{input_len},{output_len},{concurrency},{throughput},1,1,1,10,1,1,1,{tpot_ms}",
             ]
         )
         + "\n",
@@ -259,6 +267,29 @@ def test_missing_h200_model_data_degrades_without_crashing(tmp_path):
     assert "缺少数据" in quantization_text
     assert "32B 的 H200 历史配对数据" in quantization_text
     assert "32B 和 72B 的 H200 历史配对数据均显示" not in quantization_text
+
+
+def test_existing_h200_files_without_comparable_rows_are_marked_pending(tmp_path):
+    write_context_files(tmp_path)
+    h200 = tmp_path / "data" / "H200"
+    write_h200_csv(h200 / "32B" / "1.csv", throughput=100.0, tpot_ms=10.0)
+    write_h200_csv(h200 / "32B-FP8" / "1.csv", throughput=130.0, tpot_ms=8.0)
+    write_h200_csv(h200 / "72B" / "2.csv", throughput=100.0, tpot_ms=10.0, input_len=512)
+    write_h200_csv(h200 / "72B-FP8" / "2.csv", throughput=140.0, tpot_ms=7.0, input_len=2048)
+
+    summary = compute_fp8_summary(tmp_path)
+    assert summary["72B"]["status"] == "待补测"
+    assert "缺少数据" in summary["72B"]["reason"]
+    assert "无可比样本" in summary["72B"]["reason"]
+    assert "avg_throughput_gain_pct" not in summary["72B"]
+
+    wb = build_workbook(tmp_path)
+    quantization_text = sheet_text(wb["04_模型量化"])
+    assert "72B" in quantization_text
+    assert "待补测" in quantization_text
+    assert "无可比样本" in quantization_text
+    assert "72B 40.0%" not in quantization_text
+    assert "72B FP8 已有" not in quantization_text
 
 
 def test_load_context_summary_handles_zero_totals(tmp_path):
