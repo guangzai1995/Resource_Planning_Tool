@@ -697,6 +697,36 @@ def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
     )
 
 
+def save_vllm_artifacts_best_effort(config: AutoBenchConfig, runner: Runner,
+                                    case: BenchmarkCase, layout: CaseLayout) -> None:
+    try:
+        save_vllm_artifacts(config, runner, case, layout)
+    except Exception as exc:
+        try:
+            layout.serve_dir.mkdir(parents=True, exist_ok=True)
+            (layout.serve_dir / "artifact.warning.txt").write_text(
+                f"failed to save vLLM artifacts: {exc}",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+
+def stop_and_remove_container(runner: Runner, container_name: str, dry_run: bool) -> None:
+    commands = [
+        ["docker", "stop", container_name],
+        ["docker", "rm", "-f", container_name],
+    ]
+    for command in commands:
+        try:
+            if dry_run:
+                print_cmd(command)
+            else:
+                runner.run(command, check=False)
+        except Exception:
+            pass
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -726,29 +756,39 @@ def _case_ref(case: BenchmarkCase) -> dict[str, str]:
     }
 
 
+def _case_status_counts(rows: list[dict[str, Any]], total: int) -> dict[str, int]:
+    counts = {"passed": 0, "failed": 0, "skipped": 0, "running": 0, "total": total}
+    for row in rows:
+        status = row.get("status")
+        if status in ("passed", "failed", "skipped"):
+            counts[status] += 1
+    return counts
+
+
 def current_state(run_id: str, cases: tuple[BenchmarkCase, ...], completed: int,
-                  case: BenchmarkCase, status: str) -> dict[str, Any]:
+                  case: BenchmarkCase, status: str,
+                  manifest: Manifest | None = None) -> dict[str, Any]:
+    counts = (
+        _case_status_counts(manifest.cases, len(cases))
+        if manifest is not None else
+        {"passed": 0, "failed": 0, "skipped": 0, "running": 0, "total": len(cases)}
+    )
+    counts["running"] = 1 if status == "running" else 0
+    counts["completed"] = (
+        counts["passed"] + counts["failed"] + counts["skipped"]
+        if manifest is not None else
+        completed
+    )
     return {
         "run_id": run_id,
         "status": status,
         "current": _case_ref(case),
-        "counts": {
-            "passed": 0,
-            "failed": 0,
-            "skipped": 0,
-            "running": 1 if status == "running" else 0,
-            "completed": completed,
-            "total": len(cases),
-        },
+        "counts": counts,
     }
 
 
 def finished_state(run_id: str, manifest: Manifest) -> dict[str, Any]:
-    counts = {"passed": 0, "failed": 0, "skipped": 0, "running": 0, "total": manifest.total}
-    for case in manifest.cases:
-        status = case.get("status")
-        if status in counts:
-            counts[status] += 1
+    counts = _case_status_counts(manifest.cases, manifest.total)
     if manifest.status() == "running":
         counts["running"] = max(manifest.total - len(manifest.cases), 0)
     return {
@@ -798,23 +838,23 @@ def run_controller(config: AutoBenchConfig, run_id: str,
             serve_layout = build_layout(config, run_id, serve_case)
             vllm_cmd = build_vllm_run_command(config, serve_case, serve_layout.run_dir)
             started = False
-            if dry_run:
-                print_cmd(vllm_cmd)
-                ready = True
-            else:
-                active_runner.run(["docker", "rm", "-f", serve_case.container_name], check=False)
-                start_result = active_runner.run(vllm_cmd, check=False)
-                started = start_result.returncode == 0
-                if not started:
-                    ready = False
-                else:
-                    ready = wait_for_ready(
-                        f"http://{serve_case.container_name}:{config.run.container_port}/v1",
-                        config.run.api_key,
-                        config.run.ready_timeout_sec,
-                    )
-
             try:
+                if dry_run:
+                    print_cmd(vllm_cmd)
+                    ready = True
+                else:
+                    active_runner.run(["docker", "rm", "-f", serve_case.container_name], check=False)
+                    start_result = active_runner.run(vllm_cmd, check=False)
+                    started = start_result.returncode == 0
+                    if not started:
+                        ready = False
+                    else:
+                        ready = wait_for_ready(
+                            f"http://{serve_case.container_name}:{config.run.container_port}/v1",
+                            config.run.api_key,
+                            config.run.ready_timeout_sec,
+                        )
+
                 if not ready:
                     exit_code = 1
                     error = (
@@ -829,7 +869,17 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                 for case in group_cases:
                     layout = build_layout(config, run_id, case)
                     layout.bench_dir.mkdir(parents=True, exist_ok=True)
-                    write_state(run_dir, current_state(run_id, cases, completed, case, "running"))
+                    write_state(
+                        run_dir,
+                        current_state(
+                            run_id,
+                            cases,
+                            completed,
+                            case,
+                            "running",
+                            manifest=manifest,
+                        ),
+                    )
                     bench_cmd = build_bench_run_command(config, case, layout.bench_dir)
                     if dry_run:
                         print_cmd(bench_cmd)
@@ -857,10 +907,26 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                     })
                     completed += 1
                     write_manifest(run_dir, manifest)
+            except Exception as exc:
+                exit_code = 1
+                _record_skipped_group(
+                    manifest,
+                    run_dir,
+                    run_id,
+                    group_cases,
+                    config,
+                    str(exc),
+                )
+                completed += len(group_cases)
             finally:
                 if not dry_run and started:
-                    save_vllm_artifacts(config, active_runner, serve_case, serve_layout)
-                    active_runner.run(["docker", "stop", serve_case.container_name], check=False)
+                    save_vllm_artifacts_best_effort(
+                        config,
+                        active_runner,
+                        serve_case,
+                        serve_layout,
+                    )
+                    stop_and_remove_container(active_runner, serve_case.container_name, dry_run)
                     if config.run.cooldown_sec > 0:
                         time.sleep(config.run.cooldown_sec)
 

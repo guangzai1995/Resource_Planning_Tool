@@ -317,6 +317,21 @@ class FakeRunner:
         return ab.Completed(list(args), 0, "ok\n", "")
 
 
+def command_index(commands, prefix):
+    for index, command in enumerate(commands):
+        if command[:len(prefix)] == prefix:
+            return index
+    raise AssertionError(f"command not found: {prefix!r}")
+
+
+def assert_removed_after_stop(commands, container_name):
+    stop_index = command_index(commands, ["docker", "stop", container_name])
+    assert any(
+        command[:4] == ["docker", "rm", "-f", container_name]
+        for command in commands[stop_index + 1:]
+    )
+
+
 def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     runner = FakeRunner()
@@ -330,6 +345,7 @@ def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
     assert any("docker run -d" in cmd for cmd in joined)
     assert any("run_bench_multi.py" in cmd for cmd in joined)
     assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
+    assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
 
 
@@ -341,8 +357,74 @@ def test_controller_skips_bench_when_vllm_not_ready(tmp_path, monkeypatch):
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
     assert result == 1
+    joined = [" ".join(cmd) for cmd in runner.commands]
     manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["cases"][0]["status"] == "skipped"
+    assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
+    assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
+    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_controller_ready_exception_stops_and_removes_container(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+
+    def raise_ready(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(ab, "wait_for_ready", raise_ready)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    joined = [" ".join(cmd) for cmd in runner.commands]
+    assert result == 1
+    assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
+    assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
+    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_controller_artifact_failure_still_stops_and_removes_container(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+
+    def raise_artifact(*args, **kwargs):
+        raise RuntimeError("artifact boom")
+
+    monkeypatch.setattr(ab, "save_vllm_artifacts", raise_artifact)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    joined = [" ".join(cmd) for cmd in runner.commands]
+    assert result == 0
+    assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
+    assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
+    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_current_state_counts_manifest_cases(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    manifest = ab.Manifest(run_id="run123", total=3)
+    manifest.record(case, layout, "failed", error="failed")
+    manifest.record(case, layout, "skipped", error="skipped")
+
+    state = ab.current_state(
+        "run123",
+        (case, case, case),
+        2,
+        case,
+        "running",
+        manifest=manifest,
+    )
+
+    assert state["counts"]["passed"] == 0
+    assert state["counts"]["failed"] == 1
+    assert state["counts"]["skipped"] == 1
+    assert state["counts"]["running"] == 1
+    assert state["counts"]["completed"] == 2
+    assert state["counts"]["total"] == 3
 
 
 def test_runner_protocol_type_is_exposed():
