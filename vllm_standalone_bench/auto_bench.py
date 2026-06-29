@@ -1253,7 +1253,7 @@ def _run_state_is_active(run_dir: Path) -> bool:
         return False
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         print(f"state invalid: {exc}", file=sys.stderr)
         return False
     status = state.get("status")

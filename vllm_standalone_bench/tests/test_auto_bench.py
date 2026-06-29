@@ -869,6 +869,24 @@ def test_stop_run_rejects_inactive_state(tmp_path, monkeypatch, capsys):
     assert "run is not active" in captured.err or "state invalid" in captured.err
 
 
+def test_stop_run_invalid_utf8_state_returns_error(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    (run_dir / "state.json").write_bytes(b"\xff")
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for invalid state")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "state invalid" in captured.err
+
+
 def test_stop_run_rejects_mismatched_process(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()
