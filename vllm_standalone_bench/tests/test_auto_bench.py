@@ -253,3 +253,36 @@ def test_manifest_records_relative_artifact_paths(tmp_path):
     assert data["run_id"] == "run123"
     assert data["status"] == "completed"
     assert data["cases"][0]["csv"] == "qwen2_5_1_5b/bf16_default/smoke/result.csv"
+
+
+def test_manifest_interrupted_wins_over_incomplete_cases(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    manifest = ab.Manifest(run_id="run123", total=2)
+
+    manifest.record(case, layout, "interrupted", error="stopped")
+
+    assert manifest.status() == "interrupted"
+    data = manifest.to_dict()
+    assert data["status"] == "interrupted"
+    assert data["cases"][0]["error"] == "stopped"
+    assert data["cases"][0]["xlsx"] == "qwen2_5_1_5b/bf16_default/smoke/result.xlsx"
+
+
+def test_manifest_status_matrix(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+
+    running = ab.Manifest(run_id="run123", total=2)
+    running.record(case, layout, "passed")
+    assert running.status() == "running"
+
+    completed = ab.Manifest(run_id="run123", total=1)
+    completed.record(case, layout, "passed")
+    assert completed.status() == "completed"
+
+    failed = ab.Manifest(run_id="run123", total=1)
+    failed.record(case, layout, "failed", error="boom")
+    assert failed.status() == "completed_with_failures"

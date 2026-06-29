@@ -566,12 +566,12 @@ class Manifest:
 
     def status(self) -> str:
         statuses = {case["status"] for case in self.cases}
+        if "interrupted" in statuses:
+            return "interrupted"
         if len(self.cases) < self.total:
             return "running"
         if statuses == {"passed"}:
             return "completed"
-        if "interrupted" in statuses:
-            return "interrupted"
         if "failed" in statuses or "skipped" in statuses:
             return "completed_with_failures"
         return "completed"
