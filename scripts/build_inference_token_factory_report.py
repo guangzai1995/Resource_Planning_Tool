@@ -8,6 +8,7 @@ from pathlib import Path
 from statistics import mean
 
 from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 
@@ -74,11 +75,32 @@ def _style_range(ws, min_row: int, max_row: int, min_col: int, max_col: int) -> 
             cell.alignment = Alignment(vertical="center", wrap_text=True)
 
 
-def _style_table_header(ws, row: int, max_col: int) -> None:
-    for row_cells in ws.iter_rows(min_row=row, max_row=row, min_col=1, max_col=max_col):
+def _style_table_header(ws, row: int, max_col: int, min_col: int = 1) -> None:
+    for row_cells in ws.iter_rows(min_row=row, max_row=row, min_col=min_col, max_col=max_col):
         for cell in row_cells:
             cell.fill = SUB_FILL
             cell.font = Font(bold=True)
+
+
+def _write_chart_source_table(
+    ws,
+    start_row: int,
+    start_col: int,
+    headers: list[str],
+    rows: list[list[str | float | int]],
+) -> int:
+    for col_idx, header in enumerate(headers, start=start_col):
+        ws.cell(row=start_row, column=col_idx, value=header)
+
+    for row_idx, row_values in enumerate(rows, start=start_row + 1):
+        for col_idx, value in enumerate(row_values, start=start_col):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    last_row = start_row + len(rows)
+    max_col = start_col + len(headers) - 1
+    _style_range(ws, start_row, last_row, start_col, max_col)
+    _style_table_header(ws, start_row, max_col, min_col=start_col)
+    return last_row
 
 
 def _write_header(ws, spec: dict[str, str]) -> None:
@@ -191,7 +213,7 @@ def _format_pct(value: float | int) -> str:
     return f"{float(value):.1f}%"
 
 
-def _write_background(ws, context: dict[str, float | int]) -> None:
+def _write_background(ws, context: dict[str, object]) -> None:
     start_row = ws.max_row + 2
     row = _write_section_title(ws, start_row, "汇报背景与目标")
     request_scale = _format_wan(context["total_requests"])
@@ -241,6 +263,111 @@ def _write_background(ws, context: dict[str, float | int]) -> None:
             ["汇报材料", "把背景、量化结论、资源方案和数据来源写入 workbook。", "本任务补充"],
         ],
     )
+
+
+def _add_context_distribution_chart(ws, context: dict[str, object]) -> None:
+    buckets = context.get("input_buckets", [])
+    if not isinstance(buckets, list):
+        buckets = []
+    long_buckets = [
+        bucket
+        for bucket in buckets
+        if isinstance(bucket, dict) and int(bucket.get("sort_key", 0) or 0) >= 32_768
+    ]
+    if not long_buckets:
+        ws["J6"] = "图表待补测：缺少 32K 以上上下文分桶数据"
+        ws["J6"].font = Font(bold=True, color="9C6500")
+        ws["J6"].fill = PatternFill("solid", fgColor="FFF2CC")
+        return
+
+    start_row = 6
+    start_col = 10
+    rows = [
+        [
+            str(bucket["range_label"]),
+            int(bucket["request_count"]),
+            float(bucket["request_pct"]),
+        ]
+        for bucket in long_buckets
+    ]
+    last_row = _write_chart_source_table(
+        ws,
+        start_row,
+        start_col,
+        ["输入长度分桶", "请求数", "请求占比%"],
+        rows,
+    )
+    for col_offset, width in enumerate((16, 12, 14)):
+        ws.column_dimensions[ws.cell(row=1, column=start_col + col_offset).column_letter].width = width
+    for row_idx in range(start_row + 1, last_row + 1):
+        ws.cell(row=row_idx, column=start_col + 2).number_format = "0.0"
+
+    chart = BarChart()
+    chart.type = "col"
+    chart.style = 10
+    chart.title = "32K 以上长上下文输入长度分布（请求占比）"
+    chart.y_axis.title = "请求占比（%）"
+    chart.x_axis.title = "输入长度分桶"
+    chart.height = 7
+    chart.width = 11
+    data = Reference(ws, min_col=start_col + 2, min_row=start_row, max_row=last_row)
+    categories = Reference(ws, min_col=start_col, min_row=start_row + 1, max_row=last_row)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(categories)
+    ws.add_chart(chart, "J12")
+
+
+def _add_fp8_comparison_chart(ws, fp8_summary: dict[str, dict[str, float | int | str]]) -> None:
+    rows = []
+    for model_name in ("32B", "72B"):
+        summary = fp8_summary.get(model_name)
+        if not _has_fp8_result(summary):
+            continue
+        rows.append(
+            [
+                model_name,
+                float(summary["avg_bf16_throughput"]),
+                float(summary["avg_fp8_throughput"]),
+                float(summary["avg_throughput_gain_pct"]) / 100.0,
+            ]
+        )
+
+    start_row = 6
+    start_col = 10
+    if not rows:
+        ws.cell(row=start_row, column=start_col, value="图表待补测：缺少有效 FP8 对比数据")
+        ws.cell(row=start_row, column=start_col).font = Font(bold=True, color="9C6500")
+        ws.cell(row=start_row, column=start_col).fill = PatternFill("solid", fgColor="FFF2CC")
+        ws.column_dimensions["J"].width = 34
+        return
+
+    last_row = _write_chart_source_table(
+        ws,
+        start_row,
+        start_col,
+        ["模型", "BF16 吞吐", "FP8 吞吐", "吞吐提升"],
+        rows,
+    )
+    for col_offset, width in enumerate((10, 14, 14, 12)):
+        ws.column_dimensions[ws.cell(row=1, column=start_col + col_offset).column_letter].width = width
+    for row_idx in range(start_row + 1, last_row + 1):
+        ws.cell(row=row_idx, column=start_col + 1).number_format = "0.0"
+        ws.cell(row=row_idx, column=start_col + 2).number_format = "0.0"
+        ws.cell(row=row_idx, column=start_col + 3).number_format = "0.0%"
+
+    chart = BarChart()
+    chart.type = "col"
+    chart.style = 10
+    chart.title = "H200 FP8 vs BF16 吞吐对比"
+    chart.y_axis.title = "输出 tokens 总吞吐"
+    chart.x_axis.title = "模型"
+    chart.height = 7
+    chart.width = 12
+    data = Reference(ws, min_col=start_col + 1, max_col=start_col + 2, min_row=start_row, max_row=last_row)
+    categories = Reference(ws, min_col=start_col, min_row=start_row + 1, max_row=last_row)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(categories)
+    ws.add_chart(chart, "J11")
 
 
 def _has_fp8_result(summary: dict[str, float | int | str] | None) -> bool:
@@ -442,7 +569,7 @@ def _read_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
-def load_context_summary(repo_root: Path) -> dict[str, float | int]:
+def load_context_summary(repo_root: Path) -> dict[str, object]:
     out_dir = repo_root / "outputs" / "context_analysis_20260609_034248"
     overview = json.loads((out_dir / "01_overview.json").read_text(encoding="utf-8"))
     input_rows = _read_csv_rows(out_dir / "02_input_buckets.csv")
@@ -454,11 +581,23 @@ def load_context_summary(repo_root: Path) -> dict[str, float | int]:
         for row in input_rows
         if row["range_label"] in {"32K-64K", "64K-128K", "128K+"}
     )
+    input_buckets = []
+    for row in input_rows:
+        request_count = int(row["request_count"])
+        input_buckets.append(
+            {
+                "range_label": row["range_label"],
+                "sort_key": int(float(row["sort_key"])),
+                "request_count": request_count,
+                "request_pct": request_count / total_requests * 100.0 if total_requests else 0.0,
+            }
+        )
     return {
         "total_requests": total_requests,
         "total_tokens_billion": total_tokens / 1_000_000_000,
         "input_token_ratio": input_tokens / total_tokens if total_tokens else 0,
         "long_context_ratio": long_requests / total_requests if total_requests else 0,
+        "input_buckets": input_buckets,
     }
 
 
@@ -512,6 +651,8 @@ def _compare_h200_pair(base_path: Path, fp8_path: Path) -> dict[str, float | int
         "status": "已有结论/历史数据",
         "reason": "已匹配 H200 BF16/FP8 历史数据",
         "matched_rows": len(valid_keys),
+        "avg_bf16_throughput": mean(base[k]["throughput"] for k in valid_keys),
+        "avg_fp8_throughput": mean(fp8[k]["throughput"] for k in valid_keys),
         "avg_throughput_gain_pct": (mean(throughput_ratios) - 1.0) * 100.0,
         "avg_tpot_ratio_pct": mean(tpot_ratios) * 100.0,
     }
@@ -542,8 +683,10 @@ def build_workbook(repo_root: Path) -> Workbook:
             _write_summary(ws)
         if spec["title"] == "01_背景与目标":
             _write_background(ws, context)
+            _add_context_distribution_chart(ws, context)
         if spec["title"] == "04_模型量化":
             _write_model_quantization(ws, fp8_summary)
+            _add_fp8_comparison_chart(ws, fp8_summary)
         if spec["title"] == "08_PD分离":
             _write_pd_plan(ws)
         if spec["title"] == "12_数据附录":

@@ -246,6 +246,31 @@ def test_report_contains_key_business_and_quantization_conclusions():
     assert "data/H200/72B-FP8/2.csv" in appendix_text
 
 
+def test_report_contains_visual_charts():
+    wb = build_workbook(Path("."))
+
+    background_charts = wb["01_背景与目标"]._charts
+    assert len(background_charts) >= 1
+    assert any("上下文" in str(chart.title) for chart in background_charts)
+
+    quantization_charts = wb["04_模型量化"]._charts
+    assert len(quantization_charts) >= 1
+    assert any(
+        "FP8" in str(chart.title) or "吞吐" in str(chart.title)
+        for chart in quantization_charts
+    )
+
+
+def test_quantization_chart_degrades_when_all_fp8_data_is_missing(tmp_path):
+    write_context_files(tmp_path)
+
+    wb = build_workbook(tmp_path)
+    ws = wb["04_模型量化"]
+
+    assert ws._charts == []
+    assert "图表待补测：缺少有效 FP8 对比数据" in sheet_text(ws)
+
+
 def test_missing_h200_model_data_degrades_without_crashing(tmp_path):
     write_context_files(tmp_path)
     h200 = tmp_path / "data" / "H200"
