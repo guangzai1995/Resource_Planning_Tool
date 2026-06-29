@@ -1180,7 +1180,7 @@ def print_status(run_dir: Path) -> int:
         return 1
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         print(f"state file invalid: {exc}", file=sys.stderr)
         return 1
     print(f"run_id: {state.get('run_id', run_dir.name)}")

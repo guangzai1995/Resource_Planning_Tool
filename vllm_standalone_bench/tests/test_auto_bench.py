@@ -647,6 +647,19 @@ def test_status_corrupt_state_returns_error(tmp_path, capsys):
     assert "state" in captured.err.lower()
 
 
+def test_status_invalid_utf8_state_returns_error(tmp_path, capsys):
+    run_dir = tmp_path / "results" / "run123"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_bytes(b"\xff")
+
+    exit_code = ab.print_status(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "state" in captured.err.lower()
+    assert "invalid" in captured.err.lower()
+
+
 def test_parse_args_run_dry_run():
     args = ab.parse_args(["run", "--config", "c.json", "--dry-run"])
 
