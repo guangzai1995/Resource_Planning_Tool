@@ -29,6 +29,14 @@ class CollapsingTokenizer(FakeTokenizer):
         return " ".join("tok" for _ in token_ids)
 
 
+class ShortEncodingTokenizer(FakeTokenizer):
+    def __call__(self, text, add_special_tokens=False):
+        class Encoded:
+            input_ids = text.split()[:-1] if text else []
+
+        return Encoded()
+
+
 def test_random_prefix_prompt_len_uses_total_input_budget():
     args = argparse.Namespace(
         num_prompts=2,
@@ -77,6 +85,29 @@ def test_random_full_prefix_range_ratio_extends_shared_prefix(monkeypatch):
     requests = rbs._generate_random_requests(args, FakeTokenizer())
 
     assert [req.prompt_len for req in requests] == [16, 16]
+    assert requests[0].prompt == requests[1].prompt
+
+
+def test_random_full_prefix_reuses_decoded_prompt_when_tokenizer_is_short(
+    monkeypatch,
+):
+    next_token = iter(range(1000))
+
+    def increasing_token(*args):
+        return next(next_token)
+
+    monkeypatch.setattr(rbs.random, "randrange", increasing_token)
+    args = argparse.Namespace(
+        num_prompts=2,
+        random_input_len=8,
+        random_output_len=4,
+        random_prefix_len=8,
+        random_range_ratio=1.0,
+    )
+
+    requests = rbs._generate_random_requests(args, ShortEncodingTokenizer())
+
+    assert [req.prompt_len for req in requests] == [8, 8]
     assert requests[0].prompt == requests[1].prompt
 
 

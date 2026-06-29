@@ -405,6 +405,7 @@ def _generate_random_requests(args: argparse.Namespace,
 
     requests: list[SampleRequest] = []
     seen_prompts: set[str] = set()
+    full_prefix_prompt_cache: dict[int, tuple[str, int]] = {}
     for i in range(args.num_prompts):
         in_len = _rand_len(args.random_input_len)
         out_len = _rand_len(args.random_output_len)
@@ -419,17 +420,29 @@ def _generate_random_requests(args: argparse.Namespace,
         # ── 生成每个请求独有的后缀（保证请求间内容不同）────────────────────────
         if tokenizer is not None and hasattr(tokenizer, 'decode'):
             vocab_size = max(int(getattr(tokenizer, 'vocab_size', 32000)), 1)
-            suffix_ids = [random.randrange(vocab_size) for _ in range(suffix_len)]
-            index_width = _request_index_width(vocab_size, suffix_len)
-            suffix_ids[:index_width] = _request_index_tokens(
-                i,
-                index_width,
-                vocab_size,
-            )
-            prompt, actual_len = _decode_to_target_len(
-                shared_prefix_ids[:effective_prefix_len] + suffix_ids,
-                in_len,
-            )
+            if configured_full_prefix:
+                cached_prompt = full_prefix_prompt_cache.get(in_len)
+                if cached_prompt is None:
+                    cached_prompt = _decode_to_target_len(
+                        shared_prefix_ids[:effective_prefix_len],
+                        in_len,
+                    )
+                    full_prefix_prompt_cache[in_len] = cached_prompt
+                prompt, actual_len = cached_prompt
+            else:
+                suffix_ids = [
+                    random.randrange(vocab_size) for _ in range(suffix_len)
+                ]
+                index_width = _request_index_width(vocab_size, suffix_len)
+                suffix_ids[:index_width] = _request_index_tokens(
+                    i,
+                    index_width,
+                    vocab_size,
+                )
+                prompt, actual_len = _decode_to_target_len(
+                    shared_prefix_ids[:effective_prefix_len] + suffix_ids,
+                    in_len,
+                )
         else:
             # 无 tokenizer：用空格分隔的数字模拟 token ids
             suffix_tokens = [
