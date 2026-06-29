@@ -1,4 +1,5 @@
 import json
+import math
 
 import pytest
 
@@ -7,6 +8,12 @@ import auto_bench as ab
 
 def write_config(tmp_path, data):
     path = tmp_path / "config.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def write_config_at(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding="utf-8")
     return path
 
@@ -83,11 +90,58 @@ def test_invalid_name_is_rejected(tmp_path):
         ab.load_config(write_config(tmp_path, data))
 
 
+@pytest.mark.parametrize(("section", "value"), [
+    ("models", ".."),
+    ("serve_profiles", "."),
+])
+def test_dot_names_are_rejected(tmp_path, section, value):
+    data = minimal_config(tmp_path)
+    data[section][0]["name"] = value
+
+    with pytest.raises(ab.ConfigError, match="safe filename"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_relative_model_mount_is_resolved_from_config_dir(tmp_path):
+    config_dir = tmp_path / "configs"
+    model_root = config_dir / "model"
+    model_dir = model_root / "Qwen2.5-1.5B-Instruct"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    data = minimal_config(tmp_path)
+    data["mounts"]["models"] = "model"
+
+    config = ab.load_config(write_config_at(config_dir / "config.json", data))
+
+    assert config.mounts.models == (config_dir / "model").resolve()
+    assert config.models[0].host_model_path == (
+        config_dir / "model" / "Qwen2.5-1.5B-Instruct"
+    ).resolve()
+
+
 def test_model_container_path_must_not_escape_models_root(tmp_path):
     data = minimal_config(tmp_path)
     data["models"][0]["model_path"] = "/models/../outside"
 
     with pytest.raises(ab.ConfigError, match="/models|model path"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("prefix_ratio", [1.5, math.nan])
+def test_prefix_ratio_must_be_finite_ratio(tmp_path, prefix_ratio):
+    data = minimal_config(tmp_path)
+    data["bench_profiles"][0]["prefix_ratio"] = prefix_ratio
+
+    with pytest.raises(ab.ConfigError, match="prefix_ratio"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_backend_must_be_supported(tmp_path):
+    data = minimal_config(tmp_path)
+    data["bench_profiles"][0]["backend"] = "bad"
+
+    with pytest.raises(ab.ConfigError, match="backend"):
         ab.load_config(write_config(tmp_path, data))
 
 

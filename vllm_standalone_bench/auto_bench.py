@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from typing import Any
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 MODEL_CONTAINER_ROOT = PurePosixPath("/models")
+SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat"})
 
 
 class ConfigError(ValueError):
@@ -116,7 +118,11 @@ def _optional_string(value: Any, field_name: str) -> str | None:
 
 
 def _safe_name(value: Any, field_name: str) -> str:
-    if not isinstance(value, str) or not SAFE_NAME_RE.fullmatch(value):
+    if (
+        not isinstance(value, str)
+        or not SAFE_NAME_RE.fullmatch(value)
+        or value in {".", ".."}
+    ):
         raise ConfigError(f"{field_name} must be a safe filename: {value!r}")
     return value
 
@@ -139,16 +145,48 @@ def _non_negative_int(value: Any, field_name: str) -> int:
     return value
 
 
+def _finite_float(value: Any, field_name: str) -> float:
+    if type(value) not in (int, float):
+        raise ConfigError(f"{field_name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ConfigError(f"{field_name} must be a finite number")
+    return result
+
+
 def _non_negative_float(value: Any, field_name: str) -> float:
-    if type(value) not in (int, float) or value < 0:
+    result = _finite_float(value, field_name)
+    if result < 0:
         raise ConfigError(f"{field_name} must be a non-negative number")
-    return float(value)
+    return result
 
 
 def _optional_non_negative_float(value: Any, field_name: str) -> float | None:
     if value is None:
         return None
     return _non_negative_float(value, field_name)
+
+
+def _ratio(value: Any, field_name: str) -> float:
+    result = _finite_float(value, field_name)
+    if not 0 <= result <= 1:
+        raise ConfigError(f"{field_name} must be a ratio between 0 and 1")
+    return result
+
+
+def _optional_ratio(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    return _ratio(value, field_name)
+
+
+def _backend(value: Any, field_name: str) -> str:
+    backend = _string(value, field_name)
+    if backend not in SUPPORTED_BACKENDS:
+        raise ConfigError(
+            f"{field_name} must be one of: {', '.join(sorted(SUPPORTED_BACKENDS))}"
+        )
+    return backend
 
 
 def _positive_int_list(value: Any, field_name: str) -> tuple[int, ...]:
@@ -201,10 +239,13 @@ def _parse_run(data: dict[str, Any]) -> RunConfig:
     )
 
 
-def _parse_mounts(data: dict[str, Any]) -> MountConfig:
+def _parse_mounts(data: dict[str, Any], config_dir: Path) -> MountConfig:
     mounts = _require_mapping(data.get("mounts"), "mounts")
+    models = Path(_string(_required(mounts, "models", "mounts.models"), "mounts.models"))
+    if not models.is_absolute():
+        models = config_dir / models
     return MountConfig(
-        models=Path(_string(_required(mounts, "models", "mounts.models"), "mounts.models"))
+        models=models.resolve()
     )
 
 
@@ -278,13 +319,13 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
         parsed.append(BenchProfile(
             name=_safe_name(_required(profile, "name", "bench_profile.name"),
                             "bench_profile.name"),
-            backend=_string(profile.get("backend", "openai-chat"), "bench_profile.backend"),
+            backend=_backend(profile.get("backend", "openai-chat"), "bench_profile.backend"),
             input_lens=input_lens,
             output_lens=output_lens,
             parallel_nums=parallel_nums,
             epochs=_positive_int(profile.get("epochs", 3), "bench_profile.epochs"),
-            prefix_ratio=_non_negative_float(profile.get("prefix_ratio", 0.0),
-                                             "bench_profile.prefix_ratio"),
+            prefix_ratio=_ratio(profile.get("prefix_ratio", 0.0),
+                                "bench_profile.prefix_ratio"),
             warmup_requests=_non_negative_int(profile.get("warmup_requests", 1),
                                               "bench_profile.warmup_requests"),
             cross_product=cross_product,
@@ -294,7 +335,7 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
                 profile.get("min_throughput_tok_s"),
                 "bench_profile.min_throughput_tok_s",
             ),
-            min_output_compliance=_optional_non_negative_float(
+            min_output_compliance=_optional_ratio(
                 profile.get("min_output_compliance"),
                 "bench_profile.min_output_compliance",
             ),
@@ -303,15 +344,16 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
 
 
 def load_config(path: str | Path) -> AutoBenchConfig:
+    config_path = Path(path).resolve()
     try:
-        with Path(path).open(encoding="utf-8") as handle:
+        with config_path.open(encoding="utf-8") as handle:
             raw = json.load(handle)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"invalid JSON config: {exc}") from exc
 
     config_data = _require_mapping(raw, "config")
     run = _parse_run(config_data)
-    mounts = _parse_mounts(config_data)
+    mounts = _parse_mounts(config_data, config_path.parent)
     models = _parse_models(config_data, mounts)
     serve_profiles = _parse_serve_profiles(config_data)
     bench_profiles = _parse_bench_profiles(config_data)
