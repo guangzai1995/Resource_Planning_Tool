@@ -207,6 +207,7 @@ class BenchmarkMetrics:
     # —— 基准加固新增：停止原因与 usage 上报统计 ——
     finish_reason_length: int = 0      # finish_reason == "length" 的成功请求数
     usage_reported_count: int = 0      # 服务端流式上报了 output_tokens 的成功请求数
+    tokenizer_fallback_count: int = 0  # 未上报 usage 时用 tokenizer 回退统计的成功请求数
 
 
 @dataclass
@@ -433,6 +434,7 @@ def calculate_metrics(
     completed = 0
     finish_reason_length = 0
     usage_reported_count = 0
+    tokenizer_fallback_count = 0
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
@@ -462,6 +464,7 @@ def calculate_metrics(
                             outputs[i].generated_text, add_special_tokens=False
                         ).input_ids
                     )
+                    tokenizer_fallback_count += 1
             actual_output_lens.append(output_len)
             total_input += outputs[i].prompt_len
             tpot = 0
@@ -622,6 +625,7 @@ def calculate_metrics(
         rtfx=input_audio_duration / dur_s,
         finish_reason_length=finish_reason_length,
         usage_reported_count=usage_reported_count,
+        tokenizer_fallback_count=tokenizer_fallback_count,
     )
 
     return metrics, actual_output_lens
@@ -1032,6 +1036,7 @@ async def benchmark(
             "rtfx": metrics.rtfx,
             "finish_reason_length": metrics.finish_reason_length,
             "usage_reported_count": metrics.usage_reported_count,
+            "tokenizer_fallback_count": metrics.tokenizer_fallback_count,
         }
     else:
         result = {

@@ -164,21 +164,27 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
 
 # ─── 从 serve.py 返回的 result_json 提取 CSV 行 ───────────────────────────────
 
-def decide_token_usage_source(*, usage_reported_count: int, completed: int,
+def decide_token_usage_source(*, usage_reported_count: int,
+                              tokenizer_fallback_count: int,
+                              completed: int,
                               has_tokenizer: bool) -> str:
     """决定每行结果的 token 计数来源（写入 CSV 的 token_source 列）。
 
     - "usage"：所有成功请求的服务端流式 usage 都上报了 completion_tokens（最可信）
-    - "tokenizer"：服务端未上报，但有本地 tokenizer 可重编码 generated_text 估算
-    - "none"：两者皆无（统计不可信，应告警）
+    - "partial_usage"：只有部分成功请求上报 usage，统计混有 fallback
+    - "tokenizer_fallback"：服务端未上报，但有本地 tokenizer 可重编码 generated_text 估算
+    - "client_estimate"：无 usage/无 tokenizer，只能依赖客户端估算值
+    - "none"：没有成功请求
     """
     if completed <= 0:
         return "none"
     if usage_reported_count >= completed:
         return "usage"
-    if has_tokenizer:
-        return "tokenizer"
-    return "none"
+    if usage_reported_count > 0:
+        return "partial_usage"
+    if tokenizer_fallback_count > 0 or has_tokenizer:
+        return "tokenizer_fallback"
+    return "client_estimate"
 
 
 def _extract_row(
@@ -220,13 +226,20 @@ def _extract_row(
     # ── token 计数来源 ────────────────────────────────────────────────────────
     token_source = decide_token_usage_source(
         usage_reported_count=_i('usage_reported_count'),
+        tokenizer_fallback_count=_i('tokenizer_fallback_count'),
         completed=completed,
         has_tokenizer=has_tokenizer,
     )
 
-    # ── 长度合规：实测输出 / 请求输出 ──────────────────────────────────────────
+    # ── 长度合规：实测 / 请求 ────────────────────────────────────────────────
     # 基于未取整的真实均值算合规，避免 round(avg_out) 在阈值边界引入误差。
+    total_input_len = in_len + prefix_tokens
+    raw_avg_in = total_in / completed if completed > 0 else 0.0
     raw_avg_out = total_out / completed if completed > 0 else 0.0
+    input_compliance = (
+        round(raw_avg_in / total_input_len * 100, 1)
+        if total_input_len > 0 else 0.0
+    )
     output_compliance = round(raw_avg_out / out_len * 100, 1) if out_len > 0 else 0.0
     finish_reason_length_pct = (
         round(_i('finish_reason_length') / completed * 100, 1)
@@ -239,7 +252,7 @@ def _extract_row(
         'backend':         backend,
         'input_len':       in_len,            # requested 后缀长度
         'output_len':      out_len,           # requested 输出长度
-        'total_input_len': in_len + prefix_tokens,  # 含共享前缀的总输入（requested 口径）
+        'total_input_len': total_input_len,  # 含共享前缀的总输入（requested 口径）
         'prefix_ratio':    round(prefix_ratio, 3),
         'prefix_tokens':   prefix_tokens,
         'parallel_num':    parallel_num,
@@ -250,6 +263,7 @@ def _extract_row(
         'n_failed':            _i('failed'),
         'avg_input_tokens':    avg_in,    # 真实（曾因 Bug①回显 requested，现已修正）
         'avg_output_tokens':   avg_out,   # 真实
+        'input_compliance':    input_compliance,
         'output_compliance':   output_compliance,
         'finish_reason_length_pct': finish_reason_length_pct,
         'token_source':        token_source,
@@ -284,7 +298,8 @@ CSV_HEADERS = [
     'parallel_num', 'epochs', 'num_prompts',
     'n_success', 'n_failed',
     'avg_input_tokens', 'avg_output_tokens',
-    'output_compliance', 'finish_reason_length_pct', 'token_source',
+    'input_compliance', 'output_compliance',
+    'finish_reason_length_pct', 'token_source',
     'throughput_req_s', 'throughput_tok_s',
     'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
     'tpot_mean_ms', 'tpot_p50_ms', 'tpot_p90_ms', 'tpot_p99_ms',
@@ -298,7 +313,7 @@ CSV_HEADERS_ZH = [
     '并发数', '测试轮数', '总请求数',
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
-    '长度合规(%)', 'length停止占比(%)', 'token来源',
+    '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
     '请求吞吐(req/s)', '输出Token吞吐(tok/s)',
     'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
     'TPOT均值(ms)', 'TPOT_P50(ms)', 'TPOT_P90(ms)', 'TPOT_P99(ms)',
