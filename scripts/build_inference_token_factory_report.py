@@ -151,6 +151,258 @@ def _write_principle_diagram(ws, labels: list[str]) -> None:
     ws.merge_cells("B10:G10")
 
 
+def _write_section_title(ws, row: int, title: str) -> int:
+    ws.cell(row=row, column=1, value=title)
+    ws.cell(row=row, column=1).font = Font(bold=True, color="1F4E78")
+    ws.cell(row=row, column=1).fill = SUB_FILL
+    ws.cell(row=row, column=1).alignment = Alignment(vertical="center", wrap_text=True)
+    ws.cell(row=row, column=1).border = THIN_BORDER
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+    return row + 1
+
+
+def _append_table(ws, start_row: int, headers: list[str], rows: list[list[str]]) -> int:
+    for col_idx, header in enumerate(headers, start=1):
+        ws.cell(row=start_row, column=col_idx, value=header)
+
+    for row_idx, row_values in enumerate(rows, start=start_row + 1):
+        for col_idx, value in enumerate(row_values, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    last_row = start_row + len(rows)
+    max_col = len(headers)
+    _style_range(ws, start_row, last_row, 1, max_col)
+    _style_table_header(ws, start_row, max_col)
+    for row in ws.iter_rows(min_row=start_row, max_row=last_row, min_col=1, max_col=max_col):
+        for cell in row:
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+    return last_row + 1
+
+
+def _format_wan(value: float | int) -> str:
+    return f"{float(value) / 10_000:.1f} 万"
+
+
+def _format_yi_from_billion(value: float | int) -> str:
+    return f"{float(value) * 10:.1f} 亿"
+
+
+def _format_pct(value: float | int) -> str:
+    return f"{float(value):.1f}%"
+
+
+def _write_background(ws, context: dict[str, float | int]) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "汇报背景与目标")
+    request_scale = _format_wan(context["total_requests"])
+    token_scale = _format_yi_from_billion(context["total_tokens_billion"])
+    input_ratio = _format_pct(float(context["input_token_ratio"]) * 100.0)
+    long_context_ratio = _format_pct(float(context["long_context_ratio"]) * 100.0)
+    row = _append_table(
+        ws,
+        row,
+        ["主题", "已有结论/历史数据", "领导汇报口径"],
+        [
+            [
+                "业务定位",
+                "工服场景 token 工厂，以推理请求、长上下文输入和输出 token 生产效率为核心管理对象。",
+                "目标是把模型推理从单点压测转成可规模化运营的 token 产能体系。",
+            ],
+            [
+                "请求规模",
+                f"历史样本累计 {request_scale} 请求，成功率 100%，可作为本轮容量测算的业务底座。",
+                "先按已观测工服请求规模做产能口径，后续随业务峰值补充并发水位。",
+            ],
+            [
+                "Token 规模",
+                f"历史样本累计约 {token_scale} token，输入 token 占比约 {input_ratio}。",
+                "成本和容量压力主要来自输入侧长上下文，优化重点放在 prefill、KV 和缓存复用。",
+            ],
+            [
+                "长上下文压力",
+                f"32K 以上请求占比约 {long_context_ratio}，P95 总长度已进入 100K 级别。",
+                "适用大参数+长上下文场景，需要同时关注 TTFT、TPOT、吞吐和显存占用。",
+            ],
+            [
+                "指标口径",
+                "请求量、token 量、输入占比和 32K 以上占比来自 context analysis 历史数据。",
+                "已有结果标注为已有结论/历史数据；缺少线上复测的数据标注待补测/待资源验证。",
+            ],
+        ],
+    )
+    _write_section_title(ws, row + 1, "本阶段目标")
+    _append_table(
+        ws,
+        row + 2,
+        ["目标", "验收关注", "状态"],
+        [
+            ["模型量化", "用 H200 BF16/FP8 历史数据量化吞吐和 TPOT 收益。", "已有结论/历史数据"],
+            ["PD 分离资源方案", "形成 H200 做 PD、H200 做 P、H20 做 D 的资源验证路径。", "待资源验证"],
+            ["汇报材料", "把背景、量化结论、资源方案和数据来源写入 workbook。", "本任务补充"],
+        ],
+    )
+
+
+def _write_model_quantization(ws, fp8_summary: dict[str, dict[str, float | int]]) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "模型量化结论")
+    table_rows = []
+    for model_name in ("32B", "72B"):
+        summary = fp8_summary.get(model_name)
+        if not summary:
+            table_rows.append([model_name, "待补测", "待补测", "待补测", "缺少 H200 FP8/BF16 配对数据"])
+            continue
+        throughput_gain = _format_pct(summary["avg_throughput_gain_pct"])
+        tpot_ratio = _format_pct(summary["avg_tpot_ratio_pct"])
+        table_rows.append(
+            [
+                model_name,
+                str(summary["matched_rows"]),
+                throughput_gain,
+                tpot_ratio,
+                "已有结论/历史数据：FP8 相比 BF16 吞吐提升明显，TPOT 降低，适合作为 GLM5.1 或 GLM5.2 FP8 部署口径。",
+            ]
+        )
+    row = _append_table(
+        ws,
+        row,
+        ["模型", "匹配样本数", "吞吐约提升", "TPOT 约为 BF16", "结论口径"],
+        table_rows,
+    )
+    _write_section_title(ws, row + 1, "汇报建议")
+    _append_table(
+        ws,
+        row + 2,
+        ["结论", "说明", "风险/下一步"],
+        [
+            [
+                "优先采用 FP8 推理口径",
+                "32B 和 72B 的 H200 历史配对数据均显示约 30%+ 吞吐收益，可直接进入领导汇报的量化收益页。",
+                "线上峰值、混部和更长上下文组合仍需待资源验证。",
+            ],
+            [
+                "72B 作为大参数重点展示",
+                "72B FP8 已有匹配样本，可支撑大参数模型容量申请的历史数据依据。",
+                "GLM5.1/GLM5.2 实际模型版本落地后补测 TTFT、TPOT 和显存水位。",
+            ],
+        ],
+    )
+
+
+def _write_pd_plan(ws) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "PD 分离资源方案")
+    row = _append_table(
+        ws,
+        row,
+        ["模块", "方案", "汇报口径"],
+        [
+            [
+                "原理",
+                "Prefill 负责长上下文首轮计算，Decode 负责逐 token 生成；两阶段拆开后可按资源特性分别扩容。",
+                "适用大参数+长上下文，目标是降低 TTFT、稳定 TPOT，并提升整体 token 工厂吞吐。",
+            ],
+            [
+                "基线",
+                "H200 做 PD：同一类 H200 资源同时承担 Prefill 和 Decode。",
+                "作为当前验证起点，先建立端到端延迟、吞吐和显存基线。",
+            ],
+            [
+                "同构分离",
+                "H200 做 P、H200 做 D：Prefill 与 Decode 独立池化，但都使用 H200。",
+                "用于验证 PD 调度收益，排除异构硬件差异对结果的影响。",
+            ],
+            [
+                "异构方案",
+                "H200 做 P、H20 做 D：用 H200 承担长上下文 Prefill，用 H20 承担 Decode。",
+                "异构 H200+H20 方案可把高带宽高算力 H200 留给 prefill，H20 承接生成侧容量。",
+            ],
+        ],
+    )
+    row = _write_section_title(ws, row + 1, "资源申请与验证计划")
+    _append_table(
+        ws,
+        row,
+        ["事项", "要求", "状态"],
+        [
+            [
+                "资源申请口径",
+                "以 GLM5.1 或 GLM5.2 FP8 部署为口径申请资源，按 72B 大参数长上下文优先验证。",
+                "当前待申请资源",
+            ],
+            [
+                "带宽/互联要求",
+                "P/D 之间需要稳定低延迟互联和足够带宽传输 KV 或中间状态；跨机部署需重点压测链路抖动。",
+                "待资源验证",
+            ],
+            [
+                "验证指标",
+                "记录 TTFT、TPOT、输出 tokens 总吞吐、GPU 显存水位、跨节点带宽占用和失败率。",
+                "待补测",
+            ],
+            [
+                "验证顺序",
+                "先跑 H200 做 PD 基线，再跑 H200 做 P、H200 做 D，最后跑 H200 做 P、H20 做 D 的异构 H200+H20 方案。",
+                "待资源验证",
+            ],
+        ],
+    )
+
+
+def _write_appendix(ws) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "数据来源与状态")
+    _append_table(
+        ws,
+        row,
+        ["数据项", "路径", "用途", "状态"],
+        [
+            [
+                "上下文总览",
+                "outputs/context_analysis_20260609_034248/01_overview.json",
+                "请求规模、token 规模、输入占比、延迟概览。",
+                "已有结论/历史数据",
+            ],
+            [
+                "输入长度分桶",
+                "outputs/context_analysis_20260609_034248/02_input_buckets.csv",
+                "32K 以上长上下文占比。",
+                "已有结论/历史数据",
+            ],
+            [
+                "H200 32B BF16",
+                "data/H200/32B/1.csv",
+                "32B FP8 对比基线。",
+                "已有结论/历史数据",
+            ],
+            [
+                "H200 32B FP8",
+                "data/H200/32B-FP8/1.csv",
+                "32B FP8 吞吐和 TPOT 对比。",
+                "已有结论/历史数据",
+            ],
+            [
+                "H200 72B BF16",
+                "data/H200/72B/2.csv",
+                "72B FP8 对比基线。",
+                "已有结论/历史数据",
+            ],
+            [
+                "H200 72B FP8",
+                "data/H200/72B-FP8/2.csv",
+                "72B FP8 吞吐和 TPOT 对比。",
+                "已有结论/历史数据",
+            ],
+            [
+                "PD 分离验证",
+                "待资源验证",
+                "H200 做 PD、H200 做 P、H20 做 D 以及异构 H200+H20 实测。",
+                "待申请资源/待补测",
+            ],
+        ],
+    )
+
+
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         return list(csv.DictReader(f))
@@ -214,6 +466,8 @@ def compute_fp8_summary(repo_root: Path) -> dict[str, dict[str, float | int]]:
 
 
 def build_workbook(repo_root: Path) -> Workbook:
+    context = load_context_summary(repo_root)
+    fp8_summary = compute_fp8_summary(repo_root)
     wb = Workbook()
     default = wb.active
     wb.remove(default)
@@ -226,4 +480,12 @@ def build_workbook(repo_root: Path) -> Workbook:
             _write_sheet_index(ws)
         if spec["title"] == "02_总览结论":
             _write_summary(ws)
+        if spec["title"] == "01_背景与目标":
+            _write_background(ws, context)
+        if spec["title"] == "04_模型量化":
+            _write_model_quantization(ws, fp8_summary)
+        if spec["title"] == "08_PD分离":
+            _write_pd_plan(ws)
+        if spec["title"] == "12_数据附录":
+            _write_appendix(ws)
     return wb

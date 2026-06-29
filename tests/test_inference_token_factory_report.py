@@ -57,6 +57,15 @@ def assert_cell_has_principle_node_style(cell):
     assert cell.border.left.style == "thin"
 
 
+def sheet_text(ws):
+    return "\n".join(
+        str(cell.value)
+        for row in ws.iter_rows()
+        for cell in row
+        if cell.value is not None
+    )
+
+
 def test_static_sheet_specs_and_status_labels():
     assert REPORT_VERSION == "v2.0"
     assert [item["title"] for item in SHEET_SPECS] == EXPECTED_SHEETS
@@ -157,3 +166,22 @@ def test_each_technology_sheet_has_principle_diagram(tmp_path):
         for cell in (ws["A10"], ws["B10"]):
             assert cell.alignment.wrap_text is True
             assert cell.border.left.style == "thin"
+
+
+def test_report_contains_key_business_and_quantization_conclusions():
+    wb = build_workbook(Path("."))
+
+    background_text = sheet_text(wb["01_背景与目标"])
+    assert "100.8 万" in background_text
+    assert "593.6 亿" in background_text
+    assert "32K 以上" in background_text
+
+    quantization_text = sheet_text(wb["04_模型量化"])
+    assert "72B" in quantization_text
+    assert "吞吐约提升" in quantization_text
+
+    pd_text = sheet_text(wb["08_PD分离"])
+    assert "H200 做 P、H20 做 D" in pd_text
+
+    appendix_text = sheet_text(wb["12_数据附录"])
+    assert "data/H200/72B-FP8/2.csv" in appendix_text
