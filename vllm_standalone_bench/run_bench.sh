@@ -96,14 +96,13 @@ SLEEP_BETWEEN=2.0
 #
 # 用于测试 vLLM prefix caching（自动前缀缓存 / radix cache）对性能的影响。
 #
-# 原理：取值 X 时，每组测试中所有请求共享同一段前缀文本（占 input_len 的 X 倍 token），
-#        后缀部分每个请求独立随机生成，保证请求间差异性。
-#        实际 prompt_len ≈ input_len × (1 + X)
+# 原理：取值 X 时，每组测试中所有请求共享 input_len * X 的前缀 token，
+#        后缀部分每个请求独立生成，prefix + suffix 总长仍约等于 input_len。
 #
 # 典型用法：
 #   PREFIX_RATIO=0.0   → 全随机，无共享（测试无缓存基准）
-#   PREFIX_RATIO=0.5   → 50% 前缀共享（input_len=512 → 前缀256 + 后缀512）
-#   PREFIX_RATIO=0.9   → 90% 前缀共享（高缓存命中率场景）
+#   PREFIX_RATIO=0.5   → 50% 前缀共享（input_len=512 → 前缀256 + 后缀256）
+#   PREFIX_RATIO=0.9   → 90% 前缀共享（input_len=512 → 前缀460 + 后缀52）
 #
 # 注意：需同时在 vLLM 服务端启用前缀缓存（--enable-prefix-caching）才有效。
 PREFIX_RATIO=0.8

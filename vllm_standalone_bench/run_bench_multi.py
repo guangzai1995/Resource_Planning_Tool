@@ -189,7 +189,7 @@ def decide_token_usage_source(*, usage_reported_count: int,
 
 def _derive_prefix_suffix_tokens(input_len: int, prefix_ratio: float) -> Tuple[int, int]:
     """Return shared-prefix and unique-suffix lengths within total input_len."""
-    if prefix_ratio < 0.0 or prefix_ratio > 1.0:
+    if not (0.0 <= prefix_ratio <= 1.0):
         raise ValueError("--prefix-ratio must be between 0.0 and 1.0")
     prefix_tokens = int(input_len * prefix_ratio)
     suffix_tokens = input_len - prefix_tokens
@@ -241,7 +241,7 @@ def _extract_row(
     )
 
     # ── 长度合规：实测 / 请求 ────────────────────────────────────────────────
-    # 基于未取整的真实均值算合规，避免 round(avg_out) 在阈值边界引入误差。
+    # 基于未取整的真实均值算合规，避免 round(avg_in/out) 在阈值边界引入误差。
     total_input_len = in_len
     raw_avg_in = total_in / completed if completed > 0 else 0.0
     raw_avg_out = total_out / completed if completed > 0 else 0.0
@@ -436,6 +436,7 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
     """
     # 构建基础 Namespace（含全部 serve.py 默认值）
     base = _build_base_args(our_args)
+    _derive_prefix_suffix_tokens(1, our_args.prefix_ratio)
     model = our_args.served_model_name or our_args.model
 
     # 构建 (in_len, out_len) 测试对
@@ -492,6 +493,9 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                 )
                 continue
 
+            prefix_ratio = our_args.prefix_ratio
+            prefix_tokens, suffix_tokens = _derive_prefix_suffix_tokens(in_len, prefix_ratio)
+
             logger.info(
                 "\n%s\n[%d/%d] 开始测试: input=%d, output=%d, parallel=%d, "
                 "num_prompts=%d (=%d×%d epochs)%s\n%s",
@@ -499,24 +503,21 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                 config_count, total_configs,
                 in_len, out_len, parallel_num,
                 parallel_num * our_args.epochs, parallel_num, our_args.epochs,
-                (f"  prefix={int(in_len * our_args.prefix_ratio)}tok"
-                 f"({our_args.prefix_ratio * 100:.0f}%)"
-                 if our_args.prefix_ratio > 0 else ""),
+                (f"  total_input={in_len} prefix={prefix_tokens}tok"
+                 f" suffix={suffix_tokens}tok({prefix_ratio * 100:.0f}%)"
+                 if prefix_ratio > 0 else ""),
                 "─" * 65,
             )
 
             # 复制 base args，按本次配置覆盖可变字段
             cfg = copy.copy(base)
-            cfg.input_len       = in_len       # serve.py 内部映射到 random_input_len（后缀长度）
+            cfg.input_len       = in_len       # serve.py 内部映射到 random_input_len（总输入长度）
             cfg.output_len      = out_len       # serve.py 内部映射到 random_output_len
             cfg.max_concurrency = parallel_num  # 最大并发数
             cfg.num_prompts     = parallel_num * our_args.epochs  # 总请求数
 
-            # 前缀缓存：按 prefix_ratio 从 input_len 计算共享前缀 token 数
-            # prefix_tokens 不计入 input_len（input_len 仅表示后缀唯一部分）
-            # 实际 prompt_len ≈ prefix_tokens + input_len
-            prefix_ratio = our_args.prefix_ratio
-            prefix_tokens = int(in_len * prefix_ratio) if prefix_ratio > 0 else 0
+            # input_len 表示总 prompt token 预算；prefix_tokens 是其中共享前缀部分。
+            # run_bench_serve.py 会生成 shared_prefix + unique_suffix，总长约等于 input_len。
             cfg.random_prefix_len = prefix_tokens
 
             # 第一次运行：做 ready check（超时 600s）；后续跳过（设为 0）
@@ -679,8 +680,8 @@ def _parse_args() -> argparse.Namespace:
                        help='前缀缓存比例 [0.0~1.0]（默认: 0.0 = 不使用共享前缀）。'
                             '取值 0.5 表示每个请求中有 50%% 的 input_len 作为共享前缀。'
                             '所有请求共享同一段前缀文本（固定生成一次），'
-                            '后缀部分每个请求独立随机生成。'
-                            '实际 prompt_len ≈ input_len × (1 + prefix_ratio)。'
+                            '后缀包含 request-index token 加随机 tail，用于保证非 full-prefix 请求差异。'
+                            '实际 prompt_len ≈ input_len；共享前缀 token 数约为 input_len × prefix_ratio。'
                             '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。')
 
     # ── Tokenizer ────────────────────────────────────────────────────────────

@@ -40,7 +40,7 @@ def test_derive_prefix_suffix_tokens_from_total_input():
     assert m._derive_prefix_suffix_tokens(128, 1.0) == (128, 0)
 
 
-@pytest.mark.parametrize("ratio", [-0.1, 1.1])
+@pytest.mark.parametrize("ratio", [-0.1, 1.1, float("nan")])
 def test_derive_prefix_suffix_tokens_rejects_invalid_ratio(ratio):
     with pytest.raises(ValueError, match="--prefix-ratio"):
         m._derive_prefix_suffix_tokens(128, ratio)
