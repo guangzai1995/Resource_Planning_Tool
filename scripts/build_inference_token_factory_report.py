@@ -139,8 +139,16 @@ def _write_principle_diagram(ws, labels: list[str]) -> None:
         if idx < len(labels) - 1:
             ws.cell(start_row, col + 1, "→")
             ws.cell(start_row, col + 1).alignment = Alignment(horizontal="center", vertical="center")
+            ws.cell(start_row, col + 1).border = THIN_BORDER
+            ws.column_dimensions[ws.cell(start_row, col + 1).column_letter].width = 6
     ws["A10"] = "说明"
+    ws["A10"].font = Font(bold=True)
+    ws["A10"].alignment = Alignment(vertical="center", wrap_text=True)
+    ws["A10"].border = THIN_BORDER
     ws["B10"] = "该图用于快速解释技术机制，详细参数与测试设计见下方表格。"
+    ws["B10"].alignment = Alignment(vertical="center", wrap_text=True)
+    ws["B10"].border = THIN_BORDER
+    ws.merge_cells("B10:G10")
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:

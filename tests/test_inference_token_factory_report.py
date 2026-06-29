@@ -30,13 +30,13 @@ EXPECTED_SHEETS = [
 ]
 
 PRINCIPLE_EXPECTATIONS = {
-    "04_模型量化": ["BF16/FP16", "FP8", "吞吐提升"],
-    "05_KVCache量化": ["KV Cache Block", "fp8 KV", "fp4 H200 不支持"],
-    "06_Prefix_KV命中": ["共享前缀", "Prefix Hash", "复用 KV"],
-    "07_投机解码": ["Draft", "Verify", "Accept/Reject"],
-    "08_PD分离": ["Prefill", "KV 传输", "Decode", "H200 P + H20 D"],
-    "09_MOE专家并行": ["Router", "Experts", "All2All", "GLM5.1/GLM5.2 FP8"],
-    "10_连续批处理": ["Scheduler", "Prefill", "Decode", "框架原生支持"],
+    "04_模型量化": ["BF16/FP16 权重与激活", "FP8/量化模型", "显存下降", "吞吐提升"],
+    "05_KVCache量化": ["KV Cache Block", "fp16/bf16 KV", "fp8 KV", "fp4 H200 不支持"],
+    "06_Prefix_KV命中": ["共享前缀", "Prefix Hash", "复用 KV", "TTFT 降低"],
+    "07_投机解码": ["Draft 候选 token", "Verify", "Accept/Reject", "TPOT 降低"],
+    "08_PD分离": ["Prefill(H200)", "KV 传输", "Decode(H200/H20)", "H200 P + H20 D"],
+    "09_MOE专家并行": ["Router", "多 GPU Experts", "All2All 聚合", "GLM5.1/GLM5.2 FP8"],
+    "10_连续批处理": ["Scheduler", "新请求 Prefill", "旧请求 Decode", "框架原生支持"],
 }
 
 
@@ -48,6 +48,13 @@ def assert_cell_has_table_style(cell):
 def assert_cell_has_table_header_style(cell):
     assert cell.fill.fgColor.rgb in {"00D9EAF7", "D9EAF7"}
     assert cell.font.bold is True
+
+
+def assert_cell_has_principle_node_style(cell):
+    assert cell.fill.fgColor.rgb in {"00D9EAF7", "D9EAF7"}
+    assert cell.font.bold is True
+    assert cell.alignment.wrap_text is True
+    assert cell.border.left.style == "thin"
 
 
 def test_static_sheet_specs_and_status_labels():
@@ -125,10 +132,28 @@ def test_each_technology_sheet_has_principle_diagram(tmp_path):
     wb = build_workbook(Path("."))
     wb.save(output)
     loaded = load_workbook(output)
+    node_columns = ["A", "C", "E", "G"]
+    arrow_columns = ["B", "D", "F"]
     for sheet_name, expected_labels in PRINCIPLE_EXPECTATIONS.items():
         ws = loaded[sheet_name]
-        values = [cell.value for row in ws.iter_rows(min_row=6, max_row=18) for cell in row if cell.value]
-        text = " ".join(str(v) for v in values)
-        assert "V2.2 方案：原理简图" in text
-        for label in expected_labels:
-            assert label in text
+        assert ws["A6"].value == "V2.2 方案：原理简图"
+
+        for col, expected_label in zip(node_columns, expected_labels):
+            cell = ws[f"{col}8"]
+            assert cell.value == expected_label
+            assert_cell_has_principle_node_style(cell)
+            assert ws.column_dimensions[col].width >= 20
+
+        for col in arrow_columns:
+            cell = ws[f"{col}8"]
+            assert cell.value == "→"
+            assert cell.alignment.horizontal == "center"
+            assert cell.alignment.vertical == "center"
+            assert cell.border.left.style == "thin"
+            assert ws.column_dimensions[col].width == 6
+
+        assert ws["A10"].value == "说明"
+        assert "快速解释技术机制" in ws["B10"].value
+        for cell in (ws["A10"], ws["B10"]):
+            assert cell.alignment.wrap_text is True
+            assert cell.border.left.style == "thin"
