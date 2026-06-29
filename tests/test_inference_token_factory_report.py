@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import pytest
-
 from scripts.build_inference_token_factory_report import (
     REPORT_VERSION,
     SHEET_SPECS,
@@ -36,3 +34,8 @@ def test_static_sheet_specs_and_status_labels():
         "待验证",
         "已具备无需独立测试",
     ]
+
+
+def test_build_workbook_creates_expected_sheets():
+    wb = build_workbook(Path("."))
+    assert wb.sheetnames == EXPECTED_SHEETS
