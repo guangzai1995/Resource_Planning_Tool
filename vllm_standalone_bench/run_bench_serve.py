@@ -299,6 +299,8 @@ def _generate_random_requests(args: argparse.Namespace,
     前缀缓存支持（random_prefix_len > 0）：
       - 所有请求共享同一段前缀文本（固定生成一次，用于测试 prefix caching 命中率）
       - random_prefix_len 是 random_input_len 内部的共享前缀长度
+      - 当 random_prefix_len >= random_input_len 时表示 full-prefix 配置；
+        range 模式下共享前缀会扩展到采样输入长度，避免生成独有后缀
       - 每个请求的后缀部分独立随机生成，全 prefix 时请求内容相同
       - 最终 prompt = shared_prefix[:effective_prefix_len] + unique_random_suffix
       - prompt_len ≈ random_input_len（实际值由 tokenizer 决定）
@@ -340,6 +342,11 @@ def _generate_random_requests(args: argparse.Namespace,
         hi = int(base * range_ratio)
         return random.randint(lo, hi)
 
+    def _max_len(base: int) -> int:
+        if range_ratio <= 1.0:
+            return base
+        return int(base * range_ratio)
+
     def _request_index_width(base: int, max_width: int) -> int:
         if max_width <= 0:
             return 0
@@ -380,24 +387,29 @@ def _generate_random_requests(args: argparse.Namespace,
     # ── 预先生成一次共享前缀（所有请求复用，模拟真实前缀缓存场景）──────────────
     shared_prefix_text = ''
     shared_prefix_ids: list[int] = []
-    if prefix_len > 0:
+    configured_full_prefix = prefix_len >= args.random_input_len
+    shared_prefix_len = (
+        _max_len(args.random_input_len) if configured_full_prefix else prefix_len
+    )
+    if shared_prefix_len > 0:
         if tokenizer is not None and hasattr(tokenizer, 'decode'):
             vocab_size = max(int(getattr(tokenizer, 'vocab_size', 32000)), 1)
             shared_prefix_ids = [
-                random.randrange(vocab_size) for _ in range(prefix_len)
+                random.randrange(vocab_size) for _ in range(shared_prefix_len)
             ]
         else:
             shared_prefix_text = ' '.join(
-                str(random.randint(0, 31999)) for _ in range(prefix_len)
+                str(random.randint(0, 31999)) for _ in range(shared_prefix_len)
             )
 
     requests: list[SampleRequest] = []
     seen_prompts: set[str] = set()
-    configured_non_full_prefix = prefix_len < args.random_input_len
     for i in range(args.num_prompts):
         in_len = _rand_len(args.random_input_len)
         out_len = _rand_len(args.random_output_len)
-        if configured_non_full_prefix and args.num_prompts > 1 and in_len > 0:
+        if configured_full_prefix:
+            effective_prefix_len = in_len
+        elif args.num_prompts > 1 and in_len > 0:
             effective_prefix_len = min(prefix_len, max(in_len - 1, 0))
         else:
             effective_prefix_len = min(prefix_len, in_len)
@@ -429,7 +441,7 @@ def _generate_random_requests(args: argparse.Namespace,
             ]
             suffix_text = ' '.join(suffix_tokens)
             prefix_text = shared_prefix_text
-            if effective_prefix_len < prefix_len and shared_prefix_text:
+            if effective_prefix_len < shared_prefix_len and shared_prefix_text:
                 prefix_text = ' '.join(
                     shared_prefix_text.split()[:effective_prefix_len]
                 )
