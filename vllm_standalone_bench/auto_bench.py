@@ -609,6 +609,11 @@ def docker_network_exists(runner: Runner, network: str) -> bool:
 
 
 def ensure_network(config: AutoBenchConfig, runner: Runner, dry_run: bool) -> bool:
+    if dry_run:
+        if config.run.create_network:
+            print_cmd(["docker", "network", "create", config.run.network])
+            return True
+        return False
     if docker_network_exists(runner, config.run.network):
         return False
     if not config.run.create_network:
@@ -678,6 +683,45 @@ def wait_for_ready(base_url: str, api_key: str | None, timeout_sec: int) -> bool
         except (OSError, TimeoutError, urllib.error.URLError):
             time.sleep(2)
     return False
+
+
+READY_PROBE_SCRIPT = """import sys
+import time
+import urllib.error
+import urllib.request
+
+url = sys.argv[1]
+api_key = sys.argv[2]
+timeout = float(sys.argv[3])
+deadline = time.time() + timeout
+headers = {}
+if api_key:
+    headers["Authorization"] = f"Bearer {api_key}"
+while time.time() < deadline:
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.status == 200:
+                sys.exit(0)
+    except (OSError, TimeoutError, urllib.error.URLError):
+        time.sleep(2)
+sys.exit(1)
+"""
+
+
+def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
+                             runner: Runner) -> bool:
+    url = f"http://{case.container_name}:{config.run.container_port}/v1/models"
+    result = runner.run([
+        "docker", "run", "--rm",
+        "--network", config.run.network,
+        config.run.bench_image,
+        "python", "-c", READY_PROBE_SCRIPT,
+        url,
+        config.run.api_key or "",
+        str(config.run.ready_timeout_sec),
+    ], check=False)
+    return result.returncode == 0
 
 
 def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
@@ -798,18 +842,36 @@ def finished_state(run_id: str, manifest: Manifest) -> dict[str, Any]:
     }
 
 
+def _case_key(case: BenchmarkCase) -> tuple[str, str, str]:
+    return (case.model.name, case.serve_profile.name, case.bench_profile.name)
+
+
+def _manifest_case_keys(manifest: Manifest) -> set[tuple[str, str, str]]:
+    return {
+        (str(row["model"]), str(row["serve_profile"]), str(row["bench_profile"]))
+        for row in manifest.cases
+    }
+
+
 def _record_skipped_group(manifest: Manifest, run_dir: Path, run_id: str,
                           group_cases: list[BenchmarkCase], config: AutoBenchConfig,
-                          error: str) -> None:
+                          error: str) -> int:
+    recorded = _manifest_case_keys(manifest)
+    added = 0
     for case in group_cases:
+        if _case_key(case) in recorded:
+            continue
         layout = build_layout(config, run_id, case)
         layout.bench_dir.mkdir(parents=True, exist_ok=True)
         manifest.record(case, layout, "skipped", error=error)
+        recorded.add(_case_key(case))
+        added += 1
         write_json_atomic(layout.bench_dir / "status.json", {
             "status": "skipped",
             "error": error,
         })
     write_manifest(run_dir, manifest)
+    return added
 
 
 def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, str], list[BenchmarkCase]]:
@@ -819,11 +881,12 @@ def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, s
     return grouped
 
 
-def _run_controller_dry_run(config: AutoBenchConfig, run_id: str, runner: Runner) -> int:
+def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
     cases = expand_cases(config, run_id=run_id)
-    network_owned = False
+    network_owned = config.run.create_network
     try:
-        network_owned = ensure_network(config, runner, dry_run=True)
+        if config.run.create_network:
+            print_cmd(["docker", "network", "create", config.run.network])
         for group_cases in _group_cases_by_serve(cases).values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
@@ -833,15 +896,20 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str, runner: Runner
                 print_cmd(build_bench_run_command(config, case, layout.bench_dir))
         return 0
     finally:
-        cleanup_network(config, runner, network_owned, dry_run=True)
+        if should_cleanup_network(
+            owned=network_owned,
+            cleanup_enabled=config.run.cleanup_network,
+            connected_containers=[],
+        ):
+            print_cmd(["docker", "network", "rm", config.run.network])
 
 
 def run_controller(config: AutoBenchConfig, run_id: str,
                    runner: Runner | None = None,
-                   dry_run: bool = False) -> int:
+    dry_run: bool = False) -> int:
     active_runner: Runner = runner or DockerRunner()
     if dry_run:
-        return _run_controller_dry_run(config, run_id, active_runner)
+        return _run_controller_dry_run(config, run_id)
 
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
@@ -872,12 +940,14 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                     started = start_result.returncode == 0
                     if not started:
                         ready = False
-                    else:
+                    elif config.run.publish_host_port:
                         ready = wait_for_ready(
-                            f"http://{serve_case.container_name}:{config.run.container_port}/v1",
+                            f"http://127.0.0.1:{config.run.host_port}/v1",
                             config.run.api_key,
                             config.run.ready_timeout_sec,
                         )
+                    else:
+                        ready = wait_for_container_ready(config, serve_case, active_runner)
 
                 if not ready:
                     exit_code = 1
@@ -886,8 +956,14 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         if not started and not dry_run else
                         "vLLM ready check timed out"
                     )
-                    _record_skipped_group(manifest, run_dir, run_id, group_cases, config, error)
-                    completed += len(group_cases)
+                    completed += _record_skipped_group(
+                        manifest,
+                        run_dir,
+                        run_id,
+                        group_cases,
+                        config,
+                        error,
+                    )
                     continue
 
                 for case in group_cases:
@@ -933,7 +1009,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                     write_manifest(run_dir, manifest)
             except Exception as exc:
                 exit_code = 1
-                _record_skipped_group(
+                completed += _record_skipped_group(
                     manifest,
                     run_dir,
                     run_id,
@@ -941,7 +1017,6 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                     config,
                     str(exc),
                 )
-                completed += len(group_cases)
             finally:
                 if not dry_run and started:
                     save_vllm_artifacts_best_effort(

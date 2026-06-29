@@ -332,6 +332,15 @@ def assert_removed_after_stop(commands, container_name):
     )
 
 
+def ready_probe_commands(commands):
+    return [
+        command for command in commands
+        if command[:3] == ["docker", "run", "--rm"]
+        and "-c" in command
+        and "run_bench_multi.py" not in command
+    ]
+
+
 def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     runner = FakeRunner()
@@ -353,6 +362,7 @@ def test_controller_skips_bench_when_vllm_not_ready(tmp_path, monkeypatch):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     runner = FakeRunner()
     monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: False, raising=False)
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
@@ -373,6 +383,7 @@ def test_controller_ready_exception_stops_and_removes_container(tmp_path, monkey
         raise RuntimeError("boom")
 
     monkeypatch.setattr(ab, "wait_for_ready", raise_ready)
+    monkeypatch.setattr(ab, "wait_for_container_ready", raise_ready, raising=False)
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
@@ -381,6 +392,56 @@ def test_controller_ready_exception_stops_and_removes_container(tmp_path, monkey
     assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
     assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_controller_default_ready_probe_runs_inside_docker_network(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+
+    def reject_host_ready(*args, **kwargs):
+        raise AssertionError("host ready check should not be used by default")
+
+    monkeypatch.setattr(ab, "wait_for_ready", reject_host_ready)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    probes = ready_probe_commands(runner.commands)
+    assert result == 0
+    assert len(probes) == 1
+    assert value_after(probes[0], "--network") == "vllm-bench-net"
+    assert "vllm-bench-runner:offline" in probes[0]
+    assert "http://bench-vllm-qwen2_5_1_5b-bf16_default-run123:8000/v1/models" in probes[0]
+
+
+def test_controller_published_port_ready_uses_localhost(tmp_path, monkeypatch):
+    data = minimal_config(tmp_path)
+    data["run"]["publish_host_port"] = True
+    data["run"]["host_port"] = 18080
+    config = ab.load_config(write_config(tmp_path, data))
+    runner = FakeRunner()
+    captured = {}
+
+    def capture_host_ready(base_url, api_key, timeout_sec):
+        captured["base_url"] = base_url
+        captured["api_key"] = api_key
+        captured["timeout_sec"] = timeout_sec
+        return True
+
+    def reject_container_ready(*args, **kwargs):
+        raise AssertionError("container ready check should not be used with published port")
+
+    monkeypatch.setattr(ab, "wait_for_ready", capture_host_ready)
+    monkeypatch.setattr(ab, "wait_for_container_ready", reject_container_ready, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 0
+    assert captured == {
+        "base_url": "http://127.0.0.1:18080/v1",
+        "api_key": "local-bench-key",
+        "timeout_sec": 30,
+    }
+    assert ready_probe_commands(runner.commands) == []
 
 
 def test_controller_artifact_failure_still_stops_and_removes_container(tmp_path, monkeypatch):
@@ -420,7 +481,38 @@ def test_controller_dry_run_prints_commands_without_result_files(tmp_path, capsy
     assert not (
         run_dir / "qwen2_5_1_5b" / "bf16_default" / "smoke" / "status.json"
     ).exists()
-    assert runner.commands == [["docker", "network", "inspect", "vllm-bench-net"]]
+    assert runner.commands == []
+
+
+def test_controller_group_exception_skips_only_unrecorded_cases(tmp_path, monkeypatch):
+    data = minimal_config(tmp_path)
+    second_profile = dict(data["bench_profiles"][0])
+    second_profile["name"] = "smoke2"
+    data["bench_profiles"].append(second_profile)
+    config = ab.load_config(write_config(tmp_path, data))
+    runner = FakeRunner()
+    original_build_bench = ab.build_bench_run_command
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True, raising=False)
+
+    def fail_second_bench(config_arg, case, bench_dir):
+        if case.bench_profile.name == "smoke2":
+            raise RuntimeError("bench boom")
+        return original_build_bench(config_arg, case, bench_dir)
+
+    monkeypatch.setattr(ab, "build_bench_run_command", fail_second_bench)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert len(manifest["cases"]) == 2
+    assert [case["bench_profile"] for case in manifest["cases"]] == ["smoke", "smoke2"]
+    assert [case["status"] for case in manifest["cases"]] == ["passed", "skipped"]
+    assert state["counts"]["passed"] == 1
+    assert state["counts"]["skipped"] == 1
+    assert state["counts"]["total"] == 2
 
 
 def test_current_state_counts_manifest_cases(tmp_path):
