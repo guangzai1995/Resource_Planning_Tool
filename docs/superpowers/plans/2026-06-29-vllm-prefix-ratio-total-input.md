@@ -26,6 +26,10 @@
 | `vllm_standalone_bench/tests/test_random_dataset.py` | 锁定 random 请求生成长度：prefix 是 input 内部比例，不额外增加 prompt。 |
 | `vllm_standalone_bench/tests/test_extract_row.py` | 锁定报表口径：`total_input_len == input_len`，合规按总输入算。 |
 
+## 执行粒度说明
+
+任务 1 和任务 2 构成同一个 TDD 红绿循环：先写失败测试，再实现最少代码让测试通过。执行时由同一个实现子智能体连续完成任务 1 和任务 2，并在任务 2 的 commit 之后进行规格合规审查和代码质量审查。
+
 ## 任务 1：用测试锁住 random prompt 总长度
 
 **文件：**
