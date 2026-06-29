@@ -178,7 +178,10 @@ def test_build_vllm_command_uses_bridge_network_without_host_port(tmp_path):
     serve_index = cmd.index("serve")
     assert cmd[serve_index + 1] == "/models/Qwen2.5-1.5B-Instruct"
     assert value_after(cmd, "--served-model-name") == case.api_model_name
+    assert value_after(cmd, "--host") == "0.0.0.0"
     assert value_after(cmd, "--port") == "8000"
+    assert value_after(cmd, "--api-key") == "local-bench-key"
+    assert value_after(cmd, "--dtype") == "bfloat16"
 
 
 def test_build_bench_command_targets_container_dns(tmp_path):
@@ -196,6 +199,7 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert f"http://{case.container_name}:8000/v1" in cmd
     assert "--model" in cmd
     assert "qwen2_5_1_5b" in cmd
+    assert value_after(cmd, "--model") == "qwen2_5_1_5b"
     assert "--output-csv" in cmd
     assert "/results/result.csv" in cmd
     assert value_after(cmd, "--served-model-name") == "qwen2_5_1_5b"
