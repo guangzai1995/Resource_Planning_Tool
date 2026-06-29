@@ -1,10 +1,14 @@
 from pathlib import Path
 
+import pytest
+
 from scripts.build_inference_token_factory_report import (
     REPORT_VERSION,
     SHEET_SPECS,
     STATUS_LABELS,
     build_workbook,
+    compute_fp8_summary,
+    load_context_summary,
 )
 
 
@@ -39,3 +43,21 @@ def test_static_sheet_specs_and_status_labels():
 def test_build_workbook_creates_expected_sheets():
     wb = build_workbook(Path("."))
     assert wb.sheetnames == EXPECTED_SHEETS
+
+
+def test_load_context_summary_from_existing_outputs():
+    summary = load_context_summary(Path("."))
+    assert summary["total_requests"] == 1_008_098
+    assert summary["total_tokens_billion"] == pytest.approx(59.36, rel=0.01)
+    assert summary["input_token_ratio"] == pytest.approx(0.989, rel=0.01)
+    assert summary["long_context_ratio"] == pytest.approx(0.623, rel=0.02)
+
+
+def test_compute_h200_fp8_summary_from_existing_csvs():
+    summary = compute_fp8_summary(Path("."))
+    assert summary["72B"]["matched_rows"] >= 30
+    assert summary["72B"]["avg_throughput_gain_pct"] == pytest.approx(32.4, rel=0.08)
+    assert summary["72B"]["avg_tpot_ratio_pct"] == pytest.approx(77.5, rel=0.08)
+    assert summary["32B"]["matched_rows"] >= 30
+    assert summary["32B"]["avg_throughput_gain_pct"] == pytest.approx(30.3, rel=0.08)
+    assert summary["32B"]["avg_tpot_ratio_pct"] == pytest.approx(77.8, rel=0.08)
