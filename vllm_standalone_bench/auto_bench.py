@@ -25,6 +25,10 @@ class ConfigError(ValueError):
     """Raised when the auto bench configuration is invalid."""
 
 
+class StopRequested(Exception):
+    """Raised when the detached controller is asked to stop gracefully."""
+
+
 @dataclass(frozen=True)
 class RunConfig:
     name: str
@@ -671,6 +675,15 @@ def print_cmd(cmd: list[str]) -> None:
     print("+ " + " ".join(cmd))
 
 
+def install_signal_handlers() -> None:
+    def request_stop(signum: int, frame: Any) -> None:
+        _ = frame
+        raise StopRequested(f"received signal {signum}")
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+
 def wait_for_ready(base_url: str, api_key: str | None, timeout_sec: int) -> bool:
     import urllib.error
     import urllib.request
@@ -858,9 +871,9 @@ def _manifest_case_keys(manifest: Manifest) -> set[tuple[str, str, str]]:
     }
 
 
-def _record_skipped_group(manifest: Manifest, run_dir: Path, run_id: str,
-                          group_cases: list[BenchmarkCase], config: AutoBenchConfig,
-                          error: str) -> int:
+def _record_group_status(manifest: Manifest, run_dir: Path, run_id: str,
+                         group_cases: list[BenchmarkCase], config: AutoBenchConfig,
+                         status: str, error: str) -> int:
     recorded = _manifest_case_keys(manifest)
     added = 0
     for case in group_cases:
@@ -868,15 +881,43 @@ def _record_skipped_group(manifest: Manifest, run_dir: Path, run_id: str,
             continue
         layout = build_layout(config, run_id, case)
         layout.bench_dir.mkdir(parents=True, exist_ok=True)
-        manifest.record(case, layout, "skipped", error=error)
+        manifest.record(case, layout, status, error=error)
         recorded.add(_case_key(case))
         added += 1
         write_json_atomic(layout.bench_dir / "status.json", {
-            "status": "skipped",
+            "status": status,
             "error": error,
         })
     write_manifest(run_dir, manifest)
     return added
+
+
+def _record_skipped_group(manifest: Manifest, run_dir: Path, run_id: str,
+                          group_cases: list[BenchmarkCase], config: AutoBenchConfig,
+                          error: str) -> int:
+    return _record_group_status(
+        manifest,
+        run_dir,
+        run_id,
+        group_cases,
+        config,
+        "skipped",
+        error,
+    )
+
+
+def _record_interrupted_group(manifest: Manifest, run_dir: Path, run_id: str,
+                              group_cases: list[BenchmarkCase],
+                              config: AutoBenchConfig, error: str) -> int:
+    return _record_group_status(
+        manifest,
+        run_dir,
+        run_id,
+        group_cases,
+        config,
+        "interrupted",
+        error,
+    )
 
 
 def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, str], list[BenchmarkCase]]:
@@ -926,6 +967,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     network_owned = False
     exit_code = 0
     completed = 0
+    interrupted = False
     try:
         network_owned = ensure_network(config, active_runner, dry_run)
         grouped = _group_cases_by_serve(cases)
@@ -1012,6 +1054,17 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                     })
                     completed += 1
                     write_manifest(run_dir, manifest)
+            except StopRequested as exc:
+                exit_code = 130
+                interrupted = True
+                completed += _record_interrupted_group(
+                    manifest,
+                    run_dir,
+                    run_id,
+                    group_cases,
+                    config,
+                    str(exc) or "stop requested",
+                )
             except Exception as exc:
                 exit_code = 1
                 completed += _record_skipped_group(
@@ -1033,9 +1086,22 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                     stop_and_remove_container(active_runner, serve_case.container_name, dry_run)
                     if config.run.cooldown_sec > 0:
                         time.sleep(config.run.cooldown_sec)
+            if interrupted:
+                break
 
         write_state(run_dir, finished_state(run_id, manifest))
         return exit_code
+    except StopRequested as exc:
+        _record_interrupted_group(
+            manifest,
+            run_dir,
+            run_id,
+            list(cases),
+            config,
+            str(exc) or "stop requested",
+        )
+        write_state(run_dir, finished_state(run_id, manifest))
+        return 130
     finally:
         cleanup_network(config, active_runner, network_owned, dry_run)
 
@@ -1112,7 +1178,11 @@ def print_status(run_dir: Path) -> int:
     if not state_path.exists():
         print(f"state file not found: {state_path}", file=sys.stderr)
         return 1
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"state file invalid: {exc}", file=sys.stderr)
+        return 1
     print(f"run_id: {state.get('run_id', run_dir.name)}")
     print(f"status: {state.get('status', 'unknown')}")
     print(f"current: {_format_current(state.get('current'))}")
@@ -1125,7 +1195,7 @@ def follow_file(path: Path) -> int:
         print(f"log file not found: {path}", file=sys.stderr)
         return 1
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
             while True:
                 line = handle.readline()
                 if line:
@@ -1133,6 +1203,9 @@ def follow_file(path: Path) -> int:
                     sys.stdout.flush()
                 else:
                     time.sleep(1)
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"failed to read log file: {exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         return 0
 
@@ -1141,7 +1214,11 @@ def print_log(path: Path) -> int:
     if not path.exists():
         print(f"log file not found: {path}", file=sys.stderr)
         return 1
-    sys.stdout.write(path.read_text(encoding="utf-8"))
+    try:
+        sys.stdout.write(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"failed to read log file: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1270,6 +1347,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_controller(config, run_id=run_id, dry_run=True)
         if args.detach and not args.child:
             return start_detached(args.config, config, run_id)
+        if args.child:
+            install_signal_handlers()
         return run_controller(config, run_id=run_id, dry_run=args.dry_run)
     if args.command == "status":
         return print_status(args.results_dir / args.run_id)

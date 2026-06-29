@@ -395,6 +395,66 @@ def test_controller_ready_exception_stops_and_removes_container(tmp_path, monkey
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
 
 
+def test_controller_stop_requested_writes_interrupted_and_cleans(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+
+    def stop_ready(*args, **kwargs):
+        raise ab.StopRequested("stopped")
+
+    monkeypatch.setattr(ab, "wait_for_container_ready", stop_ready, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    joined = [" ".join(cmd) for cmd in runner.commands]
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert result != 0
+    assert manifest["status"] == "interrupted"
+    assert manifest["cases"][0]["status"] == "interrupted"
+    assert state["status"] == "interrupted"
+    assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
+    assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
+    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_install_signal_handlers_raises_stop_requested(monkeypatch):
+    handlers = {}
+
+    def fake_signal(signum, handler):
+        handlers[signum] = handler
+
+    monkeypatch.setattr(ab.signal, "signal", fake_signal)
+
+    ab.install_signal_handlers()
+
+    assert ab.signal.SIGTERM in handlers
+    with pytest.raises(ab.StopRequested):
+        handlers[ab.signal.SIGTERM](ab.signal.SIGTERM, None)
+
+
+def test_main_child_run_installs_signal_handlers(tmp_path, monkeypatch):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    calls = []
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: calls.append("signals"), raising=False)
+    monkeypatch.setattr(
+        ab,
+        "run_controller",
+        lambda config, run_id, runner=None, dry_run=False: calls.append(("controller", dry_run)) or 0,
+    )
+
+    exit_code = ab.main([
+        "run",
+        "--config", str(config_path),
+        "--run-id", "run123",
+        "--child",
+    ])
+
+    assert exit_code == 0
+    assert calls == ["signals", ("controller", False)]
+
+
 def test_controller_default_ready_probe_runs_inside_docker_network(tmp_path, monkeypatch):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     runner = FakeRunner()
@@ -575,6 +635,18 @@ def test_status_reads_state_file(tmp_path, capsys):
     assert "m/s/b" in captured.out
 
 
+def test_status_corrupt_state_returns_error(tmp_path, capsys):
+    run_dir = tmp_path / "results" / "run123"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("{bad json", encoding="utf-8")
+
+    exit_code = ab.print_status(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "state" in captured.err.lower()
+
+
 def test_parse_args_run_dry_run():
     args = ab.parse_args(["run", "--config", "c.json", "--dry-run"])
 
@@ -609,6 +681,35 @@ def test_logs_prints_controller_log(tmp_path, capsys):
     assert exit_code == 0
     assert "line 1" in captured.out
     assert "line 2" in captured.out
+
+
+def test_logs_replace_invalid_utf8(tmp_path, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.log").write_bytes(b"ok\n\xff\n")
+
+    exit_code = ab.main(["logs", "--results-dir", str(tmp_path), "--run-id", "run123"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "ok" in captured.out
+    assert "\ufffd" in captured.out
+
+
+def test_follow_file_handles_open_error(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "controller.log"
+    path.write_text("data", encoding="utf-8")
+
+    def fail_open(*args, **kwargs):
+        raise OSError("cannot read")
+
+    monkeypatch.setattr(Path, "open", fail_open)
+
+    exit_code = ab.follow_file(path)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "cannot read" in captured.err
 
 
 def write_stop_state(run_dir, status="running"):
