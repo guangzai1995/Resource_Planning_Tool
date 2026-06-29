@@ -37,6 +37,7 @@ import argparse
 import asyncio
 import copy
 import csv
+import hashlib
 import importlib.util
 import itertools
 import logging
@@ -163,6 +164,53 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
 
 
 # ─── 从 serve.py 返回的 result_json 提取 CSV 行 ───────────────────────────────
+
+MAX_SEED_VALUE = 2**32
+
+
+def validate_seed(seed: int) -> None:
+    if not 0 <= seed < MAX_SEED_VALUE:
+        raise ValueError(f"--seed 必须满足 0 <= seed < {MAX_SEED_VALUE}，当前值: {seed}")
+
+
+def derive_config_seed(
+    *,
+    base_seed: int,
+    input_len: int,
+    output_len: int,
+    parallel_num: int,
+    prefix_ratio: float,
+    config_index: int,
+) -> int:
+    key = (
+        f"{base_seed}:{input_len}:{output_len}:{parallel_num}:"
+        f"{prefix_ratio:.12g}:{config_index}"
+    )
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def effective_config_seed(
+    *,
+    base_seed: int,
+    input_len: int,
+    output_len: int,
+    parallel_num: int,
+    prefix_ratio: float,
+    config_index: int,
+    vary_seed_by_config: bool,
+) -> int:
+    validate_seed(base_seed)
+    if not vary_seed_by_config:
+        return base_seed
+    return derive_config_seed(
+        base_seed=base_seed,
+        input_len=input_len,
+        output_len=output_len,
+        parallel_num=parallel_num,
+        prefix_ratio=prefix_ratio,
+        config_index=config_index,
+    )
+
 
 def decide_token_usage_source(*, usage_reported_count: int,
                               tokenizer_fallback_count: int,
@@ -673,6 +721,10 @@ def _parse_args() -> argparse.Namespace:
                             '后缀部分每个请求独立随机生成。'
                             '实际 prompt_len ≈ input_len × (1 + prefix_ratio)。'
                             '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。')
+    bench.add_argument('--seed', type=int, default=0,
+                       help='随机种子（默认: 0）')
+    bench.add_argument('--no-vary-seed-by-config', action='store_true', default=False,
+                       help='所有配置复用同一个随机种子')
 
     # ── Tokenizer ────────────────────────────────────────────────────────────
     tok = p.add_argument_group('Tokenizer（可选）')
