@@ -64,6 +64,13 @@ def _style_range(ws, min_row: int, max_row: int, min_col: int, max_col: int) -> 
             cell.alignment = Alignment(vertical="center", wrap_text=True)
 
 
+def _style_table_header(ws, row: int, max_col: int) -> None:
+    for row_cells in ws.iter_rows(min_row=row, max_row=row, min_col=1, max_col=max_col):
+        for cell in row_cells:
+            cell.fill = SUB_FILL
+            cell.font = Font(bold=True)
+
+
 def _write_header(ws, spec: dict[str, str]) -> None:
     ws["A1"] = "推理 Token 工厂汇报"
     ws["A1"].font = Font(size=16, bold=True, color="FFFFFF")
@@ -88,20 +95,22 @@ def _write_header(ws, spec: dict[str, str]) -> None:
 
 def _write_sheet_index(ws) -> None:
     ws.append([])
-    header_row = ws.max_row + 1
     ws.append(["Sheet", "名称", "责任人", "状态", "说明"])
+    header_row = ws.max_row
     for index, spec in enumerate(SHEET_SPECS):
         ws.append([index, spec["title"], spec["owner"], spec["status"], "按规格生成"])
     _style_range(ws, header_row, ws.max_row, 1, 5)
+    _style_table_header(ws, header_row, 5)
 
 
 def _write_summary(ws) -> None:
     ws.append([])
-    header_row = ws.max_row + 1
     ws.append(["技术点", "状态", "汇报口径"])
+    header_row = ws.max_row
     for row in TECH_ROWS:
         ws.append(list(row))
     _style_range(ws, header_row, ws.max_row, 1, 3)
+    _style_table_header(ws, header_row, 3)
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
