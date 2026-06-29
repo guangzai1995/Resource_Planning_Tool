@@ -54,6 +54,7 @@ def predict(
     input_tokens: int,
     output_tokens: int,
     concurrency: int,
+    max_ttft_ms: float | None = None,
 ) -> dict:
     """
     统一预测入口

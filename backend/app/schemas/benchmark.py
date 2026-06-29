@@ -86,6 +86,16 @@ class GpuSpecSchema(BaseModel):
         from_attributes = True
 
 
+class GpuSpecUpdate(BaseModel):
+    name: Optional[str] = None
+    vendor: Optional[str] = None
+    memory_gb: Optional[float] = None
+    memory_bandwidth_gbps: Optional[float] = None
+    tflops_bf16: Optional[float] = None
+    price_per_hour: Optional[float] = None
+    notes: Optional[str] = None
+
+
 class ModelSchema(BaseModel):
     id: Optional[int] = None
     name: str
@@ -96,3 +106,11 @@ class ModelSchema(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ModelUpdate(BaseModel):
+    name: Optional[str] = None
+    parameter_b: Optional[float] = None
+    model_type: Optional[str] = None
+    default_model_path: Optional[str] = None
+    notes: Optional[str] = None

@@ -94,5 +94,3 @@ def test_usage_without_completion_tokens_keeps_zero():
     assert out.success
     assert out.output_tokens == 0          # 不是 None
     assert out.prompt_len == 3
-
-

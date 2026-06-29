@@ -51,15 +51,15 @@ def optimize(
                 continue
 
             ttft = pred.get("ttft_mean_ms") or 0.0
-            throughput = pred.get("output_throughput") or 0.0
+            throughput = pred.get("throughput_tokens_s") or pred.get("output_throughput") or 0.0
             per_user_tput = throughput / target_concurrency if target_concurrency > 0 else 0
 
             # 计算最大可承载并发数（通过 vLLM 建模估算）
             max_conc = target_concurrency  # 默认
-            if model_row and gpu.memory_bw_gbps and gpu.bf16_tflops:
+            if model_row and gpu.memory_bandwidth_gbps and gpu.tflops_bf16:
                 model_spec = ModelSpec(
                     name=model_row.name,
-                    size_b=model_row.size_b,
+                    size_b=model_row.parameter_b,
                     is_moe=bool(model_row.is_moe),
                     num_layers=model_row.num_layers or 32,
                     hidden_size=model_row.hidden_size or 4096,
@@ -70,8 +70,8 @@ def optimize(
                 gpu_spec = GPUSpec(
                     name=gpu.name,
                     memory_gb=gpu.memory_gb,
-                    memory_bw_gbps=gpu.memory_bw_gbps,
-                    bf16_tflops=gpu.bf16_tflops,
+                    memory_bw_gbps=gpu.memory_bandwidth_gbps,
+                    bf16_tflops=gpu.tflops_bf16,
                 )
                 max_conc, _ = estimate_max_concurrency(
                     model_spec, gpu_spec, gpu_count,

@@ -211,7 +211,13 @@ def predict(
     data_factor = min(1.0, interp_data["data_count"] / 20)
     confidence = round(base_confidence * data_factor, 2)
 
+    results["source"] = "interpolation"
     results["confidence"] = confidence
     results["data_count"] = interp_data["data_count"]
     results["is_extrapolation"] = not in_range
+    results["result"] = {
+        "predicted_ttft_mean_ms": results.get("ttft_mean_ms"),
+        "predicted_ttft_p90_ms": results.get("ttft_p90_ms"),
+        "predicted_throughput_tokens_s": results.get("throughput_tokens_s"),
+    }
     return results

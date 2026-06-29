@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.cache import clear_prediction_cache
-from app.schemas.benchmark import GpuSpecSchema, ModelSchema
+from app.schemas.benchmark import GpuSpecSchema, GpuSpecUpdate, ModelSchema, ModelUpdate
 
 router = APIRouter(tags=["meta"])
 
@@ -41,7 +41,7 @@ def create_gpu(spec: GpuSpecSchema, db: Session = Depends(get_db)):
 
 
 @router.put("/gpus/{gpu_id}", response_model=GpuSpecSchema)
-def update_gpu(gpu_id: int, spec: GpuSpecSchema, db: Session = Depends(get_db)):
+def update_gpu(gpu_id: int, spec: GpuSpecUpdate, db: Session = Depends(get_db)):
     from app.models.gpu_spec import GpuSpec
 
     gpu = db.query(GpuSpec).filter(GpuSpec.id == gpu_id).first()
@@ -99,7 +99,7 @@ def create_model(schema: ModelSchema, db: Session = Depends(get_db)):
 
 
 @router.put("/models/{model_id}", response_model=ModelSchema)
-def update_model(model_id: int, schema: ModelSchema, db: Session = Depends(get_db)):
+def update_model(model_id: int, schema: ModelUpdate, db: Session = Depends(get_db)):
     from app.models.model import Model
 
     model = db.query(Model).filter(Model.id == model_id).first()
