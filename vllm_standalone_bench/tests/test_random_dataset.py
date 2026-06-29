@@ -22,6 +22,13 @@ class TinyTokenizer(FakeTokenizer):
     vocab_size = 2
 
 
+class CollapsingTokenizer(FakeTokenizer):
+    vocab_size = 128
+
+    def decode(self, token_ids):
+        return " ".join("tok" for _ in token_ids)
+
+
 def test_random_prefix_prompt_len_uses_total_input_budget():
     args = argparse.Namespace(
         num_prompts=2,
@@ -111,3 +118,39 @@ def test_random_prefix_raises_when_unique_suffix_capacity_is_exhausted(
 
     with pytest.raises(ValueError, match="unique suffix"):
         rbs._generate_random_requests(args, TinyTokenizer())
+
+
+def test_random_prefix_raises_when_decoded_prompts_collide(monkeypatch):
+    def always_zero(*args):
+        return 0
+
+    monkeypatch.setattr(rbs.random, "randrange", always_zero)
+    args = argparse.Namespace(
+        num_prompts=2,
+        random_input_len=8,
+        random_output_len=4,
+        random_prefix_len=3,
+        random_range_ratio=1.0,
+    )
+
+    with pytest.raises(ValueError, match="unique prompt"):
+        rbs._generate_random_requests(args, CollapsingTokenizer())
+
+
+def test_random_prefix_range_ratio_keeps_suffix_for_short_inputs(monkeypatch):
+    def lower_bound(lo, hi):
+        return lo
+
+    monkeypatch.setattr(rbs.random, "randint", lower_bound)
+    args = argparse.Namespace(
+        num_prompts=2,
+        random_input_len=8,
+        random_output_len=4,
+        random_prefix_len=3,
+        random_range_ratio=4.0,
+    )
+
+    requests = rbs._generate_random_requests(args, FakeTokenizer())
+
+    assert [req.prompt_len for req in requests] == [2, 2]
+    assert requests[0].prompt != requests[1].prompt

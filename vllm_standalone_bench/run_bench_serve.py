@@ -392,10 +392,15 @@ def _generate_random_requests(args: argparse.Namespace,
             )
 
     requests: list[SampleRequest] = []
+    seen_prompts: set[str] = set()
+    configured_non_full_prefix = prefix_len < args.random_input_len
     for i in range(args.num_prompts):
         in_len = _rand_len(args.random_input_len)
         out_len = _rand_len(args.random_output_len)
-        effective_prefix_len = min(prefix_len, in_len)
+        if configured_non_full_prefix and args.num_prompts > 1 and in_len > 0:
+            effective_prefix_len = min(prefix_len, max(in_len - 1, 0))
+        else:
+            effective_prefix_len = min(prefix_len, in_len)
         suffix_len = max(in_len - effective_prefix_len, 0)
 
         # ── 生成每个请求独有的后缀（保证请求间内容不同）────────────────────────
@@ -430,6 +435,14 @@ def _generate_random_requests(args: argparse.Namespace,
                 )
             prompt = ' '.join(part for part in (prefix_text, suffix_text) if part)
             actual_len = in_len
+
+        if suffix_len > 0 and prompt in seen_prompts:
+            raise ValueError(
+                'unique prompt collision: '
+                f'request_index={i}, prompt_len={actual_len}, '
+                f'suffix_len={suffix_len}'
+            )
+        seen_prompts.add(prompt)
 
         requests.append(SampleRequest(
             prompt=prompt,
