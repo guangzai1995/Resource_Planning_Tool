@@ -582,3 +582,288 @@ class Manifest:
 
 def write_manifest(run_dir: Path, manifest: Manifest) -> None:
     write_json_atomic(run_dir / "manifest.json", manifest.to_dict())
+
+
+class FakeRunnerProtocol:
+    def run(self, args: list[str], *, check: bool = False,
+            capture: bool = True, text: bool = True,
+            stdout: Any = None, stderr: Any = None) -> Completed:
+        raise NotImplementedError
+
+
+Runner = DockerRunner | FakeRunnerProtocol
+
+
+def _check_result(result: Completed) -> Completed:
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({result.returncode}): {' '.join(result.args)}\n{result.stderr}"
+        )
+    return result
+
+
+def docker_network_exists(runner: Runner, network: str) -> bool:
+    result = runner.run(["docker", "network", "inspect", network], check=False)
+    return result.returncode == 0
+
+
+def ensure_network(config: AutoBenchConfig, runner: Runner, dry_run: bool) -> bool:
+    if dry_run:
+        if not config.run.create_network:
+            raise RuntimeError(f"Docker network does not exist: {config.run.network}")
+        print_cmd(["docker", "network", "create", config.run.network])
+        return True
+    if docker_network_exists(runner, config.run.network):
+        return False
+    if not config.run.create_network:
+        raise RuntimeError(f"Docker network does not exist: {config.run.network}")
+    _check_result(runner.run(["docker", "network", "create", config.run.network], check=False))
+    return True
+
+
+def connected_network_containers(runner: Runner, network: str) -> list[str]:
+    result = runner.run([
+        "docker", "inspect", "--format",
+        "{{json .Containers}}", network,
+    ], check=False)
+    payload = result.stdout.strip()
+    if result.returncode != 0 or payload in ("", "null", "{}"):
+        return []
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return ["unknown"]
+    if isinstance(data, list):
+        return [str(item) for item in data]
+    if isinstance(data, dict):
+        return [str(key) for key in data.keys()]
+    return ["unknown"]
+
+
+def cleanup_network(config: AutoBenchConfig, runner: Runner,
+                    owned: bool, dry_run: bool) -> None:
+    if not owned or not config.run.cleanup_network:
+        return
+    connected = [] if dry_run else connected_network_containers(runner, config.run.network)
+    if should_cleanup_network(
+        owned=owned,
+        cleanup_enabled=config.run.cleanup_network,
+        connected_containers=connected,
+    ):
+        cmd = ["docker", "network", "rm", config.run.network]
+        if dry_run:
+            print_cmd(cmd)
+        else:
+            runner.run(cmd, check=False)
+
+
+def print_cmd(cmd: list[str]) -> None:
+    print("+ " + " ".join(cmd))
+
+
+def wait_for_ready(base_url: str, api_key: str | None, timeout_sec: int) -> bool:
+    import urllib.error
+    import urllib.request
+
+    deadline = time.time() + timeout_sec
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    while time.time() < deadline:
+        request = urllib.request.Request(f"{base_url}/models", headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                if response.status == 200:
+                    return True
+        except (OSError, TimeoutError, urllib.error.URLError):
+            time.sleep(2)
+    return False
+
+
+def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
+                        case: BenchmarkCase, layout: CaseLayout) -> None:
+    layout.serve_dir.mkdir(parents=True, exist_ok=True)
+    logs = runner.run(["docker", "logs", "--timestamps", case.container_name], check=False)
+    (layout.serve_dir / "vllm.log").write_text(
+        logs.stdout + logs.stderr,
+        encoding="utf-8",
+    )
+    inspect = runner.run(["docker", "inspect", case.container_name], check=False)
+    (layout.serve_dir / "docker.inspect.json").write_text(inspect.stdout, encoding="utf-8")
+    (layout.serve_dir / "serve_command.txt").write_text(
+        " ".join(build_vllm_run_command(config, case, layout.run_dir)),
+        encoding="utf-8",
+    )
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if hasattr(value, "__dataclass_fields__"):
+        return {
+            field_name: _jsonable(getattr(value, field_name))
+            for field_name in value.__dataclass_fields__
+        }
+    return value
+
+
+def config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
+    return _jsonable(config)
+
+
+def _case_ref(case: BenchmarkCase) -> dict[str, str]:
+    return {
+        "model": case.model.name,
+        "serve_profile": case.serve_profile.name,
+        "bench_profile": case.bench_profile.name,
+    }
+
+
+def current_state(run_id: str, cases: tuple[BenchmarkCase, ...], completed: int,
+                  case: BenchmarkCase, status: str) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "status": status,
+        "current": _case_ref(case),
+        "counts": {
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "running": 1 if status == "running" else 0,
+            "completed": completed,
+            "total": len(cases),
+        },
+    }
+
+
+def finished_state(run_id: str, manifest: Manifest) -> dict[str, Any]:
+    counts = {"passed": 0, "failed": 0, "skipped": 0, "running": 0, "total": manifest.total}
+    for case in manifest.cases:
+        status = case.get("status")
+        if status in counts:
+            counts[status] += 1
+    if manifest.status() == "running":
+        counts["running"] = max(manifest.total - len(manifest.cases), 0)
+    return {
+        "run_id": run_id,
+        "status": manifest.status(),
+        "current": None,
+        "counts": counts,
+    }
+
+
+def _record_skipped_group(manifest: Manifest, run_dir: Path, run_id: str,
+                          group_cases: list[BenchmarkCase], config: AutoBenchConfig,
+                          error: str) -> None:
+    for case in group_cases:
+        layout = build_layout(config, run_id, case)
+        layout.bench_dir.mkdir(parents=True, exist_ok=True)
+        manifest.record(case, layout, "skipped", error=error)
+        write_json_atomic(layout.bench_dir / "status.json", {
+            "status": "skipped",
+            "error": error,
+        })
+    write_manifest(run_dir, manifest)
+
+
+def run_controller(config: AutoBenchConfig, run_id: str,
+                   runner: Runner | None = None,
+                   dry_run: bool = False) -> int:
+    active_runner: Runner = runner or DockerRunner()
+    cases = expand_cases(config, run_id=run_id)
+    run_dir = config.run.results_dir / run_id
+    manifest = Manifest(run_id=run_id, total=len(cases))
+    write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
+    if not dry_run:
+        validate_local_paths(config)
+
+    network_owned = False
+    exit_code = 0
+    completed = 0
+    try:
+        network_owned = ensure_network(config, active_runner, dry_run)
+        grouped: dict[tuple[str, str], list[BenchmarkCase]] = {}
+        for case in cases:
+            grouped.setdefault((case.model.name, case.serve_profile.name), []).append(case)
+
+        for group_cases in grouped.values():
+            serve_case = group_cases[0]
+            serve_layout = build_layout(config, run_id, serve_case)
+            vllm_cmd = build_vllm_run_command(config, serve_case, serve_layout.run_dir)
+            started = False
+            if dry_run:
+                print_cmd(vllm_cmd)
+                ready = True
+            else:
+                active_runner.run(["docker", "rm", "-f", serve_case.container_name], check=False)
+                start_result = active_runner.run(vllm_cmd, check=False)
+                started = start_result.returncode == 0
+                if not started:
+                    ready = False
+                else:
+                    ready = wait_for_ready(
+                        f"http://{serve_case.container_name}:{config.run.container_port}/v1",
+                        config.run.api_key,
+                        config.run.ready_timeout_sec,
+                    )
+
+            try:
+                if not ready:
+                    exit_code = 1
+                    error = (
+                        "vLLM container failed to start"
+                        if not started and not dry_run else
+                        "vLLM ready check timed out"
+                    )
+                    _record_skipped_group(manifest, run_dir, run_id, group_cases, config, error)
+                    completed += len(group_cases)
+                    continue
+
+                for case in group_cases:
+                    layout = build_layout(config, run_id, case)
+                    layout.bench_dir.mkdir(parents=True, exist_ok=True)
+                    write_state(run_dir, current_state(run_id, cases, completed, case, "running"))
+                    bench_cmd = build_bench_run_command(config, case, layout.bench_dir)
+                    if dry_run:
+                        print_cmd(bench_cmd)
+                        status = "passed"
+                        error = None
+                    else:
+                        with (layout.bench_dir / "bench.log").open("w", encoding="utf-8") as log:
+                            result = active_runner.run(
+                                bench_cmd,
+                                check=False,
+                                capture=False,
+                                stdout=log,
+                                stderr=log,
+                            )
+                        status = "passed" if result.returncode == 0 else "failed"
+                        error = None if result.returncode == 0 else (
+                            f"benchmark exited {result.returncode}"
+                        )
+                    if status != "passed":
+                        exit_code = 1
+                    manifest.record(case, layout, status, error=error)
+                    write_json_atomic(layout.bench_dir / "status.json", {
+                        "status": status,
+                        "error": error,
+                    })
+                    completed += 1
+                    write_manifest(run_dir, manifest)
+            finally:
+                if not dry_run and started:
+                    save_vllm_artifacts(config, active_runner, serve_case, serve_layout)
+                    active_runner.run(["docker", "stop", serve_case.container_name], check=False)
+                    if config.run.cooldown_sec > 0:
+                        time.sleep(config.run.cooldown_sec)
+
+        write_state(run_dir, finished_state(run_id, manifest))
+        return exit_code
+    finally:
+        cleanup_network(config, active_runner, network_owned, dry_run)

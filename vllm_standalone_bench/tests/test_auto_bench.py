@@ -286,3 +286,60 @@ def test_manifest_status_matrix(tmp_path):
     failed = ab.Manifest(run_id="run123", total=1)
     failed.record(case, layout, "failed", error="boom")
     assert failed.status() == "completed_with_failures"
+
+
+class FakeRunner:
+    def __init__(self, failures=None):
+        self.commands = []
+        self.failures = failures or {}
+
+    def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+        self.commands.append(list(args))
+        key = " ".join(args[:3])
+        if key in self.failures:
+            return ab.Completed(list(args), self.failures[key], "", "forced failure")
+        if args[:3] == ["docker", "network", "inspect"]:
+            return ab.Completed(list(args), 1, "", "not found")
+        if args[:3] == ["docker", "network", "create"]:
+            return ab.Completed(list(args), 0, "network-id\n", "")
+        if args[:3] == ["docker", "run", "-d"]:
+            return ab.Completed(list(args), 0, "container-id\n", "")
+        if args[:3] == ["docker", "logs", "--timestamps"]:
+            return ab.Completed(list(args), 0, "vllm log\n", "")
+        if args[:3] == ["docker", "inspect", "--format"]:
+            return ab.Completed(list(args), 0, "[]\n", "")
+        if args[:3] == ["docker", "network", "rm"]:
+            return ab.Completed(list(args), 0, "", "")
+        if args[:2] == ["docker", "stop"]:
+            return ab.Completed(list(args), 0, "", "")
+        if args[:3] == ["docker", "inspect", "--type=image"]:
+            return ab.Completed(list(args), 0, "image\n", "")
+        return ab.Completed(list(args), 0, "ok\n", "")
+
+
+def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    joined = [" ".join(cmd) for cmd in runner.commands]
+    assert result == 0
+    assert any("docker network create vllm-bench-net" in cmd for cmd in joined)
+    assert any("docker run -d" in cmd for cmd in joined)
+    assert any("run_bench_multi.py" in cmd for cmd in joined)
+    assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
+    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_controller_skips_bench_when_vllm_not_ready(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: False)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 1
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["cases"][0]["status"] == "skipped"
