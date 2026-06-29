@@ -628,3 +628,127 @@ def test_stop_run_sends_sigterm(tmp_path, monkeypatch, capsys):
     assert exit_code == 0
     assert signals == [(12345, ab.signal.SIGTERM)]
     assert "12345" in captured.out
+
+
+def test_stop_run_rejects_unsafe_pid(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("0\n", encoding="utf-8")
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for unsafe pid")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "unsafe pid" in captured.err
+
+
+def test_stop_run_handles_missing_process(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+
+    def missing_process(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(ab.os, "kill", missing_process, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "not running" in captured.err or "process not found" in captured.err
+
+
+def test_stop_run_rejects_invalid_pid(tmp_path, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("not-a-pid\n", encoding="utf-8")
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "invalid pid" in captured.err
+
+
+def test_stop_run_handles_os_error(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+
+    def fail_stop(pid, sig):
+        raise OSError("denied")
+
+    monkeypatch.setattr(ab.os, "kill", fail_stop, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "failed to stop" in captured.err
+
+
+def test_prepare_model_args_parse_expected_options():
+    args = ab.parse_args([
+        "prepare-model",
+        "--modelscope-id", "Qwen/Qwen2.5-1.5B-Instruct",
+        "--target", "/tmp/model",
+        "--bench-image", "bench:offline",
+        "--force",
+    ])
+
+    assert args.modelscope_id == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert args.target == "/tmp/model"
+    assert args.bench_image == "bench:offline"
+    assert args.force is True
+
+
+def test_main_prepare_model_calls_stub_with_expected_keywords(monkeypatch):
+    captured = {}
+
+    def fake_prepare_model(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(ab, "prepare_model", fake_prepare_model)
+
+    exit_code = ab.main([
+        "prepare-model",
+        "--modelscope-id", "Qwen/Qwen2.5-1.5B-Instruct",
+        "--target", "/tmp/model",
+        "--bench-image", "bench:offline",
+        "--force",
+    ])
+
+    assert exit_code == 0
+    assert captured["modelscope_id"] == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert captured["target"] == Path("/tmp/model")
+    assert captured["bench_image"] == "bench:offline"
+    assert captured["force"] is True
+    assert isinstance(captured["runner"], ab.DockerRunner)
+
+
+def test_start_detached_uses_devnull_stdin(tmp_path, monkeypatch):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    assert exit_code == 0
+    assert calls
+    assert calls[0][1]["stdin"] is ab.subprocess.DEVNULL

@@ -1077,6 +1077,7 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
             command,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
     (run_dir / "controller.pid").write_text(f"{process.pid}\n", encoding="utf-8")
@@ -1154,13 +1155,28 @@ def stop_run(run_dir: Path) -> int:
     except ValueError:
         print(f"invalid pid file: {pid_path}", file=sys.stderr)
         return 1
-    os.kill(pid, signal.SIGTERM)
+    if pid <= 1:
+        print(f"unsafe pid in {pid_path}: {pid}", file=sys.stderr)
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        print(f"process not found or not running: {pid}", file=sys.stderr)
+        return 1
+    except PermissionError as exc:
+        print(f"failed to stop {pid}: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"failed to stop {pid}: {exc}", file=sys.stderr)
+        return 1
     print(f"sent SIGTERM to {pid}")
     return 0
 
 
-def prepare_model(*args: Any, **kwargs: Any) -> int:
-    _ = (args, kwargs)
+def prepare_model(*, modelscope_id: str, target: Path,
+                  bench_image: str, force: bool = False,
+                  runner: Runner | None = None) -> int:
+    _ = (modelscope_id, target, bench_image, force, runner)
     raise NotImplementedError("prepare-model is implemented in task 6")
 
 
@@ -1191,7 +1207,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stop_parser.add_argument("--run-id", required=True)
 
     prepare_parser = subparsers.add_parser("prepare-model", help="prepare model assets")
-    prepare_parser.add_argument("--config", type=Path)
+    prepare_parser.add_argument("--modelscope-id", required=True)
+    prepare_parser.add_argument("--target", required=True)
+    prepare_parser.add_argument("--bench-image", required=True)
+    prepare_parser.add_argument("--force", action="store_true")
 
     return parser.parse_args(argv)
 
@@ -1212,7 +1231,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "stop":
         return stop_run(args.results_dir / args.run_id)
     if args.command == "prepare-model":
-        return prepare_model(args)
+        return prepare_model(
+            modelscope_id=args.modelscope_id,
+            target=Path(args.target),
+            bench_image=args.bench_image,
+            force=args.force,
+            runner=DockerRunner(),
+        )
     raise RuntimeError(f"unknown command: {args.command}")
 
 
