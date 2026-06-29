@@ -4,6 +4,8 @@ import argparse
 import csv
 import logging
 
+import pytest
+
 import run_bench_multi as m
 
 # 注意：run_bench_multi 内部用 importlib 把 run_bench_serve.py 加载为独立模块
@@ -109,3 +111,25 @@ def test_run_all_prefix_ratio_uses_total_input_budget(monkeypatch, tmp_path, cap
     assert rows[0]["prefix_tokens"] == 102
     assert rows[0]["prefix_ratio"] == 0.8
     assert "total_input=128 prefix=102tok(80%) suffix=26tok" in caplog.text
+
+
+def test_run_all_rejects_invalid_prefix_ratio_before_serving(monkeypatch):
+    async def fail_if_called(cfg):
+        raise AssertionError("main_async should not be called")
+
+    monkeypatch.setattr(serve, "main_async", fail_if_called)
+
+    args = argparse.Namespace(
+        model="m", served_model_name=None, backend="openai",
+        base_url="http://x/v1", host="127.0.0.1", port=8000,
+        insecure=False, api_key=None, tokenizer="/some/tok",
+        input_lens=[128], output_lens=[8], cross_product=False,
+        parallel_nums=[1], epochs=1, sleep_between=0,
+        warmup_requests=0, prefix_ratio=float("nan"),
+        output_csv=None, output_xlsx=None,
+        result_dir=None, max_ttft_ms=None, min_throughput_tok_s=None,
+        min_output_compliance=0.0,
+    )
+
+    with pytest.raises(ValueError, match="--prefix-ratio"):
+        m._run_all(args)
