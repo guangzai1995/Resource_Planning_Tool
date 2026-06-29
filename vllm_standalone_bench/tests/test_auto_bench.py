@@ -1,5 +1,6 @@
 import json
 import math
+import sys
 from pathlib import Path
 
 import pytest
@@ -542,3 +543,88 @@ def test_current_state_counts_manifest_cases(tmp_path):
 
 def test_runner_protocol_type_is_exposed():
     assert hasattr(ab, "RunnerProtocol")
+
+
+def test_detach_command_reinvokes_child_with_run_id(tmp_path):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    run_id = "smoke_20260629_120000"
+    cmd = ab.build_detach_command(config_path, run_id)
+
+    assert cmd[:2] == [sys.executable, str(Path(ab.__file__).resolve())]
+    assert cmd[2:] == [
+        "run", "--config", str(config_path),
+        "--run-id", run_id,
+        "--child",
+    ]
+
+
+def test_status_reads_state_file(tmp_path, capsys):
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": {"model": "m", "serve_profile": "s", "bench_profile": "b"},
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+
+    exit_code = ab.print_status(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "running" in captured.out
+    assert "m/s/b" in captured.out
+
+
+def test_parse_args_run_dry_run():
+    args = ab.parse_args(["run", "--config", "c.json", "--dry-run"])
+
+    assert args.command == "run"
+    assert args.config == Path("c.json")
+    assert args.dry_run is True
+
+
+def test_main_status_reads_state_file(tmp_path, capsys):
+    ab.write_state(tmp_path / "run123", {
+        "run_id": "run123",
+        "status": "completed",
+        "current": None,
+        "counts": {"passed": 1, "failed": 0, "skipped": 0, "running": 0, "total": 1},
+    })
+
+    exit_code = ab.main(["status", "--results-dir", str(tmp_path), "--run-id", "run123"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "completed" in captured.out
+
+
+def test_logs_prints_controller_log(tmp_path, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.log").write_text("line 1\nline 2\n", encoding="utf-8")
+
+    exit_code = ab.main(["logs", "--results-dir", str(tmp_path), "--run-id", "run123"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "line 1" in captured.out
+    assert "line 2" in captured.out
+
+
+def test_stop_run_sends_sigterm(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    signals = []
+
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+
+    monkeypatch.setattr(ab.os, "kill", fake_kill, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert signals == [(12345, ab.signal.SIGTERM)]
+    assert "12345" in captured.out

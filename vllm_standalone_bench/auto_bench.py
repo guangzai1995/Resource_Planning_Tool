@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import os
 import re
+import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -14,6 +18,7 @@ from typing import Any, Protocol
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 MODEL_CONTAINER_ROOT = PurePosixPath("/models")
 SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat"})
+DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 
 class ConfigError(ValueError):
@@ -906,7 +911,7 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
 
 def run_controller(config: AutoBenchConfig, run_id: str,
                    runner: Runner | None = None,
-    dry_run: bool = False) -> int:
+                   dry_run: bool = False) -> int:
     active_runner: Runner = runner or DockerRunner()
     if dry_run:
         return _run_controller_dry_run(config, run_id)
@@ -1033,3 +1038,183 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         return exit_code
     finally:
         cleanup_network(config, active_runner, network_owned, dry_run)
+
+
+def build_detach_command(config_path: Path, run_id: str) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "run",
+        "--config",
+        str(config_path),
+        "--run-id",
+        run_id,
+        "--child",
+    ]
+
+
+def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> int:
+    run_dir = config.run.results_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cases = expand_cases(config, run_id=run_id)
+    write_state(run_dir, {
+        "run_id": run_id,
+        "status": "starting",
+        "current": None,
+        "counts": {
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "running": 0,
+            "total": len(cases),
+        },
+    })
+
+    log_path = run_dir / "controller.log"
+    command = build_detach_command(config_path, run_id)
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    (run_dir / "controller.pid").write_text(f"{process.pid}\n", encoding="utf-8")
+    print(f"run_id: {run_id}")
+    print(f"log: {log_path}")
+    return 0
+
+
+def _format_current(current: Any) -> str:
+    if not isinstance(current, dict):
+        return "-"
+    return "/".join([
+        str(current.get("model", "-")),
+        str(current.get("serve_profile", "-")),
+        str(current.get("bench_profile", "-")),
+    ])
+
+
+def _format_counts(counts: Any) -> str:
+    if not isinstance(counts, dict):
+        return "-"
+    keys = ["passed", "failed", "skipped", "running", "completed", "total"]
+    return " ".join(
+        f"{key}={counts[key]}"
+        for key in keys
+        if key in counts
+    )
+
+
+def print_status(run_dir: Path) -> int:
+    state_path = run_dir / "state.json"
+    if not state_path.exists():
+        print(f"state file not found: {state_path}", file=sys.stderr)
+        return 1
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    print(f"run_id: {state.get('run_id', run_dir.name)}")
+    print(f"status: {state.get('status', 'unknown')}")
+    print(f"current: {_format_current(state.get('current'))}")
+    print(f"counts: {_format_counts(state.get('counts'))}")
+    return 0
+
+
+def follow_file(path: Path) -> int:
+    if not path.exists():
+        print(f"log file not found: {path}", file=sys.stderr)
+        return 1
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            while True:
+                line = handle.readline()
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                else:
+                    time.sleep(1)
+    except KeyboardInterrupt:
+        return 0
+
+
+def print_log(path: Path) -> int:
+    if not path.exists():
+        print(f"log file not found: {path}", file=sys.stderr)
+        return 1
+    sys.stdout.write(path.read_text(encoding="utf-8"))
+    return 0
+
+
+def stop_run(run_dir: Path) -> int:
+    pid_path = run_dir / "controller.pid"
+    if not pid_path.exists():
+        print(f"pid file not found: {pid_path}", file=sys.stderr)
+        return 1
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        print(f"invalid pid file: {pid_path}", file=sys.stderr)
+        return 1
+    os.kill(pid, signal.SIGTERM)
+    print(f"sent SIGTERM to {pid}")
+    return 0
+
+
+def prepare_model(*args: Any, **kwargs: Any) -> int:
+    _ = (args, kwargs)
+    raise NotImplementedError("prepare-model is implemented in task 6")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Offline vLLM auto benchmark controller",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="run benchmark cases")
+    run_parser.add_argument("--config", required=True, type=Path)
+    run_parser.add_argument("--run-id")
+    run_parser.add_argument("--detach", action="store_true")
+    run_parser.add_argument("--child", action="store_true")
+    run_parser.add_argument("--dry-run", action="store_true")
+
+    status_parser = subparsers.add_parser("status", help="show run status")
+    status_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    status_parser.add_argument("--run-id", required=True)
+
+    logs_parser = subparsers.add_parser("logs", help="show controller log")
+    logs_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    logs_parser.add_argument("--run-id", required=True)
+    logs_parser.add_argument("-f", "--follow", action="store_true")
+
+    stop_parser = subparsers.add_parser("stop", help="stop detached controller")
+    stop_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    stop_parser.add_argument("--run-id", required=True)
+
+    prepare_parser = subparsers.add_parser("prepare-model", help="prepare model assets")
+    prepare_parser.add_argument("--config", type=Path)
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.command == "run":
+        config = load_config(args.config)
+        run_id = args.run_id or make_run_id(config.run.name)
+        if args.detach and not args.child:
+            return start_detached(args.config, config, run_id)
+        return run_controller(config, run_id=run_id, dry_run=args.dry_run)
+    if args.command == "status":
+        return print_status(args.results_dir / args.run_id)
+    if args.command == "logs":
+        log_path = args.results_dir / args.run_id / "controller.log"
+        return follow_file(log_path) if args.follow else print_log(log_path)
+    if args.command == "stop":
+        return stop_run(args.results_dir / args.run_id)
+    if args.command == "prepare-model":
+        return prepare_model(args)
+    raise RuntimeError(f"unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
