@@ -196,6 +196,11 @@ def _derive_prefix_suffix_tokens(input_len: int, prefix_ratio: float) -> Tuple[i
     return prefix_tokens, suffix_tokens
 
 
+def _is_random_prompt_generation_error(exc: ValueError) -> bool:
+    message = str(exc)
+    return "unique suffix" in message or "unique prompt collision" in message
+
+
 def _extract_row(
     result: dict,
     in_len: int,
@@ -531,6 +536,12 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
             # 调用 vllm_bench/serve.py 的核心测试逻辑
             try:
                 result = asyncio.run(_serve.main_async(cfg))
+            except ValueError as exc:
+                if _is_random_prompt_generation_error(exc):
+                    raise
+                logger.error("测试失败 (input=%d, output=%d, parallel=%d): %s",
+                             in_len, out_len, parallel_num, exc)
+                continue
             except Exception as exc:
                 logger.error("测试失败 (input=%d, output=%d, parallel=%d): %s",
                              in_len, out_len, parallel_num, exc)

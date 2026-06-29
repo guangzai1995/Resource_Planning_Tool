@@ -133,3 +133,32 @@ def test_run_all_rejects_invalid_prefix_ratio_before_serving(monkeypatch):
 
     with pytest.raises(ValueError, match="--prefix-ratio"):
         m._run_all(args)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "unique suffix capacity exhausted: random_input_len=2",
+        "unique prompt collision: request_index=1",
+    ],
+)
+def test_run_all_reraises_random_prompt_generation_errors(monkeypatch, message):
+    async def fail_with_generation_error(cfg):
+        raise ValueError(message)
+
+    monkeypatch.setattr(serve, "main_async", fail_with_generation_error)
+
+    args = argparse.Namespace(
+        model="m", served_model_name=None, backend="openai",
+        base_url="http://x/v1", host="127.0.0.1", port=8000,
+        insecure=False, api_key=None, tokenizer="/some/tok",
+        input_lens=[128], output_lens=[8], cross_product=False,
+        parallel_nums=[1], epochs=1, sleep_between=0,
+        warmup_requests=0, prefix_ratio=0.8,
+        output_csv=None, output_xlsx=None,
+        result_dir=None, max_ttft_ms=None, min_throughput_tok_s=None,
+        min_output_compliance=0.0,
+    )
+
+    with pytest.raises(ValueError, match=message.split(":")[0]):
+        m._run_all(args)

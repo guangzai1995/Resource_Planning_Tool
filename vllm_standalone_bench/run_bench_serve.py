@@ -265,7 +265,8 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
     g.add_argument('--random-range-ratio', type=float, default=1.0,
                    help='长度随机抖动比例（1.0=固定长度）')
     g.add_argument('--random-prefix-len', type=int, default=0,
-                   help='共享前缀长度（测试 prefix caching）')
+                   help='共享前缀长度，计入 --random-input-len 总输入预算；'
+                        '>= random-input-len 表示 full-prefix（测试 prefix caching）')
 
     # ── sharegpt dataset ──────────────────────────────────────────────────────
     g.add_argument('--sharegpt-output-len', type=int, default=None,
