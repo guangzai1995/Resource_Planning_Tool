@@ -503,8 +503,8 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                 config_count, total_configs,
                 in_len, out_len, parallel_num,
                 parallel_num * our_args.epochs, parallel_num, our_args.epochs,
-                (f"  total_input={in_len} prefix={prefix_tokens}tok"
-                 f" suffix={suffix_tokens}tok({prefix_ratio * 100:.0f}%)"),
+                (f"  total_input={in_len} prefix={prefix_tokens}tok({prefix_ratio * 100:.0f}%)"
+                 f" suffix={suffix_tokens}tok"),
                 "─" * 65,
             )
 

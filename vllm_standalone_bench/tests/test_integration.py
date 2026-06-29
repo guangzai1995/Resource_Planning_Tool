@@ -1,6 +1,8 @@
 """端到端冒烟：monkeypatch serve.main_async 返回固定结果，走 run_bench_multi
 的提取与落盘路径，断言 CSV 的 avg/合规列真实。"""
+import argparse
 import csv
+import logging
 
 import run_bench_multi as m
 
@@ -32,7 +34,6 @@ def _fake_result(in_len, out_len, completed, *, undergen=False):
 
 def _run_to_rows(monkeypatch, results_seq):
     """把 _serve.main_async 替换为依次返回 results_seq 的假实现，跑 _run_all。"""
-    import argparse
     it = iter(results_seq)
 
     async def _fake_main_async(cfg):
@@ -75,3 +76,36 @@ def test_csv_flags_undergeneration(tmp_path, monkeypatch):
     assert rows[0]["avg_output_tokens"] == 4.0          # 服务端只生成一半
     assert rows[0]["output_compliance"] == 50.0         # 4/8
     assert rows[0]["finish_reason_length_pct"] == 0.0   # 都不是 length 停止
+
+
+def test_run_all_prefix_ratio_uses_total_input_budget(monkeypatch, tmp_path, caplog):
+    seen_cfgs = []
+
+    async def fake_main_async(cfg):
+        seen_cfgs.append(cfg)
+        return _fake_result(128, 8, 1)
+
+    monkeypatch.setattr(serve, "main_async", fake_main_async)
+    caplog.set_level(logging.INFO, logger=m.logger.name)
+
+    args = argparse.Namespace(
+        model="m", served_model_name=None, backend="openai",
+        base_url="http://x/v1", host="127.0.0.1", port=8000,
+        insecure=False, api_key=None, tokenizer="/some/tok",
+        input_lens=[128], output_lens=[8], cross_product=False,
+        parallel_nums=[1], epochs=1, sleep_between=0,
+        warmup_requests=0, prefix_ratio=0.8,
+        output_csv=str(tmp_path / "out.csv"), output_xlsx=None,
+        result_dir=None, max_ttft_ms=None, min_throughput_tok_s=None,
+        min_output_compliance=0.0,
+    )
+
+    rows = m._run_all(args)
+
+    assert seen_cfgs[0].input_len == 128
+    assert seen_cfgs[0].random_prefix_len == 102
+    assert rows[0]["input_len"] == 128
+    assert rows[0]["total_input_len"] == 128
+    assert rows[0]["prefix_tokens"] == 102
+    assert rows[0]["prefix_ratio"] == 0.8
+    assert "total_input=128 prefix=102tok(80%) suffix=26tok" in caplog.text
