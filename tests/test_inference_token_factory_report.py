@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -66,6 +67,53 @@ def sheet_text(ws):
     )
 
 
+def write_context_files(
+    repo_root: Path,
+    *,
+    total_requests: int = 100,
+    total_tokens: int = 1000,
+    total_input_tokens: int = 900,
+    long_requests: int = 50,
+):
+    out_dir = repo_root / "outputs" / "context_analysis_20260609_034248"
+    out_dir.mkdir(parents=True)
+    (out_dir / "01_overview.json").write_text(
+        json.dumps(
+            {
+                "total_requests": str(total_requests),
+                "total_tokens": str(total_tokens),
+                "total_input_tokens": str(total_input_tokens),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (out_dir / "02_input_buckets.csv").write_text(
+        "\n".join(
+            [
+                "range_label,sort_key,request_count,pct,total_in_all",
+                f"0-512,1,{max(total_requests - long_requests, 0)},0,0",
+                f"32K-64K,32768,{long_requests},0,0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_h200_csv(path: Path, throughput: float, tpot_ms: float):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "输入长度,输出长度,并发数,输出tokens总吞吐,首tokens时延TP90（ms）,首tokens时延TP99（ms）,最大首tokens时延（ms）,平均首tokens时延（ms）,增量时延TP90（ms）,增量时延TP99（ms）,最大增量时延（ms）,平均增量时延（ms）",
+                f"512,1024,1,{throughput},1,1,1,10,1,1,1,{tpot_ms}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_static_sheet_specs_and_status_labels():
     assert REPORT_VERSION == "v2.0"
     assert [item["title"] for item in SHEET_SPECS] == EXPECTED_SHEETS
@@ -129,9 +177,11 @@ def test_load_context_summary_from_existing_outputs():
 def test_compute_h200_fp8_summary_from_existing_csvs():
     summary = compute_fp8_summary(Path("."))
     assert summary["72B"]["matched_rows"] >= 30
+    assert summary["72B"]["status"] == "已有结论/历史数据"
     assert summary["72B"]["avg_throughput_gain_pct"] == pytest.approx(32.4, rel=0.08)
     assert summary["72B"]["avg_tpot_ratio_pct"] == pytest.approx(77.5, rel=0.08)
     assert summary["32B"]["matched_rows"] >= 30
+    assert summary["32B"]["status"] == "已有结论/历史数据"
     assert summary["32B"]["avg_throughput_gain_pct"] == pytest.approx(30.3, rel=0.08)
     assert summary["32B"]["avg_tpot_ratio_pct"] == pytest.approx(77.8, rel=0.08)
 
@@ -179,9 +229,44 @@ def test_report_contains_key_business_and_quantization_conclusions():
     quantization_text = sheet_text(wb["04_模型量化"])
     assert "72B" in quantization_text
     assert "吞吐约提升" in quantization_text
+    assert "32.4%" in quantization_text
 
     pd_text = sheet_text(wb["08_PD分离"])
     assert "H200 做 P、H20 做 D" in pd_text
 
     appendix_text = sheet_text(wb["12_数据附录"])
     assert "data/H200/72B-FP8/2.csv" in appendix_text
+
+
+def test_missing_h200_model_data_degrades_without_crashing(tmp_path):
+    write_context_files(tmp_path)
+    h200 = tmp_path / "data" / "H200"
+    write_h200_csv(h200 / "32B" / "1.csv", throughput=100.0, tpot_ms=10.0)
+    write_h200_csv(h200 / "32B-FP8" / "1.csv", throughput=130.0, tpot_ms=8.0)
+
+    summary = compute_fp8_summary(tmp_path)
+    assert summary["32B"]["status"] == "已有结论/历史数据"
+    assert summary["32B"]["avg_throughput_gain_pct"] == pytest.approx(30.0)
+    assert summary["72B"]["status"] == "待补测"
+    assert "缺少数据" in summary["72B"]["reason"]
+
+    wb = build_workbook(tmp_path)
+    quantization_text = sheet_text(wb["04_模型量化"])
+    assert "32B" in quantization_text
+    assert "30.0%" in quantization_text
+    assert "72B" in quantization_text
+    assert "待补测" in quantization_text
+    assert "缺少数据" in quantization_text
+    assert "32B 的 H200 历史配对数据" in quantization_text
+    assert "32B 和 72B 的 H200 历史配对数据均显示" not in quantization_text
+
+
+def test_load_context_summary_handles_zero_totals(tmp_path):
+    write_context_files(tmp_path, total_requests=0, total_tokens=0, total_input_tokens=0, long_requests=0)
+
+    summary = load_context_summary(tmp_path)
+
+    assert summary["total_requests"] == 0
+    assert summary["total_tokens_billion"] == 0
+    assert summary["input_token_ratio"] == 0
+    assert summary["long_context_ratio"] == 0

@@ -243,20 +243,27 @@ def _write_background(ws, context: dict[str, float | int]) -> None:
     )
 
 
-def _write_model_quantization(ws, fp8_summary: dict[str, dict[str, float | int]]) -> None:
+def _has_fp8_result(summary: dict[str, float | int | str] | None) -> bool:
+    return bool(summary and summary.get("status") == "已有结论/历史数据")
+
+
+def _write_model_quantization(ws, fp8_summary: dict[str, dict[str, float | int | str]]) -> None:
     start_row = ws.max_row + 2
     row = _write_section_title(ws, start_row, "模型量化结论")
     table_rows = []
     for model_name in ("32B", "72B"):
         summary = fp8_summary.get(model_name)
-        if not summary:
-            table_rows.append([model_name, "待补测", "待补测", "待补测", "缺少 H200 FP8/BF16 配对数据"])
+        if not _has_fp8_result(summary):
+            reason = summary.get("reason", "缺少数据") if summary else "缺少数据"
+            matched_rows = str(summary.get("matched_rows", 0)) if summary else "0"
+            table_rows.append([model_name, "待补测", matched_rows, "待补测", "待补测", reason])
             continue
         throughput_gain = _format_pct(summary["avg_throughput_gain_pct"])
         tpot_ratio = _format_pct(summary["avg_tpot_ratio_pct"])
         table_rows.append(
             [
                 model_name,
+                str(summary["status"]),
                 str(summary["matched_rows"]),
                 throughput_gain,
                 tpot_ratio,
@@ -266,26 +273,53 @@ def _write_model_quantization(ws, fp8_summary: dict[str, dict[str, float | int]]
     row = _append_table(
         ws,
         row,
-        ["模型", "匹配样本数", "吞吐约提升", "TPOT 约为 BF16", "结论口径"],
+        ["模型", "状态", "匹配样本数", "吞吐约提升", "TPOT 约为 BF16", "备注"],
         table_rows,
     )
+    available_models = [model_name for model_name in ("32B", "72B") if _has_fp8_result(fp8_summary.get(model_name))]
+    if available_models:
+        model_list = "、".join(available_models)
+        gain_text = "、".join(
+            f"{model_name} {_format_pct(fp8_summary[model_name]['avg_throughput_gain_pct'])}"
+            for model_name in available_models
+        )
+        summary_row = [
+            "优先采用 FP8 推理口径",
+            f"{model_list} 的 H200 历史配对数据已可用，吞吐约提升 {gain_text}，可进入领导汇报的量化收益页。",
+            "线上峰值、混部和更长上下文组合仍需待资源验证。",
+        ]
+    else:
+        summary_row = [
+            "量化收益待补测",
+            "当前 H200 BF16/FP8 可比数据缺失，量化收益页先标注待补测/缺少数据。",
+            "补齐 BF16 与 FP8 同输入长度、输出长度、并发数的配对样本后再写收益结论。",
+        ]
+
+    detail_rows = [summary_row]
+    if _has_fp8_result(fp8_summary.get("72B")):
+        detail_rows.append(
+            [
+                "72B 作为大参数重点展示",
+                f"72B FP8 已有 {fp8_summary['72B']['matched_rows']} 条匹配样本，可支撑大参数模型容量申请的历史数据依据。",
+                "GLM5.1/GLM5.2 实际模型版本落地后补测 TTFT、TPOT 和显存水位。",
+            ]
+        )
+    else:
+        reason = fp8_summary.get("72B", {}).get("reason", "缺少数据")
+        detail_rows.append(
+            [
+                "72B 待补测",
+                f"72B 当前 {reason}，暂不写大参数量化收益结论。",
+                "补齐 72B BF16/FP8 配对数据后再更新领导汇报口径。",
+            ]
+        )
+
     _write_section_title(ws, row + 1, "汇报建议")
     _append_table(
         ws,
         row + 2,
         ["结论", "说明", "风险/下一步"],
-        [
-            [
-                "优先采用 FP8 推理口径",
-                "32B 和 72B 的 H200 历史配对数据均显示约 30%+ 吞吐收益，可直接进入领导汇报的量化收益页。",
-                "线上峰值、混部和更长上下文组合仍需待资源验证。",
-            ],
-            [
-                "72B 作为大参数重点展示",
-                "72B FP8 已有匹配样本，可支撑大参数模型容量申请的历史数据依据。",
-                "GLM5.1/GLM5.2 实际模型版本落地后补测 TTFT、TPOT 和显存水位。",
-            ],
-        ],
+        detail_rows,
     )
 
 
@@ -412,9 +446,9 @@ def load_context_summary(repo_root: Path) -> dict[str, float | int]:
     out_dir = repo_root / "outputs" / "context_analysis_20260609_034248"
     overview = json.loads((out_dir / "01_overview.json").read_text(encoding="utf-8"))
     input_rows = _read_csv_rows(out_dir / "02_input_buckets.csv")
-    total_requests = int(overview["total_requests"])
-    total_tokens = float(overview["total_tokens"])
-    input_tokens = float(overview["total_input_tokens"])
+    total_requests = int(float(overview.get("total_requests", 0) or 0))
+    total_tokens = float(overview.get("total_tokens", 0) or 0)
+    input_tokens = float(overview.get("total_input_tokens", 0) or 0)
     long_requests = sum(
         int(row["request_count"])
         for row in input_rows
@@ -423,8 +457,8 @@ def load_context_summary(repo_root: Path) -> dict[str, float | int]:
     return {
         "total_requests": total_requests,
         "total_tokens_billion": total_tokens / 1_000_000_000,
-        "input_token_ratio": input_tokens / total_tokens,
-        "long_context_ratio": long_requests / total_requests,
+        "input_token_ratio": input_tokens / total_tokens if total_tokens else 0,
+        "long_context_ratio": long_requests / total_requests if total_requests else 0,
     }
 
 
@@ -444,20 +478,46 @@ def _load_h200_csv(path: Path) -> dict[tuple[float, float, int], dict[str, float
     return rows
 
 
-def _compare_h200_pair(base_path: Path, fp8_path: Path) -> dict[str, float | int]:
+def _fp8_pending(reason: str) -> dict[str, float | int | str]:
+    return {
+        "status": "待补测",
+        "reason": reason,
+        "matched_rows": 0,
+    }
+
+
+def _compare_h200_pair(base_path: Path, fp8_path: Path) -> dict[str, float | int | str]:
+    missing_paths = [path for path in (base_path, fp8_path) if not path.exists()]
+    if missing_paths:
+        missing_text = "、".join(path.as_posix() for path in missing_paths)
+        return _fp8_pending(f"缺少数据：{missing_text}")
+
     base = _load_h200_csv(base_path)
     fp8 = _load_h200_csv(fp8_path)
     keys = sorted(set(base) & set(fp8))
-    throughput_ratios = [fp8[k]["throughput"] / base[k]["throughput"] for k in keys]
-    tpot_ratios = [fp8[k]["avg_tpot_ms"] / base[k]["avg_tpot_ms"] for k in keys]
+    valid_keys = [
+        key
+        for key in keys
+        if base[key]["throughput"] > 0
+        and base[key]["avg_tpot_ms"] > 0
+        and fp8[key]["throughput"] > 0
+        and fp8[key]["avg_tpot_ms"] > 0
+    ]
+    if not valid_keys:
+        return _fp8_pending("缺少数据：BF16/FP8 无可比样本")
+
+    throughput_ratios = [fp8[k]["throughput"] / base[k]["throughput"] for k in valid_keys]
+    tpot_ratios = [fp8[k]["avg_tpot_ms"] / base[k]["avg_tpot_ms"] for k in valid_keys]
     return {
-        "matched_rows": len(keys),
+        "status": "已有结论/历史数据",
+        "reason": "已匹配 H200 BF16/FP8 历史数据",
+        "matched_rows": len(valid_keys),
         "avg_throughput_gain_pct": (mean(throughput_ratios) - 1.0) * 100.0,
         "avg_tpot_ratio_pct": mean(tpot_ratios) * 100.0,
     }
 
 
-def compute_fp8_summary(repo_root: Path) -> dict[str, dict[str, float | int]]:
+def compute_fp8_summary(repo_root: Path) -> dict[str, dict[str, float | int | str]]:
     h200 = repo_root / "data" / "H200"
     return {
         "32B": _compare_h200_pair(h200 / "32B" / "1.csv", h200 / "32B-FP8" / "1.csv"),
