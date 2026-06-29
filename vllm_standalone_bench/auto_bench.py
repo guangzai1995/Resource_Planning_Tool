@@ -21,6 +21,9 @@ SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat"})
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 NETWORK_MANAGED_LABEL = "vllm_auto_bench.managed"
 NETWORK_RUN_ID_LABEL = "vllm_auto_bench.run_id"
+CONTAINER_RUN_DIR_LABEL = "vllm_auto_bench.run_dir"
+CONTAINER_MODEL_LABEL = "vllm_auto_bench.model"
+CONTAINER_SERVE_PROFILE_LABEL = "vllm_auto_bench.serve_profile"
 
 
 class ConfigError(ValueError):
@@ -445,10 +448,15 @@ def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[Be
 
 def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                            run_dir: Path) -> list[str]:
-    _ = run_dir
+    resolved_run_dir = Path(run_dir).resolve()
     cmd = [
         "docker", "run", "-d",
         "--name", case.container_name,
+        "--label", f"{NETWORK_MANAGED_LABEL}=true",
+        "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
+        "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
+        "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
         "--gpus", case.serve_profile.gpus,
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
@@ -687,6 +695,57 @@ def network_has_run_labels(runner: Runner, network: str, run_id: str) -> bool:
         labels.get(NETWORK_MANAGED_LABEL) == "true"
         and labels.get(NETWORK_RUN_ID_LABEL) == run_id
     )
+
+
+def inspect_container_labels(runner: Runner, container_name: str) -> dict[str, str] | None:
+    result = runner.run([
+        "docker", "inspect", "--format",
+        "{{json .Config.Labels}}", container_name,
+    ], check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        labels = json.loads(result.stdout.strip() or "null")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(labels, dict):
+        return {}
+    return {str(key): str(value) for key, value in labels.items()}
+
+
+def vllm_container_labels_match(labels: dict[str, str],
+                                case: BenchmarkCase,
+                                run_dir: Path) -> bool:
+    return (
+        labels.get(NETWORK_MANAGED_LABEL) == "true"
+        and labels.get(NETWORK_RUN_ID_LABEL) == case.run_id
+        and labels.get(CONTAINER_RUN_DIR_LABEL) == str(Path(run_dir).resolve())
+    )
+
+
+def remove_existing_vllm_container_if_owned(runner: Runner, case: BenchmarkCase,
+                                            run_dir: Path) -> None:
+    labels = inspect_container_labels(runner, case.container_name)
+    if labels is None:
+        return
+    if not vllm_container_labels_match(labels, case, run_dir):
+        raise RuntimeError(
+            f"vLLM container exists but is not owned by this run: {case.container_name}"
+        )
+    runner.run(["docker", "rm", "-f", case.container_name], check=False)
+
+
+def stop_and_remove_vllm_container_if_owned(runner: Runner, case: BenchmarkCase,
+                                           run_dir: Path, dry_run: bool) -> None:
+    if dry_run:
+        stop_and_remove_container(runner, case.container_name, dry_run=True)
+        return
+    labels = inspect_container_labels(runner, case.container_name)
+    if labels is None:
+        return
+    if not vllm_container_labels_match(labels, case, run_dir):
+        return
+    stop_and_remove_container(runner, case.container_name, dry_run=False)
 
 
 def cleanup_network(config: AutoBenchConfig, runner: Runner,
@@ -1070,7 +1129,11 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                     ready = True
                 else:
                     cleanup_container = True
-                    active_runner.run(["docker", "rm", "-f", serve_case.container_name], check=False)
+                    remove_existing_vllm_container_if_owned(
+                        active_runner,
+                        serve_case,
+                        serve_layout.run_dir,
+                    )
                     start_result = active_runner.run(vllm_cmd, check=False)
                     started = start_result.returncode == 0
                     if not started:
@@ -1178,7 +1241,12 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         except StopRequested as exc:
                             stop_requested = exc
                     try:
-                        stop_and_remove_container(active_runner, serve_case.container_name, dry_run)
+                        stop_and_remove_vllm_container_if_owned(
+                            active_runner,
+                            serve_case,
+                            serve_layout.run_dir,
+                            dry_run,
+                        )
                     except StopRequested as exc:
                         if stop_requested is None:
                             stop_requested = exc
@@ -1231,7 +1299,8 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     return exit_code
 
 
-def build_detach_command(config_path: Path, run_id: str) -> list[str]:
+def build_detach_command(config_path: Path, run_id: str,
+                         results_dir: Path) -> list[str]:
     return [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -1241,6 +1310,8 @@ def build_detach_command(config_path: Path, run_id: str) -> list[str]:
         "--run-id",
         run_id,
         "--child",
+        "--results-dir",
+        str(results_dir),
     ]
 
 
@@ -1282,7 +1353,7 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
     write_state(run_dir, _detached_state(run_id, "starting", total))
 
     log_path = run_dir / "controller.log"
-    command = build_detach_command(config_path, run_id)
+    command = build_detach_command(config_path, run_id, config.run.results_dir)
     process: subprocess.Popen[Any] | None = None
     try:
         with log_path.open("ab") as log_file:
@@ -1441,6 +1512,8 @@ def _controller_metadata_command(run_dir: Path, pid: int,
         raise ValueError("controller metadata run_id mismatch")
     if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
         raise ValueError("controller metadata command invalid")
+    if not _cmdline_matches_controller(command, run_id):
+        raise ValueError("controller metadata command is not an auto_bench child")
     return command
 
 
@@ -1532,6 +1605,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument("--detach", action="store_true")
     run_parser.add_argument("--child", action="store_true")
     run_parser.add_argument("--dry-run", action="store_true")
+    run_parser.add_argument("--results-dir", type=Path, help=argparse.SUPPRESS)
 
     status_parser = subparsers.add_parser("status", help="show run status")
     status_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
@@ -1555,17 +1629,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def write_child_startup_state(results_dir: Path | None, run_id: str | None,
+                              status: str, error: str) -> None:
+    if results_dir is None or run_id is None:
+        return
+    state = _detached_state(run_id, status, 0, error=error)
+    write_state(results_dir / run_id, state)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "run":
+        if args.child:
+            try:
+                install_signal_handlers()
+                config = load_config(args.config)
+                run_id = args.run_id or make_run_id(config.run.name)
+            except StopRequested as exc:
+                error = str(exc) or "stop requested"
+                write_child_startup_state(args.results_dir, args.run_id, "interrupted", error)
+                print(error, file=sys.stderr)
+                return 130
+            except Exception as exc:
+                error = str(exc)
+                write_child_startup_state(args.results_dir, args.run_id, "failed", error)
+                print(error, file=sys.stderr)
+                return 1
+            return run_controller(config, run_id=run_id, dry_run=args.dry_run)
+
         config = load_config(args.config)
         run_id = args.run_id or make_run_id(config.run.name)
         if args.dry_run:
             return run_controller(config, run_id=run_id, dry_run=True)
         if args.detach and not args.child:
             return start_detached(args.config, config, run_id)
-        if args.child:
-            install_signal_handlers()
         return run_controller(config, run_id=run_id, dry_run=args.dry_run)
     if args.command == "status":
         return print_status(args.results_dir / args.run_id)
