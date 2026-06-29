@@ -340,12 +340,36 @@ def _generate_random_requests(args: argparse.Namespace,
         hi = int(base * range_ratio)
         return random.randint(lo, hi)
 
+    def _request_index_width(base: int, max_width: int) -> int:
+        if max_width <= 0:
+            return 0
+        if base <= 1:
+            return max_width
+
+        width = 1
+        capacity = base
+        while capacity < args.num_prompts and width < max_width:
+            width += 1
+            capacity *= base
+        return width
+
+    def _request_index_tokens(request_index: int,
+                              width: int,
+                              base: int) -> list[int]:
+        base = max(int(base), 1)
+        value = request_index
+        tokens: list[int] = []
+        for _ in range(width):
+            tokens.append(value % base)
+            value //= base
+        return tokens
+
     # ── 预先生成一次共享前缀（所有请求复用，模拟真实前缀缓存场景）──────────────
     shared_prefix_text = ''
     shared_prefix_ids: list[int] = []
     if prefix_len > 0:
         if tokenizer is not None and hasattr(tokenizer, 'decode'):
-            vocab_size = getattr(tokenizer, 'vocab_size', 32000)
+            vocab_size = max(int(getattr(tokenizer, 'vocab_size', 32000)), 1)
             shared_prefix_ids = [
                 random.randrange(vocab_size) for _ in range(prefix_len)
             ]
@@ -363,17 +387,29 @@ def _generate_random_requests(args: argparse.Namespace,
 
         # ── 生成每个请求独有的后缀（保证请求间内容不同）────────────────────────
         if tokenizer is not None and hasattr(tokenizer, 'decode'):
-            vocab_size = getattr(tokenizer, 'vocab_size', 32000)
+            vocab_size = max(int(getattr(tokenizer, 'vocab_size', 32000)), 1)
             suffix_ids = [random.randrange(vocab_size) for _ in range(suffix_len)]
+            index_width = _request_index_width(vocab_size, suffix_len)
+            suffix_ids[:index_width] = _request_index_tokens(
+                i,
+                index_width,
+                vocab_size,
+            )
             prompt, actual_len = _decode_to_target_len(
                 shared_prefix_ids[:effective_prefix_len] + suffix_ids,
                 in_len,
             )
         else:
             # 无 tokenizer：用空格分隔的数字模拟 token ids
-            suffix_text = ' '.join(
+            suffix_tokens = [
                 str(random.randint(0, 31999)) for _ in range(suffix_len)
-            )
+            ]
+            index_width = _request_index_width(32000, suffix_len)
+            suffix_tokens[:index_width] = [
+                str(token)
+                for token in _request_index_tokens(i, index_width, 32000)
+            ]
+            suffix_text = ' '.join(suffix_tokens)
             prefix_text = shared_prefix_text
             if effective_prefix_len < prefix_len and shared_prefix_text:
                 prefix_text = ' '.join(
