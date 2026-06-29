@@ -1,5 +1,7 @@
+import hashlib
 import json
 from pathlib import Path
+import time
 
 from openpyxl import load_workbook
 import pytest
@@ -69,6 +71,10 @@ def sheet_text(ws):
         for cell in row
         if cell.value is not None
     )
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def write_context_files(
@@ -289,6 +295,22 @@ def test_save_report_writes_reloadable_workbook_with_charts_and_key_content(tmp_
     assert saved_path == output
     assert output.exists()
     assert_saved_report_content(output)
+
+
+def test_save_report_is_byte_stable_across_repeated_generation(tmp_path):
+    first = tmp_path / "first.xlsx"
+    second = tmp_path / "second.xlsx"
+
+    save_report(Path("."), first)
+    first_hash = file_sha256(first)
+    time.sleep(2.1)
+    save_report(Path("."), first)
+    save_report(Path("."), second)
+
+    assert file_sha256(first) == first_hash
+    assert file_sha256(second) == first_hash
+    assert_saved_report_content(first)
+    assert_saved_report_content(second)
 
 
 def test_cli_writes_requested_output_path_from_non_repo_cwd(tmp_path, monkeypatch, capsys):

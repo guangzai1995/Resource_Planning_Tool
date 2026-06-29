@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime
 import json
 from pathlib import Path
 from statistics import mean
 from typing import Sequence
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.writer.excel import ExcelWriter
 
 
 REPORT_VERSION = "v2.0"
 OUTPUT_FILENAME = "推理token工厂汇报大纲_汇报版_v2.0.xlsx"
+DETERMINISTIC_CORE_DATETIME = datetime(2026, 6, 29, 0, 0, 0)
+DETERMINISTIC_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+REPORT_AUTHOR = "Resource Planning Tool"
 
 STATUS_LABELS = [
     "已验证",
@@ -711,8 +717,57 @@ def save_report(repo_root: Path, output: Path | str | None = None) -> Path:
     output_path = resolve_output_path(repo_root, output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     workbook = build_workbook(repo_root)
-    workbook.save(output_path)
+    _set_deterministic_core_properties(workbook)
+    _save_workbook_deterministically(workbook, output_path)
     return output_path
+
+
+def _set_deterministic_core_properties(workbook: Workbook) -> None:
+    props = workbook.properties
+    props.creator = REPORT_AUTHOR
+    props.lastModifiedBy = REPORT_AUTHOR
+    props.version = REPORT_VERSION
+    props.revision = "1"
+    props.title = "推理 Token 工厂汇报"
+    props.subject = "推理 Token 工厂汇报"
+    props.description = "推理 Token 工厂汇报大纲初版"
+    props.keywords = "inference,token,factory,report"
+    props.category = "Report"
+    props.contentStatus = "Draft"
+    props.language = "zh-CN"
+    props.created = DETERMINISTIC_CORE_DATETIME
+    props.modified = DETERMINISTIC_CORE_DATETIME
+
+
+def _save_workbook_deterministically(workbook: Workbook, output_path: Path) -> None:
+    raw_path = output_path.with_name(f".{output_path.name}.raw")
+    repacked_path = output_path.with_name(f".{output_path.name}.deterministic")
+    try:
+        with ZipFile(raw_path, "w", ZIP_DEFLATED, allowZip64=True) as archive:
+            ExcelWriter(workbook, archive).save()
+        _repack_xlsx_deterministically(raw_path, repacked_path)
+        repacked_path.replace(output_path)
+    finally:
+        for path in (raw_path, repacked_path):
+            if path.exists():
+                path.unlink()
+
+
+def _repack_xlsx_deterministically(source_path: Path, output_path: Path) -> None:
+    with ZipFile(source_path, "r") as source:
+        entries = sorted(
+            (info.filename, source.read(info.filename))
+            for info in source.infolist()
+            if not info.is_dir()
+        )
+
+    with ZipFile(output_path, "w", compression=ZIP_DEFLATED, compresslevel=9) as target:
+        for filename, data in entries:
+            info = ZipInfo(filename, date_time=DETERMINISTIC_ZIP_TIMESTAMP)
+            info.compress_type = ZIP_DEFLATED
+            info.create_system = 3
+            info.external_attr = 0o644 << 16
+            target.writestr(info, data, compress_type=ZIP_DEFLATED, compresslevel=9)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
