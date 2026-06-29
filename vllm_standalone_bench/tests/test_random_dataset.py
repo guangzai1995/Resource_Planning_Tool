@@ -16,7 +16,7 @@ class FakeTokenizer:
         return Encoded()
 
 
-def test_random_prefix_prompt_len_includes_prefix_and_suffix():
+def test_random_prefix_prompt_len_uses_total_input_budget():
     args = argparse.Namespace(
         num_prompts=2,
         random_input_len=8,
@@ -27,6 +27,22 @@ def test_random_prefix_prompt_len_includes_prefix_and_suffix():
 
     requests = rbs._generate_random_requests(args, FakeTokenizer())
 
-    assert [req.prompt_len for req in requests] == [11, 11]
+    assert [req.prompt_len for req in requests] == [8, 8]
     assert [req.expected_output_len for req in requests] == [4, 4]
     assert requests[0].prompt != requests[1].prompt
+
+
+def test_random_full_prefix_keeps_total_input_budget():
+    args = argparse.Namespace(
+        num_prompts=2,
+        random_input_len=8,
+        random_output_len=4,
+        random_prefix_len=8,
+        random_range_ratio=1.0,
+    )
+
+    requests = rbs._generate_random_requests(args, FakeTokenizer())
+
+    assert [req.prompt_len for req in requests] == [8, 8]
+    assert [req.expected_output_len for req in requests] == [4, 4]
+    assert requests[0].prompt == requests[1].prompt

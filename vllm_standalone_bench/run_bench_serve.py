@@ -294,13 +294,14 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
 def _generate_random_requests(args: argparse.Namespace,
                                tokenizer) -> list[SampleRequest]:
     """
-    生成随机 token 序列请求，每个请求内容均不同。
+    生成随机 token 序列请求。
 
     前缀缓存支持（random_prefix_len > 0）：
       - 所有请求共享同一段前缀文本（固定生成一次，用于测试 prefix caching 命中率）
-      - 每个请求的后缀部分独立随机生成，保证请求间差异性
-      - 最终 prompt = shared_prefix + unique_random_suffix
-      - prompt_len ≈ random_prefix_len + random_input_len（实际值由 tokenizer 决定）
+      - random_prefix_len 是 random_input_len 内部的共享前缀长度
+      - 每个请求的后缀部分独立随机生成，全 prefix 时请求内容相同
+      - 最终 prompt = shared_prefix[:effective_prefix_len] + unique_random_suffix
+      - prompt_len ≈ random_input_len（实际值由 tokenizer 决定）
 
     无前缀缓存（random_prefix_len == 0）：
       - 每个请求完全随机，互不相同
@@ -357,25 +358,29 @@ def _generate_random_requests(args: argparse.Namespace,
     for i in range(args.num_prompts):
         in_len = _rand_len(args.random_input_len)
         out_len = _rand_len(args.random_output_len)
+        effective_prefix_len = min(prefix_len, in_len)
+        suffix_len = max(in_len - effective_prefix_len, 0)
 
         # ── 生成每个请求独有的后缀（保证请求间内容不同）────────────────────────
         if tokenizer is not None and hasattr(tokenizer, 'decode'):
             vocab_size = getattr(tokenizer, 'vocab_size', 32000)
-            suffix_ids = [random.randrange(vocab_size) for _ in range(in_len)]
+            suffix_ids = [random.randrange(vocab_size) for _ in range(suffix_len)]
             prompt, actual_len = _decode_to_target_len(
-                shared_prefix_ids + suffix_ids,
-                prefix_len + in_len,
+                shared_prefix_ids[:effective_prefix_len] + suffix_ids,
+                in_len,
             )
         else:
             # 无 tokenizer：用空格分隔的数字模拟 token ids
             suffix_text = ' '.join(
-                str(random.randint(0, 31999)) for _ in range(in_len)
+                str(random.randint(0, 31999)) for _ in range(suffix_len)
             )
-            if shared_prefix_text:
-                prompt = shared_prefix_text + ' ' + suffix_text
-            else:
-                prompt = suffix_text
-            actual_len = prefix_len + in_len
+            prefix_text = shared_prefix_text
+            if effective_prefix_len < prefix_len and shared_prefix_text:
+                prefix_text = ' '.join(
+                    shared_prefix_text.split()[:effective_prefix_len]
+                )
+            prompt = ' '.join(part for part in (prefix_text, suffix_text) if part)
+            actual_len = in_len
 
         requests.append(SampleRequest(
             prompt=prompt,
