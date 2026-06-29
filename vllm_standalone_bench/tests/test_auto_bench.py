@@ -58,7 +58,10 @@ def minimal_config(tmp_path):
 
 
 def test_load_config_applies_defaults_and_expands_cases(tmp_path):
-    path = write_config(tmp_path, minimal_config(tmp_path))
+    data = minimal_config(tmp_path)
+    del data["run"]["container_port"]
+    del data["run"]["publish_host_port"]
+    path = write_config(tmp_path, data)
 
     config = ab.load_config(path)
     cases = ab.expand_cases(config)
@@ -77,6 +80,14 @@ def test_invalid_name_is_rejected(tmp_path):
     data["models"][0]["name"] = "bad/name"
 
     with pytest.raises(ab.ConfigError, match="safe filename"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_model_container_path_must_not_escape_models_root(tmp_path):
+    data = minimal_config(tmp_path)
+    data["models"][0]["model_path"] = "/models/../outside"
+
+    with pytest.raises(ab.ConfigError, match="/models|model path"):
         ab.load_config(write_config(tmp_path, data))
 
 

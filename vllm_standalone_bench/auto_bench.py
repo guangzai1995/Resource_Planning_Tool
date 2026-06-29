@@ -5,12 +5,12 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-MODEL_CONTAINER_ROOT = Path("/models")
+MODEL_CONTAINER_ROOT = PurePosixPath("/models")
 
 
 class ConfigError(ValueError):
@@ -164,9 +164,11 @@ def _positive_int_list(value: Any, field_name: str) -> tuple[int, ...]:
 
 def _container_path_to_host(path_value: Any, model_root: Path, field_name: str) -> Path:
     path_text = _string(path_value, field_name)
-    container_path = Path(path_text)
+    container_path = PurePosixPath(path_text)
     if not container_path.is_absolute():
         raise ConfigError(f"{field_name} must be absolute inside the container: {path_text}")
+    if ".." in container_path.parts:
+        raise ConfigError(f"{field_name} must stay under /models: {path_text}")
     try:
         relative = container_path.relative_to(MODEL_CONTAINER_ROOT)
     except ValueError as exc:
