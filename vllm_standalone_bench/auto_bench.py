@@ -1473,25 +1473,46 @@ def _is_current_script_arg(arg: str) -> bool:
         return arg == str(Path(__file__).resolve())
 
 
-def _cmdline_matches_controller(cmdline: list[str], run_id: str) -> bool:
-    script_indexes = [
-        index
-        for index, value in enumerate(cmdline)
-        if _is_current_script_arg(value)
-    ]
-    for script_index in script_indexes:
-        args = cmdline[script_index + 1:]
-        if not args or args[0] != "run":
-            continue
-        if "--child" not in args:
-            continue
+def _flag_indexes(command: list[str], flag: str) -> list[int]:
+    return [index for index, value in enumerate(command) if value == flag]
+
+
+def _single_flag_value(command: list[str], flag: str) -> str | None:
+    indexes = _flag_indexes(command, flag)
+    if len(indexes) != 1:
+        return None
+    index = indexes[0]
+    if index + 1 >= len(command):
+        return None
+    return command[index + 1]
+
+
+def controller_command_matches(command: list[str], run_id: str,
+                               results_dir: Path | None = None) -> bool:
+    if len(command) < 3:
+        return False
+    if not _is_current_script_arg(command[1]):
+        return False
+    if command[2] != "run":
+        return False
+    if "--child" not in command:
+        return False
+    if _single_flag_value(command, "--run-id") != run_id:
+        return False
+    if results_dir is not None:
+        results_value = _single_flag_value(command, "--results-dir")
+        if results_value is None:
+            return False
         try:
-            run_id_index = args.index("--run-id")
-        except ValueError:
-            continue
-        if run_id_index + 1 < len(args) and args[run_id_index + 1] == run_id:
-            return True
-    return False
+            if Path(results_value).resolve() != Path(results_dir).resolve():
+                return False
+        except (OSError, RuntimeError):
+            return False
+    return True
+
+
+def _cmdline_matches_controller(cmdline: list[str], run_id: str) -> bool:
+    return controller_command_matches(cmdline, run_id)
 
 
 def _controller_metadata_command(run_dir: Path, pid: int,
@@ -1512,20 +1533,24 @@ def _controller_metadata_command(run_dir: Path, pid: int,
         raise ValueError("controller metadata run_id mismatch")
     if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
         raise ValueError("controller metadata command invalid")
-    if not _cmdline_matches_controller(command, run_id):
+    if not controller_command_matches(command, run_id, run_dir.parent):
         raise ValueError("controller metadata command is not an auto_bench child")
     return command
 
 
 def is_controller_process(pid: int, run_id: str,
-                          expected_command: list[str] | None = None) -> bool:
+                          expected_command: list[str] | None = None,
+                          results_dir: Path | None = None) -> bool:
     try:
         cmdline = read_process_cmdline(pid)
     except OSError:
         return False
     if expected_command is not None:
-        return cmdline == expected_command
-    return _cmdline_matches_controller(cmdline, run_id)
+        return (
+            cmdline == expected_command
+            and controller_command_matches(cmdline, run_id, results_dir)
+        )
+    return controller_command_matches(cmdline, run_id, results_dir)
 
 
 def _run_state_is_active(run_dir: Path) -> bool:
@@ -1568,7 +1593,12 @@ def stop_run(run_dir: Path) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    if not is_controller_process(pid, run_dir.name, expected_command=expected_command):
+    if not is_controller_process(
+        pid,
+        run_dir.name,
+        expected_command=expected_command,
+        results_dir=run_dir.parent,
+    ):
         print(f"process does not match controller or stale pid: {pid}", file=sys.stderr)
         return 1
     try:

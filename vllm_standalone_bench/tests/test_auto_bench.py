@@ -1037,8 +1037,8 @@ def write_stop_state(run_dir, status="running"):
     })
 
 
-def matching_controller_cmdline(run_id="run123"):
-    return [
+def matching_controller_cmdline(run_id="run123", results_dir=None):
+    command = [
         sys.executable,
         str(Path(ab.__file__).resolve()),
         "run",
@@ -1048,11 +1048,14 @@ def matching_controller_cmdline(run_id="run123"):
         run_id,
         "--child",
     ]
+    if results_dir is not None:
+        command.extend(["--results-dir", str(results_dir)])
+    return command
 
 
 def write_controller_metadata(run_dir, pid=12345, run_id=None, command=None):
     run_id = run_id or run_dir.name
-    command = command or matching_controller_cmdline(run_id)
+    command = command or matching_controller_cmdline(run_id, run_dir.parent)
     (run_dir / "controller.json").write_text(
         json.dumps({
             "pid": pid,
@@ -1080,7 +1083,7 @@ def test_stop_run_sends_sigterm(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         ab,
         "read_process_cmdline",
-        lambda pid: matching_controller_cmdline(run_dir.name),
+        lambda pid: matching_controller_cmdline(run_dir.name, run_dir.parent),
         raising=False,
     )
 
@@ -1124,7 +1127,7 @@ def test_stop_run_handles_missing_process(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         ab,
         "read_process_cmdline",
-        lambda pid: matching_controller_cmdline(run_dir.name),
+        lambda pid: matching_controller_cmdline(run_dir.name, run_dir.parent),
         raising=False,
     )
 
@@ -1161,7 +1164,7 @@ def test_stop_run_handles_os_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         ab,
         "read_process_cmdline",
-        lambda pid: matching_controller_cmdline(run_dir.name),
+        lambda pid: matching_controller_cmdline(run_dir.name, run_dir.parent),
         raising=False,
     )
 
@@ -1261,7 +1264,7 @@ def test_stop_run_rejects_run_id_as_other_argument(tmp_path, monkeypatch, capsys
     def fail_if_called(pid, sig):
         raise AssertionError("os.kill should not be called for mismatched run id")
 
-    malicious_cmdline = matching_controller_cmdline("other") + ["--config", "run123"]
+    malicious_cmdline = matching_controller_cmdline("other", run_dir.parent) + ["--config", "run123"]
     monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
     monkeypatch.setattr(ab, "read_process_cmdline", lambda pid: malicious_cmdline, raising=False)
 
@@ -1285,7 +1288,7 @@ def test_stop_run_requires_controller_metadata(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(
         ab,
         "read_process_cmdline",
-        lambda pid: matching_controller_cmdline(run_dir.name),
+        lambda pid: matching_controller_cmdline(run_dir.name, run_dir.parent),
         raising=False,
     )
 
@@ -1310,7 +1313,7 @@ def test_stop_run_rejects_bad_controller_metadata(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(
         ab,
         "read_process_cmdline",
-        lambda pid: matching_controller_cmdline(run_dir.name),
+        lambda pid: matching_controller_cmdline(run_dir.name, run_dir.parent),
         raising=False,
     )
 
@@ -1362,6 +1365,88 @@ def test_stop_run_rejects_metadata_command_that_is_not_controller(tmp_path, monk
 
     def fail_if_called(pid, sig):
         raise AssertionError("os.kill should not be called for non-controller command")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+    monkeypatch.setattr(ab, "read_process_cmdline", lambda pid: command, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "controller" in captured.err or "metadata" in captured.err
+
+
+def test_stop_run_rejects_auto_bench_path_outside_controller_position(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    command = [
+        "tail",
+        "-f",
+        str(Path(ab.__file__).resolve()),
+        "run",
+        "--child",
+        "--run-id", "run123",
+        "--results-dir", str(run_dir.parent),
+    ]
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
+    write_controller_metadata(run_dir, command=command)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for tail command")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+    monkeypatch.setattr(ab, "read_process_cmdline", lambda pid: command, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "controller" in captured.err or "metadata" in captured.err
+
+
+def test_stop_run_rejects_duplicate_run_id_arguments(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    command = [
+        sys.executable,
+        str(Path(ab.__file__).resolve()),
+        "run",
+        "--config", "config.json",
+        "--run-id", "run123",
+        "--run-id", "other",
+        "--child",
+        "--results-dir", str(run_dir.parent),
+    ]
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
+    write_controller_metadata(run_dir, command=command)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for duplicate run-id")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+    monkeypatch.setattr(ab, "read_process_cmdline", lambda pid: command, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "controller" in captured.err or "metadata" in captured.err
+
+
+def test_stop_run_rejects_controller_from_other_results_dir(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "results" / "run123"
+    other_results = tmp_path / "other-results"
+    run_dir.mkdir(parents=True)
+    other_results.mkdir()
+    command = matching_controller_cmdline("run123", other_results)
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
+    write_controller_metadata(run_dir, command=command)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for other results-dir")
 
     monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
     monkeypatch.setattr(ab, "read_process_cmdline", lambda pid: command, raising=False)
