@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -91,6 +92,39 @@ class BenchmarkCase:
     run_id: str
     container_name: str
     api_model_name: str
+
+
+@dataclass
+class Completed:
+    args: list[str]
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+class DockerRunner:
+    def run(self, args: list[str], *, check: bool = False,
+            capture: bool = True, text: bool = True,
+            stdout: Any = None, stderr: Any = None) -> Completed:
+        completed = subprocess.run(
+            args,
+            check=False,
+            capture_output=capture if stdout is None and stderr is None else False,
+            text=text,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        result = Completed(
+            args=args,
+            returncode=completed.returncode,
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
+        )
+        if check and result.returncode != 0:
+            raise RuntimeError(
+                f"command failed ({result.returncode}): {' '.join(args)}\n{result.stderr}"
+            )
+        return result
 
 
 def _require_mapping(data: Any, field_name: str) -> dict[str, Any]:
@@ -389,3 +423,93 @@ def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[Be
                     api_model_name=model.served_model_name or model.name,
                 ))
     return tuple(cases)
+
+
+def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                           run_dir: Path) -> list[str]:
+    _ = run_dir
+    cmd = [
+        "docker", "run", "-d",
+        "--name", case.container_name,
+        "--gpus", case.serve_profile.gpus,
+        "--network", config.run.network,
+        "-v", f"{config.mounts.models}:/models:ro",
+        "--entrypoint", "vllm",
+    ]
+    if config.run.publish_host_port:
+        if config.run.host_port is None:
+            raise ConfigError("host_port is required when publish_host_port=true")
+        cmd.extend([
+            "-p",
+            f"127.0.0.1:{config.run.host_port}:{config.run.container_port}",
+        ])
+    cmd.extend([
+        config.run.vllm_image,
+        "serve", case.model.model_path,
+        "--served-model-name", case.api_model_name,
+        "--host", "0.0.0.0",
+        "--port", str(config.run.container_port),
+    ])
+    if config.run.api_key:
+        cmd.extend(["--api-key", config.run.api_key])
+    cmd.extend(case.serve_profile.args)
+    return cmd
+
+
+def _append_many(cmd: list[str], flag: str, values: tuple[int, ...]) -> None:
+    cmd.append(flag)
+    cmd.extend(str(value) for value in values)
+
+
+def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                            bench_dir: Path) -> list[str]:
+    bench = case.bench_profile
+    cmd = [
+        "docker", "run", "--rm",
+        "--network", config.run.network,
+        "-v", f"{config.mounts.models}:/models:ro",
+        "-v", f"{Path(bench_dir)}:/results",
+        config.run.bench_image,
+        "python", "/opt/vllm_standalone_bench/run_bench_multi.py",
+        "--base-url", f"http://{case.container_name}:{config.run.container_port}/v1",
+        "--model", case.api_model_name,
+        "--served-model-name", case.api_model_name,
+        "--backend", bench.backend,
+        "--epochs", str(bench.epochs),
+        "--warmup-requests", str(bench.warmup_requests),
+        "--output-csv", "/results/result.csv",
+        "--output-xlsx", "/results/result.xlsx",
+    ]
+    if config.run.api_key:
+        cmd.extend(["--api-key", config.run.api_key])
+    if case.model.tokenizer_path:
+        cmd.extend(["--tokenizer", case.model.tokenizer_path])
+    _append_many(cmd, "--input-lens", bench.input_lens)
+    _append_many(cmd, "--output-lens", bench.output_lens)
+    _append_many(cmd, "--parallel-nums", bench.parallel_nums)
+    if bench.cross_product:
+        cmd.append("--cross-product")
+    if bench.prefix_ratio:
+        cmd.extend(["--prefix-ratio", str(bench.prefix_ratio)])
+    if bench.max_ttft_ms is not None:
+        cmd.extend(["--max-ttft-ms", str(bench.max_ttft_ms)])
+    if bench.min_throughput_tok_s is not None:
+        cmd.extend(["--min-throughput-tok-s", str(bench.min_throughput_tok_s)])
+    if bench.min_output_compliance is not None:
+        cmd.extend(["--min-output-compliance", str(bench.min_output_compliance)])
+    return cmd
+
+
+def should_cleanup_network(*, owned: bool, cleanup_enabled: bool,
+                           connected_containers: list[str]) -> bool:
+    return owned and cleanup_enabled and not connected_containers
+
+
+def validate_local_paths(config: AutoBenchConfig) -> None:
+    if not config.mounts.models.is_dir():
+        raise ConfigError(f"model root does not exist: {config.mounts.models}")
+    for model in config.models:
+        if not model.host_model_path.is_dir():
+            raise ConfigError(f"model path does not exist: {model.host_model_path}")
+        if model.host_tokenizer_path is not None and not model.host_tokenizer_path.exists():
+            raise ConfigError(f"tokenizer path does not exist: {model.host_tokenizer_path}")

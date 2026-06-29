@@ -152,3 +152,57 @@ def test_output_lens_must_broadcast_or_match_input_lens(tmp_path):
 
     with pytest.raises(ab.ConfigError, match="output_lens"):
         ab.load_config(write_config(tmp_path, data))
+
+
+def test_build_vllm_command_uses_bridge_network_without_host_port(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    run_dir = tmp_path / "results" / "run123"
+
+    cmd = ab.build_vllm_run_command(config, case, run_dir)
+
+    assert "--network" in cmd
+    assert "vllm-bench-net" in cmd
+    assert "--network=host" not in cmd
+    assert "-p" not in cmd
+    assert "vllm serve" not in " ".join(cmd)
+    assert cmd[-10:] == [
+        "vllm", "serve", "/models/Qwen2.5-1.5B-Instruct",
+        "--served-model-name", "qwen2_5_1_5b",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--api-key", "local-bench-key",
+        "--dtype", "bfloat16",
+    ][-10:]
+
+
+def test_build_bench_command_targets_container_dns(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = tmp_path / "results" / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
+
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+
+    assert "--network" in cmd
+    assert "vllm-bench-net" in cmd
+    assert "--base-url" in cmd
+    assert f"http://{case.container_name}:8000/v1" in cmd
+    assert "--model" in cmd
+    assert "qwen2_5_1_5b" in cmd
+    assert "--output-csv" in cmd
+    assert "/results/result.csv" in cmd
+
+
+def test_network_cleanup_only_removes_owned_empty_network():
+    assert ab.should_cleanup_network(owned=True, cleanup_enabled=True, connected_containers=[]) is True
+    assert ab.should_cleanup_network(owned=False, cleanup_enabled=True, connected_containers=[]) is False
+    assert ab.should_cleanup_network(owned=True, cleanup_enabled=False, connected_containers=[]) is False
+    assert ab.should_cleanup_network(owned=True, cleanup_enabled=True, connected_containers=["external"]) is False
+
+
+def test_validate_local_paths_rejects_missing_model_dir(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    config.models[0].host_model_path.rename(tmp_path / "missing-model")
+
+    with pytest.raises(ab.ConfigError, match="model path"):
+        ab.validate_local_paths(config)
