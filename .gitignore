@@ -87,6 +87,15 @@ model/*/*.pt
 
 # ── vLLM source directory ─────────────────────────────────
 vllm-0.18.1rc0/
+vllm-0.23.0/
+vllm-main/
+sglang-main/
+
+# ── Local agent/tooling config ─────────────────────────────
+.superpowers/
+.codex/
+.claude/
+.agents/
 
 # ── SQLite WAL files ──────────────────────────────────────
 *.db-shm

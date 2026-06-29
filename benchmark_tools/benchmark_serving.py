@@ -185,9 +185,11 @@ async def send_request(
                                                             served_model_name,
                                                             api_key)
 
-    time_record, _ = await do_request(api_url, headers, pload, confirm_error_output, output_len, num_scheduler_steps)
+    time_record, _, server_reported_output_tokens = await do_request(
+        api_url, headers, pload, confirm_error_output, output_len, num_scheduler_steps)
 
-    output_tokens = len(time_record) - 1
+    # 优先使用服务端报告的真实 token 数
+    output_tokens = server_reported_output_tokens if server_reported_output_tokens else (len(time_record) - 1)
 
     if output_tokens < output_len:
         logger.warning(f"output_tokens: {output_tokens} < output_len: {output_len} (模型可能提前停止)")

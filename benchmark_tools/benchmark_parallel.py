@@ -251,18 +251,20 @@ async def send_request(
         except Exception as e:
             logger.warning("打印messages失败: %s", str(e))
 
-    time_record, chunk_record = await do_request(api_url, headers, pload, confirm_error_output,
-                                                 output_len, num_scheduler_steps, use_spec_decode,
-                                                 log_outputs=log_outputs)
+    time_record, chunk_record, server_reported_output_tokens = await do_request(
+        api_url, headers, pload, confirm_error_output,
+        output_len, num_scheduler_steps, use_spec_decode,
+        log_outputs=log_outputs)
 
-    output_tokens = len(time_record) - 1
+    # 优先使用服务端报告的真实 token 数，其次用时间戳长度推断
+    output_tokens = server_reported_output_tokens if server_reported_output_tokens else (len(time_record) - 1)
 
     # output_tokens will smaller than output_len when use spec decode, fix it in update_spec_output_tokens function.
     if not use_spec_decode and output_tokens < output_len:
         # 对于部分服务（如OpenAI兼容接口/多模态），模型可能因EOS/停止词提前结束，属正常行为，降级为警告
         logger.warning("output_tokens: %d < output_len: %d (模型可能提前停止，属正常现象)", output_tokens, output_len)
 
-    request_latency_record.append((prompt_len, output_len, time_record, chunk_record))
+    request_latency_record.append((prompt_len, output_len, time_record, chunk_record, server_reported_output_tokens))
 
 
 async def benchmark(
@@ -360,11 +362,11 @@ def update_spec_output_tokens(request_latency_record, tokenizer, backend):
         return output_list
 
     if backend in ("openai", "openai-chat"):
-        request_output_list = [decode_openai_output(chunk_list) for _, _, _, chunk_list in request_latency_record]
+        request_output_list = [decode_openai_output(chunk_list) for _, _, _, chunk_list, *_ in request_latency_record]
     elif backend == "vllm":
-        request_output_list = [decode_vllm_output(chunk_list) for _, _, _, chunk_list in request_latency_record]
+        request_output_list = [decode_vllm_output(chunk_list) for _, _, _, chunk_list, *_ in request_latency_record]
     elif backend == "vllm-chat":
-        request_output_list = [decode_openai_output(chunk_list) for _, _, _, chunk_list in request_latency_record]
+        request_output_list = [decode_openai_output(chunk_list) for _, _, _, chunk_list, *_ in request_latency_record]
     else:
         logger.warning(
             f"Backend {backend} is not supported in spec decode benchmark, it might return the incorrect results.")
@@ -374,7 +376,9 @@ def update_spec_output_tokens(request_latency_record, tokenizer, backend):
                                 request_output_list]
 
     for req_index in range(len(request_latency_record)):
-        (prompt_len, output_len, time_record, chunk_record) = request_latency_record[req_index]
+        item = request_latency_record[req_index]
+        prompt_len, output_len, time_record = item[0], item[1], item[2]
+        server_reported_tokens = item[4] if len(item) > 4 else None
         output_lens_per_step = request_output_lens_list[req_index]
         new_time_record = [time_record[0]]
         for o_len, timestamp in zip(output_lens_per_step, time_record[1:]):
@@ -385,7 +389,8 @@ def update_spec_output_tokens(request_latency_record, tokenizer, backend):
             logger.warning("output_tokens: %d < output_len: %d (SpecDecode路径下由实际输出长度计算)", output_tokens, output_len)
 
         # replace chunk_record to output_step for acceptance rate of speculative decode.
-        request_latency_record[req_index] = (prompt_len, output_len, new_time_record, len(output_lens_per_step))
+        # 保留 server_reported_tokens 作为第5个元素
+        request_latency_record[req_index] = (prompt_len, output_len, new_time_record, len(output_lens_per_step), server_reported_tokens)
 
 
 def get_dataset_requests(args, tokenizer, prompt_tokens, output_tokens, parallel_num,

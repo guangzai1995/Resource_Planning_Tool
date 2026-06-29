@@ -31,7 +31,66 @@ def get_tokenizer(
         transformer_tokenizer_path: str,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
-    tokenizer = AutoTokenizer.from_pretrained(transformer_tokenizer_path, trust_remote_code=True)
+    def _build_fast_tokenizer(value_error: ValueError) -> PreTrainedTokenizerFast:
+        tokenizer_config_path = os.path.join(transformer_tokenizer_path, "tokenizer_config.json")
+        tokenizer_json_path = os.path.join(transformer_tokenizer_path, "tokenizer.json")
+        should_fallback = (
+            os.path.isdir(transformer_tokenizer_path)
+            and "Tokenizer class" in str(value_error)
+            and "does not exist or is not currently imported" in str(value_error)
+            and os.path.exists(tokenizer_config_path)
+            and os.path.exists(tokenizer_json_path)
+        )
+        if not should_fallback:
+            raise value_error
+
+        with open(tokenizer_config_path, "r", encoding="utf-8") as config_file:
+            tokenizer_config = json.load(config_file)
+
+        tokenizer_kwargs = {
+            "tokenizer_file": tokenizer_json_path,
+        }
+        for key in (
+            "model_max_length",
+            "padding_side",
+            "truncation_side",
+            "clean_up_tokenization_spaces",
+            "bos_token",
+            "eos_token",
+            "unk_token",
+            "sep_token",
+            "pad_token",
+            "cls_token",
+            "mask_token",
+        ):
+            if key in tokenizer_config:
+                tokenizer_kwargs[key] = tokenizer_config[key]
+
+        if "extra_special_tokens" in tokenizer_config:
+            tokenizer_kwargs["additional_special_tokens"] = tokenizer_config["extra_special_tokens"]
+
+        logger.warning(
+            "Falling back to PreTrainedTokenizerFast for %s because tokenizer_class=%s is not available in the installed transformers version.",
+            transformer_tokenizer_path,
+            tokenizer_config.get("tokenizer_class"),
+        )
+        return PreTrainedTokenizerFast(**tokenizer_kwargs)
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(transformer_tokenizer_path, trust_remote_code=True)
+    except TypeError as exc:
+        if "trust_remote_code" not in str(exc):
+            raise
+        logger.warning(
+            "Installed transformers does not support trust_remote_code. Retrying tokenizer load for %s without it.",
+            transformer_tokenizer_path,
+        )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(transformer_tokenizer_path)
+        except ValueError as value_error:
+            tokenizer = _build_fast_tokenizer(value_error)
+    except ValueError as exc:
+        tokenizer = _build_fast_tokenizer(exc)
 
     return tokenizer
 
@@ -170,6 +229,7 @@ def get_request_data(
             "top_p": 0.8,
             "max_tokens": output_len,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         confirm_error_output = True
     elif backend == "openai":
@@ -186,6 +246,7 @@ def get_request_data(
             "ignore_eos": True,
             "model": served_name,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         confirm_error_output = True
     elif backend == "openai-chat":
@@ -209,6 +270,7 @@ def get_request_data(
             "top_p": 0.8,
             "max_tokens": output_len,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         confirm_error_output = True
     elif backend == "mindspore":
@@ -270,6 +332,11 @@ async def do_request(api_url, headers, pload, confirm_error_output, output_len, 
                      use_spec_decode=False, log_outputs: bool = False):
     timeout = aiohttp.ClientTimeout(total=TIMEOUT)
     first_token = True
+    # SSE 缓冲区：用于正确拼装跨 TCP chunk 的 SSE 帧
+    sse_buffer = ""
+    # 服务器报告的真实 token 数（来自 usage.completion_tokens 字段）
+    server_reported_output_tokens = None
+
     async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=False)) as session:
         while True:
             last_chunk = None
@@ -277,72 +344,92 @@ async def do_request(api_url, headers, pload, confirm_error_output, output_len, 
             time_record = [prefill_start_time]
             # 收集所有原始chunk（用于重建输出文本和调试）
             chunk_record = []
+            sse_buffer = ""
+            server_reported_output_tokens = None
             async with session.post(api_url, headers=headers, json=pload) as response:
-                async for chunk, _ in response.content.iter_chunks():
-                    if len(chunk.strip()) > 0:
-                        last_chunk = chunk
-                        return_token_num = 1 if first_token else min(num_scheduler_steps, output_len)
-                        time_record.extend([time.perf_counter()] * return_token_num)
-                        first_token = False
-                        output_len -= return_token_num
-                    # 记录所有非空chunk，便于调试或后续解析
-                    if len(chunk.strip()) > 0:
-                        chunk_record.append(chunk)
+                async for chunk_bytes in response.content.iter_any():
+                    chunk_bytes = chunk_bytes.strip()
+                    if not chunk_bytes:
+                        continue
+
+                    last_chunk = chunk_bytes
+                    chunk_record.append(chunk_bytes)
+
+                    # --- SSE 帧级解析（对齐 Tool-A / vllm bench serve 逻辑）---
+                    chunk_str = chunk_bytes.decode("utf-8", errors="ignore")
+                    sse_buffer += chunk_str
+
+                    # 按双换行符分割完整 SSE 帧
+                    while "\n\n" in sse_buffer:
+                        message, sse_buffer = sse_buffer.split("\n\n", 1)
+                        message = message.strip()
+                        if not message:
+                            continue
+
+                        # 跳过 SSE 注释/心跳包（以 ":" 开头）
+                        if message.startswith(":"):
+                            continue
+
+                        data_str = message.removeprefix("data:").strip()
+                        if data_str == "[DONE]":
+                            continue
+
+                        try:
+                            data = json.loads(data_str)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+
+                        # 从 usage 字段提取真实 token 数
+                        if "usage" in data and data["usage"]:
+                            usage = data["usage"]
+                            ct = usage.get("completion_tokens")
+                            if ct is not None:
+                                server_reported_output_tokens = int(ct)
+                                logger.debug("服务端报告 completion_tokens: %d", ct)
+
+                        # 仅在有 choices 字段时记录 token 时间戳
+                        choices = data.get("choices")
+                        if not choices:
+                            continue
+
+                        # 检查是否有实际内容（text 或 delta.content）
+                        choice = choices[0]
+                        has_content = False
+                        if "text" in choice:
+                            has_content = True
+                        elif "delta" in choice:
+                            delta = choice["delta"]
+                            if delta.get("content") is not None:
+                                has_content = True
+
+                        if not has_content:
+                            # choices 存在但无内容（如空 delta role），跳过
+                            continue
+
+                        timestamp = time.perf_counter()
+                        if first_token:
+                            # TTFT：首个有内容的 SSE 帧到达时刻
+                            time_record.extend([timestamp])
+                            first_token = False
+                        else:
+                            # 后续 token：按 num_scheduler_steps 扩展时间戳
+                            return_token_num = min(num_scheduler_steps, output_len)
+                            time_record.extend([timestamp] * return_token_num)
+                            output_len -= return_token_num
 
             if confirm_error_output:
-                # 检查是否接收到有效的chunk数据
+                # SSE 解析已完成（在 iter_any 循环中），
+                # 仅需检查是否收到了有效数据
                 if last_chunk is None:
                     logger.error("未接收到有效的响应数据")
                     break
-                    
-                # if last_chunk.startswith(b'data:'):
-                #     output = last_chunk[5:].strip().decode("utf-8")
-                # elif last_chunk.endswith('data: [DONE]\n\n') and len(last_chunk) > len('data: [DONE]\n\n\n'):
-                #     output = last_chunk[5:-len('data: [DONE]\n\n')].strip().decode("utf-8")
-                # else:
-                #     output = last_chunk.strip().strip().decode("utf-8").rstrip("\0")
-                # 先将字节数据转换为字符串，便于处理
-                try:
-                    chunk_str = last_chunk.decode("utf-8").strip()
-                except UnicodeDecodeError as e:
-                    logger.error("解码响应数据失败: %s, 原始数据: %s", str(e), repr(last_chunk))
-                    break
-                
-                # 分割可能存在的多个数据部分
-                parts = [p.strip() for p in chunk_str.split('data:') if p.strip()]
-                
-                # 寻找有效的JSON部分（排除[DONE]标记）
-                json_part = None
-                for part in parts:
-                    if part != '[DONE]':
-                        json_part = part
-                        break
-                
-                if json_part:
-                    output = json_part
-                else:
-                    # 如果没有找到有效JSON部分，使用原始处理
-                    output = chunk_str
 
-                if IS_DEBUG:
-                    logger.info(output)
-                    
-                # 检查是否为结束标记
-                if output == '[DONE]' or output == 'data: [DONE]' or output.strip() == '[DONE]':
-                    break
-                    
-                # 尝试解析JSON（只有当不是结束标记时）
-                try:
-                    output = json.loads(output)
-                except Exception as e:
-                    logger.error("JSON解析失败: %s, 原始数据: %s", str(e), repr(output))
-                    break
-
-                # Re-send the request if it failed.
-                if "error" not in output:
+                # 如果 SSE 解析到了至少一个 token（首 token 已标记），
+                # 或者收到了有效 chunk 数据，则认为请求成功
+                if not first_token or last_chunk is not None:
                     break
                 else:
-                    logger.error("request failed, %s, retry", output)
+                    logger.error("请求可能失败：未收到有效 token 数据，重试中...")
                     await asyncio.sleep(0.1)
             else:
                 break
@@ -359,6 +446,9 @@ async def do_request(api_url, headers, pload, confirm_error_output, output_len, 
                         events = [e.strip() for e in data_str.split("\n\n") if e.strip()]
                         acc = []
                         for ev in events:
+                            # 跳过心跳/注释
+                            if ev.startswith(":"):
+                                continue
                             # 仅处理以data:开头的行
                             if ev.startswith("data:"):
                                 payload = ev[len("data:"):].strip()
@@ -387,7 +477,7 @@ async def do_request(api_url, headers, pload, confirm_error_output, output_len, 
             except Exception as e:
                 logger.warning("解析模型输出预览失败: %s", str(e))
 
-        return time_record, chunk_record
+        return time_record, chunk_record, server_reported_output_tokens
 
 
 # def check_multi_step(args, api_url, tokenizer, prompt_len, output_len):
@@ -469,26 +559,34 @@ def check_multi_step(args, api_url, tokenizer, prompt_len, output_len):
 
 def statistics_and_print_performance_data(args, prompt_tokens, output_tokens, parallel_num,
                                           request_latency_record, all_latency_record):
-    benchmark_start_time = np.min([time_record[0] for _, _, time_record, _ in request_latency_record])
-    benchmark_end_time = np.max([time_record[-1] for _, _, time_record, _ in request_latency_record])
+    benchmark_start_time = np.min([time_record[0] for _, _, time_record, *_ in request_latency_record])
+    benchmark_end_time = np.max([time_record[-1] for _, _, time_record, *_ in request_latency_record])
     benchmark_time = benchmark_end_time - benchmark_start_time
     logger.info("所有请求耗时: %.4f s", benchmark_time)
 
     benchmark_requests = args.epochs * parallel_num / benchmark_time
     logger.info("请求吞吐: %.4f requests/s", benchmark_requests)
 
-    # 使用实际生成的 token 数（由时间戳长度推导）
-    actual_output_tokens_list = [
-        (len(time_record) - 1)
-        for _, _, time_record, _ in request_latency_record
-    ]
+    # --- 优化：优先使用服务端报告的真实 token 数 ---
+    # request_latency_record 格式: (prompt_len, output_len, time_record, chunk_record_or_spec, [server_output_tokens])
+    actual_output_tokens_list = []
+    for item in request_latency_record:
+        time_record = item[2]
+        server_tokens = item[4] if len(item) > 4 else None
+        # 优先使用服务端 usage.completion_tokens，其次用时间戳长度推断
+        if server_tokens is not None and server_tokens > 0:
+            actual_output_tokens_list.append(server_tokens)
+        else:
+            actual_output_tokens_list.append(len(time_record) - 1)
+
     total_output_tokens = int(np.sum(actual_output_tokens_list))
     total_output_token_throughput = total_output_tokens / benchmark_time
     logger.info("输出tokens总吞吐: %.4f tokens/s", total_output_token_throughput)
 
+    # --- TTFT（首 token 延时）---
     prefill_latency_list = [
         time_record[1] - time_record[0]
-        for _, _, time_record, _ in request_latency_record
+        for _, _, time_record, *_ in request_latency_record
     ]
 
     p90_prefill_latency = np.percentile(prefill_latency_list, 90) * 1000
@@ -503,49 +601,40 @@ def statistics_and_print_performance_data(args, prompt_tokens, output_tokens, pa
     avg_prefill_latency = np.mean(prefill_latency_list) * 1000
     logger.info("平均首tokens时延: %.4f ms", avg_prefill_latency)
 
-    prefill_ranges = [
-        (time_record[0], time_record[1])
-        for _, _, time_record, _ in request_latency_record
-    ]
+    # --- 优化：Decode 延时（TPOT）使用 per-request 减法推导 ---
+    # 与 vllm bench serve 一致：TPOT = (E2E - TTFT) / (output_tokens - 1)
+    # 避免 num_scheduler_steps > 1 时 chunk 级统计产生大量 0 值
+    tpot_list = []
+    for idx, item in enumerate(request_latency_record):
+        time_record = item[2]
+        output_len_actual = actual_output_tokens_list[idx]
+        e2e_latency = time_record[-1] - time_record[0]
+        ttft = time_record[1] - time_record[0]
+        if output_len_actual > 1:
+            tpot = (e2e_latency - ttft) / (output_len_actual - 1)
+            tpot_list.append(tpot)
 
-    def in_ranges(ranges, start, end):
-        for time_range in ranges:
-            if start <= time_range[1] and end >= time_range[0]:
-                return True
-        return False
+    if tpot_list:
+        p90_decode_latency = np.percentile(tpot_list, 90) * 1000
+        logger.info("增量时延TP90: %.4f ms", p90_decode_latency)
 
-    decode_latency_list = [
-        end - start
-        for _, _, time_record, _ in request_latency_record
-        for start, end in zip(time_record[1:-1], time_record[2:])
-        if not in_ranges(prefill_ranges, start, end)
-    ]
+        p99_decode_latency = np.percentile(tpot_list, 99) * 1000
+        logger.info("增量时延TP99: %.4f ms", p99_decode_latency)
 
-    # 去掉开始的0（multi-step场景）
-    start_index = 0
-    for latency_index, latency in enumerate(decode_latency_list):
-        if latency > 0:
-            start_index = latency_index
-            break
-    decode_latency_list = decode_latency_list[start_index:]
+        max_decode_latency = np.max(tpot_list) * 1000
+        logger.info("最大增量时延: %.1f ms", max_decode_latency)
 
-    p90_decode_latency = np.percentile(decode_latency_list, 90) * 1000
-    logger.info("增量时延TP90: %.4f ms", p90_decode_latency)
-
-    p99_decode_latency = np.percentile(decode_latency_list, 99) * 1000
-    logger.info("增量时延TP99: %.4f ms", p99_decode_latency)
-
-    max_decode_latency = np.max(decode_latency_list) * 1000
-    logger.info("最大增量时延: %.1f ms", max_decode_latency)
-
-    avg_decode_latency = np.mean(decode_latency_list) * 1000
-    logger.info("平均增量时延: %.1f ms", avg_decode_latency)
+        avg_decode_latency = np.mean(tpot_list) * 1000
+        logger.info("平均增量时延: %.1f ms", avg_decode_latency)
+    else:
+        p90_decode_latency = p99_decode_latency = max_decode_latency = avg_decode_latency = 0.0
+        logger.warning("无有效 decode 延时数据（可能所有请求仅输出 1 个 token）")
 
     if IS_DEBUG:
         plot_time_record(benchmark_start_time, benchmark_time, request_latency_record,
                          f"{parallel_num}_{prompt_tokens}_{output_tokens}.jpg")
 
-    avg_prompt_token = np.mean([prompt_len for prompt_len, _, _, _ in request_latency_record])
+    avg_prompt_token = np.mean([prompt_len for prompt_len, *_ in request_latency_record])
     # 以实际生成的 token 数统计平均输出长度
     avg_output_token = np.mean(actual_output_tokens_list)
 
@@ -556,14 +645,15 @@ def statistics_and_print_performance_data(args, prompt_tokens, output_tokens, pa
 
     # If the benchmark backend supports speculative inference, request_latency_record is replaced with output_step,
     # which is an int value. Otherwise, the original chunk_list is retained as a list.
-    is_spec_support_backend = isinstance(request_latency_record[0][-1], int)
+    # 检查第4个元素（index 3）：spec decode 模式下是 int（output_step），正常模式下是 list（chunk_record）
+    is_spec_support_backend = isinstance(request_latency_record[0][3], int)
     if getattr(args, "use_spec_decode", False) and getattr(args, "num_speculative_tokens", -1) >= 0 \
             and is_spec_support_backend:
         # 使用实际生成 token 数替换配置的 output_len，避免提前终止带来的偏差
         accept_rate_list = [
             ((len(time_record) - 1) - 1) / ((output_step - 1) * (args.num_speculative_tokens + 1))
             if (output_step - 1) * (args.num_speculative_tokens + 1) > 0 else 0.0
-            for _, _, time_record, output_step in request_latency_record
+            for _, _, time_record, output_step, *_ in request_latency_record
         ]
 
         p90_accept_rate = np.percentile(accept_rate_list, 90)
@@ -609,7 +699,7 @@ def plot_time_record(benchmark_start_time, benchmark_time, request_latency_recor
     fig_size_x = 256
     fig_size_y = 128
     fig, ax = plt.subplots(1, 1, figsize=(fig_size_x, fig_size_y), facecolor='#f7f7f7', dpi=80)
-    time_records = [time_record for _, _, time_record in request_latency_record]
+    time_records = [time_record for _, _, time_record, *_ in request_latency_record]
     time_records = (time_records - benchmark_start_time) * 1000
     for idx, time_record in enumerate(tqdm(time_records, desc="plot_time_record")):
         idx = idx * 1

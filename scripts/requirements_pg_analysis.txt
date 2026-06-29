@@ -1,0 +1,9 @@
+# PostgreSQL 向量库分析工具依赖
+
+# 必需依赖
+psycopg2-binary>=2.9.0  # PostgreSQL 数据库驱动
+
+# 可选依赖（用于高级功能）
+pandas>=2.0.0           # 数据处理和 CSV 导出
+matplotlib>=3.7.0       # 图表绘制
+numpy>=1.24.0          # 数值计算（matplotlib 依赖）
