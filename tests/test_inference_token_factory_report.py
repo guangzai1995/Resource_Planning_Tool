@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from openpyxl import load_workbook
 import pytest
 
 from scripts.build_inference_token_factory_report import (
@@ -43,6 +44,32 @@ def test_static_sheet_specs_and_status_labels():
 def test_build_workbook_creates_expected_sheets():
     wb = build_workbook(Path("."))
     assert wb.sheetnames == EXPECTED_SHEETS
+
+
+def test_workbook_contains_required_sheet_headers(tmp_path):
+    output = tmp_path / "report.xlsx"
+    wb = build_workbook(Path("."))
+    wb.save(output)
+    loaded = load_workbook(output)
+    assert loaded.sheetnames == EXPECTED_SHEETS
+    for sheet_name in EXPECTED_SHEETS:
+        ws = loaded[sheet_name]
+        assert ws["A1"].value == "推理 Token 工厂汇报"
+        assert ws["B2"].value == REPORT_VERSION
+        assert ws["A4"].value == "当前状态"
+
+
+def test_summary_sheet_has_expected_technology_states(tmp_path):
+    output = tmp_path / "report.xlsx"
+    wb = build_workbook(Path("."))
+    wb.save(output)
+    ws = load_workbook(output)["02_总览结论"]
+    values = [cell.value for row in ws.iter_rows() for cell in row if cell.value]
+    assert "模型量化" in values
+    assert "MOE 专家并行" in values
+    assert "待验证" in values
+    assert "连续批处理" in values
+    assert "已具备无需独立测试" in values
 
 
 def test_load_context_summary_from_existing_outputs():
