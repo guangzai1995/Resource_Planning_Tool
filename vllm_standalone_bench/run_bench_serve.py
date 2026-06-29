@@ -343,7 +343,18 @@ def _generate_random_requests(args: argparse.Namespace,
     def _request_index_width(base: int, max_width: int) -> int:
         if max_width <= 0:
             return 0
+        base = max(int(base), 1)
+
+        def _raise_capacity_error() -> None:
+            raise ValueError(
+                'unique suffix capacity exhausted: '
+                f'num_prompts={args.num_prompts}, '
+                f'suffix_len={max_width}, base={base}'
+            )
+
         if base <= 1:
+            if args.num_prompts > 1:
+                _raise_capacity_error()
             return max_width
 
         width = 1
@@ -351,6 +362,8 @@ def _generate_random_requests(args: argparse.Namespace,
         while capacity < args.num_prompts and width < max_width:
             width += 1
             capacity *= base
+        if capacity < args.num_prompts:
+            _raise_capacity_error()
         return width
 
     def _request_index_tokens(request_index: int,
