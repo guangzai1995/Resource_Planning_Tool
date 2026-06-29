@@ -565,6 +565,49 @@ def test_main_child_run_installs_signal_handlers(tmp_path, monkeypatch):
     assert calls == ["signals", ("controller", False)]
 
 
+def test_main_foreground_run_installs_signal_handlers(tmp_path, monkeypatch):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    calls = []
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: calls.append("signals"), raising=False)
+    monkeypatch.setattr(
+        ab,
+        "run_controller",
+        lambda config, run_id, runner=None, dry_run=False: calls.append(("controller", dry_run)) or 0,
+    )
+
+    exit_code = ab.main([
+        "run",
+        "--config", str(config_path),
+        "--run-id", "run123",
+    ])
+
+    assert exit_code == 0
+    assert calls == ["signals", ("controller", False)]
+
+
+def test_main_dry_run_does_not_install_signal_handlers(tmp_path, monkeypatch):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    calls = []
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: calls.append("signals"), raising=False)
+    monkeypatch.setattr(
+        ab,
+        "run_controller",
+        lambda config, run_id, runner=None, dry_run=False: calls.append(("controller", dry_run)) or 0,
+    )
+
+    exit_code = ab.main([
+        "run",
+        "--config", str(config_path),
+        "--run-id", "run123",
+        "--dry-run",
+    ])
+
+    assert exit_code == 0
+    assert calls == [("controller", True)]
+
+
 def test_main_child_load_config_failure_writes_failed_state(tmp_path, monkeypatch, capsys):
     config_path = tmp_path / "bad-config.json"
     results_dir = tmp_path / "results"
@@ -1061,6 +1104,29 @@ def test_logs_replace_invalid_utf8(tmp_path, capsys):
     assert exit_code == 0
     assert "ok" in captured.out
     assert "\ufffd" in captured.out
+
+
+def test_follow_file_tails_from_end(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "controller.log"
+    path.write_text("old\n", encoding="utf-8")
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write("new\n")
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ab.time, "sleep", fake_sleep)
+
+    exit_code = ab.follow_file(path)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "old" not in captured.out
+    assert "new" in captured.out
 
 
 def test_follow_file_handles_open_error(tmp_path, monkeypatch, capsys):

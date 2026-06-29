@@ -1484,6 +1484,7 @@ def follow_file(path: Path) -> int:
         return 1
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(0, os.SEEK_END)
             while True:
                 line = handle.readline()
                 if line:
@@ -1746,6 +1747,7 @@ def main(argv: list[str] | None = None) -> int:
             return run_controller(config, run_id=run_id, dry_run=True)
         if args.detach and not args.child:
             return start_detached(args.config, config, run_id)
+        install_signal_handlers()
         return run_controller(config, run_id=run_id, dry_run=args.dry_run)
     if args.command == "status":
         return print_status(args.results_dir / args.run_id)
