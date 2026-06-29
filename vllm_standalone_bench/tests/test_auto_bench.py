@@ -219,3 +219,37 @@ def test_validate_local_paths_rejects_missing_model_dir(tmp_path):
 
     with pytest.raises(ab.ConfigError, match="model path"):
         ab.validate_local_paths(config)
+
+
+def test_case_paths_and_state_files_are_written(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+
+    assert layout.run_dir == tmp_path / "results" / "run123"
+    assert layout.serve_dir == layout.run_dir / "qwen2_5_1_5b" / "bf16_default"
+    assert layout.bench_dir == layout.serve_dir / "smoke"
+
+    ab.write_state(layout.run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": {"model": "qwen2_5_1_5b", "serve_profile": "bf16_default", "bench_profile": "smoke"},
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1}
+    })
+    state = json.loads((layout.run_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "running"
+
+
+def test_manifest_records_relative_artifact_paths(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    manifest = ab.Manifest(run_id="run123", total=1)
+
+    manifest.record(case, layout, "passed")
+    ab.write_manifest(layout.run_dir, manifest)
+
+    data = json.loads((layout.run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert data["run_id"] == "run123"
+    assert data["status"] == "completed"
+    assert data["cases"][0]["csv"] == "qwen2_5_1_5b/bf16_default/smoke/result.csv"

@@ -94,6 +94,13 @@ class BenchmarkCase:
     api_model_name: str
 
 
+@dataclass(frozen=True)
+class CaseLayout:
+    run_dir: Path
+    serve_dir: Path
+    bench_dir: Path
+
+
 @dataclass
 class Completed:
     args: list[str]
@@ -514,3 +521,64 @@ def validate_local_paths(config: AutoBenchConfig) -> None:
             raise ConfigError(f"model path does not exist: {model.host_model_path}")
         if model.host_tokenizer_path is not None and not model.host_tokenizer_path.exists():
             raise ConfigError(f"tokenizer path does not exist: {model.host_tokenizer_path}")
+
+
+def build_layout(config: AutoBenchConfig, run_id: str, case: BenchmarkCase) -> CaseLayout:
+    run_dir = config.run.results_dir / run_id
+    serve_dir = run_dir / case.model.name / case.serve_profile.name
+    bench_dir = serve_dir / case.bench_profile.name
+    return CaseLayout(run_dir=run_dir, serve_dir=serve_dir, bench_dir=bench_dir)
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def write_state(run_dir: Path, state: dict[str, Any]) -> None:
+    write_json_atomic(run_dir / "state.json", state)
+
+
+@dataclass
+class Manifest:
+    run_id: str
+    total: int
+    cases: list[dict[str, Any]] = field(default_factory=list)
+
+    def record(self, case: BenchmarkCase, layout: CaseLayout, status: str,
+               error: str | None = None) -> None:
+        row: dict[str, Any] = {
+            "model": case.model.name,
+            "serve_profile": case.serve_profile.name,
+            "bench_profile": case.bench_profile.name,
+            "status": status,
+            "csv": str((layout.bench_dir / "result.csv").relative_to(layout.run_dir)),
+            "xlsx": str((layout.bench_dir / "result.xlsx").relative_to(layout.run_dir)),
+        }
+        if error:
+            row["error"] = error
+        self.cases.append(row)
+
+    def status(self) -> str:
+        statuses = {case["status"] for case in self.cases}
+        if len(self.cases) < self.total:
+            return "running"
+        if statuses == {"passed"}:
+            return "completed"
+        if "interrupted" in statuses:
+            return "interrupted"
+        if "failed" in statuses or "skipped" in statuses:
+            return "completed_with_failures"
+        return "completed"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"run_id": self.run_id, "status": self.status(), "cases": self.cases}
+
+
+def write_manifest(run_dir: Path, manifest: Manifest) -> None:
+    write_json_atomic(run_dir / "manifest.json", manifest.to_dict())
