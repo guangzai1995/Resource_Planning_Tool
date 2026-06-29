@@ -242,7 +242,7 @@ def _extract_row(
 
     # ── 长度合规：实测 / 请求 ────────────────────────────────────────────────
     # 基于未取整的真实均值算合规，避免 round(avg_out) 在阈值边界引入误差。
-    total_input_len = in_len + prefix_tokens
+    total_input_len = in_len
     raw_avg_in = total_in / completed if completed > 0 else 0.0
     raw_avg_out = total_out / completed if completed > 0 else 0.0
     input_compliance = (
@@ -259,9 +259,9 @@ def _extract_row(
         # ── 测试配置 ────────────────────────────────
         'model':           model,
         'backend':         backend,
-        'input_len':       in_len,            # requested 后缀长度
+        'input_len':       in_len,           # requested 总输入长度
         'output_len':      out_len,           # requested 输出长度
-        'total_input_len': total_input_len,  # 含共享前缀的总输入（requested 口径）
+        'total_input_len': total_input_len,  # 新语义下等于 input_len
         'prefix_ratio':    round(prefix_ratio, 3),
         'prefix_tokens':   prefix_tokens,
         'parallel_num':    parallel_num,

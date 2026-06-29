@@ -87,15 +87,16 @@ def test_extract_row_compliance_when_undergenerated():
     assert row["token_source"] == "usage"
 
 
-def test_extract_row_prefix_total_input_len():
+def test_extract_row_prefix_total_input_len_uses_total_input_budget():
     row = m._extract_row(
-        _result(completed=3, total_in=690, total_out=24),  # prefix 场景
+        _result(completed=3, total_in=384, total_out=24),
         in_len=128, out_len=8, parallel_num=3, epochs=1,
         model="m", backend="openai", prefix_tokens=102,
         prefix_ratio=0.8, has_tokenizer=True)
-    assert row["total_input_len"] == 128 + 102
-    assert row["input_len"] == 128  # requested 后缀长度
-    assert row["avg_input_tokens"] == 230.0
+    assert row["total_input_len"] == 128
+    assert row["input_len"] == 128
+    assert row["prefix_tokens"] == 102
+    assert row["avg_input_tokens"] == 128.0
     assert row["input_compliance"] == 100.0
 
 
@@ -135,14 +136,14 @@ def test_output_compliance_uses_unrounded_mean():
 
 
 def test_input_compliance_uses_unrounded_mean():
-    """输入合规基于未取整均值和总输入目标长度（后缀 + prefix）。"""
+    """输入合规基于未取整均值和总输入目标长度。"""
     row = m._extract_row(
-        _result(total_in=689, total_out=24, completed=3),
+        _result(total_in=383, total_out=24, completed=3),
         in_len=128, out_len=8, parallel_num=3, epochs=1,
         model="m", backend="openai-chat", prefix_tokens=102,
         prefix_ratio=0.8, has_tokenizer=True)
-    assert row["avg_input_tokens"] == 229.7
-    assert row["input_compliance"] == 99.9
+    assert row["avg_input_tokens"] == 127.7
+    assert row["input_compliance"] == 99.7
 
 
 
