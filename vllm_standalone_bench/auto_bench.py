@@ -1684,6 +1684,30 @@ def validate_prepared_model_dir(target: Path) -> None:
         raise ConfigError(
             f"model directory missing tokenizer.json or tokenizer_config.json: {model_dir}"
         )
+    index_paths = sorted(model_dir.glob("*.safetensors.index.json"))
+    if index_paths:
+        shard_names: set[str] = set()
+        for index_path in index_paths:
+            try:
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ConfigError(f"safetensors index invalid: {index_path}: {exc}") from exc
+            if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
+                raise ConfigError(f"safetensors index weight_map invalid: {index_path}")
+            for shard_name in index["weight_map"].values():
+                if not isinstance(shard_name, str):
+                    raise ConfigError(f"safetensors index shard invalid: {index_path}")
+                shard_path = Path(shard_name)
+                if shard_path.is_absolute() or ".." in shard_path.parts:
+                    raise ConfigError(f"safetensors shard path invalid: {shard_name}")
+                shard_names.add(shard_name)
+        if not shard_names:
+            raise ConfigError(f"model directory missing complete safetensors weights: {model_dir}")
+        for shard_name in sorted(shard_names):
+            shard_path = model_dir / shard_name
+            if not shard_path.is_file() or shard_path.stat().st_size <= 0:
+                raise ConfigError(f"safetensors shard missing or empty: {shard_name}")
+        return
     safetensors = [
         path for path in model_dir.glob("*.safetensors")
         if path.is_file() and path.stat().st_size > 0
@@ -1713,6 +1737,15 @@ def _backup_path_for_target(target: Path) -> Path:
     return candidate
 
 
+def _remove_download_tmp(tmp_dir: Path) -> None:
+    if not tmp_dir.exists():
+        return
+    if tmp_dir.is_dir() and not tmp_dir.is_symlink():
+        shutil.rmtree(tmp_dir)
+    else:
+        tmp_dir.unlink()
+
+
 def build_prepare_model_command(modelscope_id: str, target: Path,
                                 bench_image: str) -> list[str]:
     resolved_target = Path(target).resolve()
@@ -1740,6 +1773,7 @@ def prepare_model(*, modelscope_id: str, target: Path,
         return 0
 
     resolved_target.parent.mkdir(parents=True, exist_ok=True)
+    _remove_download_tmp(tmp_dir)
     result = active_runner.run(
         build_prepare_model_command(modelscope_id, resolved_target, bench_image),
         check=False,

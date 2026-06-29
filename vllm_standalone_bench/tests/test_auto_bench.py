@@ -1667,6 +1667,26 @@ def write_model_files(path, *, safetensors=True, marker="complete"):
         (path / "model.safetensors").write_text(marker, encoding="utf-8")
 
 
+class ModelDownloadRunner(FakeRunner):
+    def __init__(self, target_parent, marker="fresh", require_clean_tmp=False):
+        super().__init__()
+        self.target_parent = Path(target_parent)
+        self.marker = marker
+        self.require_clean_tmp = require_clean_tmp
+
+    def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+        self.commands.append(list(args))
+        target_arg = args[-1]
+        prefix = "/model-target/"
+        if not target_arg.startswith(prefix):
+            return ab.Completed(list(args), 1, "", "unexpected target")
+        host_tmp = self.target_parent / target_arg.removeprefix(prefix)
+        if host_tmp.exists() and self.require_clean_tmp:
+            return ab.Completed(list(args), 0, "download skipped existing tmp\n", "")
+        write_model_files(host_tmp, marker=self.marker)
+        return ab.Completed(list(args), 0, "ok\n", "")
+
+
 def test_model_dir_requires_complete_safetensors(tmp_path):
     target = tmp_path / "model"
     target.mkdir()
@@ -1678,11 +1698,45 @@ def test_model_dir_requires_complete_safetensors(tmp_path):
         ab.validate_prepared_model_dir(target)
 
 
+def test_model_dir_requires_all_indexed_safetensors_shards(tmp_path):
+    target = tmp_path / "model"
+    write_model_files(target, safetensors=False)
+    (target / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "weight_map": {
+                "layer.0": "model-00001-of-00002.safetensors",
+                "layer.1": "model-00002-of-00002.safetensors",
+            }
+        }),
+        encoding="utf-8",
+    )
+    (target / "model-00001-of-00002.safetensors").write_text("shard-1", encoding="utf-8")
+
+    with pytest.raises(ab.ConfigError, match="safetensors|model-00002"):
+        ab.validate_prepared_model_dir(target)
+
+
+def test_model_dir_accepts_complete_indexed_safetensors_shards(tmp_path):
+    target = tmp_path / "model"
+    write_model_files(target, safetensors=False)
+    (target / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "weight_map": {
+                "layer.0": "model-00001-of-00002.safetensors",
+                "layer.1": "model-00002-of-00002.safetensors",
+            }
+        }),
+        encoding="utf-8",
+    )
+    (target / "model-00001-of-00002.safetensors").write_text("shard-1", encoding="utf-8")
+    (target / "model-00002-of-00002.safetensors").write_text("shard-2", encoding="utf-8")
+
+    ab.validate_prepared_model_dir(target)
+
+
 def test_prepare_model_uses_bench_image_and_temp_dir(tmp_path):
     target = tmp_path / "Qwen2.5-1.5B-Instruct"
-    tmp_download = tmp_path / "Qwen2.5-1.5B-Instruct.download-tmp"
-    write_model_files(tmp_download)
-    runner = FakeRunner()
+    runner = ModelDownloadRunner(tmp_path)
 
     result = ab.prepare_model(
         modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
@@ -1700,6 +1754,23 @@ def test_prepare_model_uses_bench_image_and_temp_dir(tmp_path):
     assert "bench:offline" in cmd
     assert "Qwen/Qwen2.5-1.5B-Instruct" in cmd
     assert "/model-target/Qwen2.5-1.5B-Instruct.download-tmp" in cmd
+
+
+def test_prepare_model_removes_stale_download_tmp_before_download(tmp_path):
+    target = tmp_path / "model"
+    tmp_download = tmp_path / "model.download-tmp"
+    write_model_files(tmp_download, marker="stale-other-model")
+    runner = ModelDownloadRunner(tmp_path, marker="fresh-model", require_clean_tmp=True)
+
+    result = ab.prepare_model(
+        modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
+        target=target,
+        bench_image="bench:offline",
+        runner=runner,
+    )
+
+    assert result == 0
+    assert (target / "model.safetensors").read_text(encoding="utf-8") == "fresh-model"
 
 
 def test_prepare_model_existing_complete_skips_download(tmp_path, capsys):
@@ -1738,10 +1809,8 @@ def test_prepare_model_existing_incomplete_without_force_fails(tmp_path):
 
 def test_prepare_model_force_backs_up_existing_target(tmp_path):
     target = tmp_path / "model"
-    tmp_download = tmp_path / "model.download-tmp"
     write_model_files(target, marker="old")
-    write_model_files(tmp_download, marker="new")
-    runner = FakeRunner()
+    runner = ModelDownloadRunner(tmp_path, marker="new")
 
     result = ab.prepare_model(
         modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
@@ -1778,7 +1847,7 @@ def test_prepare_model_download_failure_keeps_tmp_and_no_target(tmp_path):
         )
 
     assert not target.exists()
-    assert tmp_download.exists()
+    assert runner.commands
 
 
 def test_main_dry_run_takes_precedence_over_detach(tmp_path, monkeypatch):
