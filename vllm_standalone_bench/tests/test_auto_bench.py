@@ -299,6 +299,16 @@ class FakeRunner:
         key = " ".join(args[:3])
         if key in self.failures:
             return ab.Completed(list(args), self.failures[key], "", "forced failure")
+        if args[:4] == ["docker", "network", "inspect", "--format"]:
+            return ab.Completed(
+                list(args),
+                0,
+                json.dumps({
+                    "vllm_auto_bench.managed": "true",
+                    "vllm_auto_bench.run_id": "run123",
+                }) + "\n",
+                "",
+            )
         if args[:3] == ["docker", "network", "inspect"]:
             return ab.Completed(list(args), 1, "", "not found")
         if args[:3] == ["docker", "network", "create"]:
@@ -342,6 +352,13 @@ def ready_probe_commands(commands):
     ]
 
 
+def network_create_command(commands):
+    for command in commands:
+        if command[:3] == ["docker", "network", "create"]:
+            return command
+    raise AssertionError("docker network create command not found")
+
+
 def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     runner = FakeRunner()
@@ -351,12 +368,52 @@ def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
 
     joined = [" ".join(cmd) for cmd in runner.commands]
     assert result == 0
-    assert any("docker network create vllm-bench-net" in cmd for cmd in joined)
+    assert "vllm-bench-net" in network_create_command(runner.commands)
     assert any("docker run -d" in cmd for cmd in joined)
     assert any("run_bench_multi.py" in cmd for cmd in joined)
     assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
     assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_network_create_command_has_ownership_labels(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    create = network_create_command(runner.commands)
+    labels = [create[index + 1] for index, value in enumerate(create) if value == "--label"]
+    assert result == 0
+    assert "vllm_auto_bench.managed=true" in labels
+    assert "vllm_auto_bench.run_id=run123" in labels
+
+
+def test_controller_does_not_remove_network_with_other_run_label(tmp_path):
+    class OtherRunLabelRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if args[:4] == ["docker", "network", "inspect", "--format"]:
+                self.commands.append(list(args))
+                return ab.Completed(
+                    list(args),
+                    0,
+                    json.dumps({
+                        "vllm_auto_bench.managed": "true",
+                        "vllm_auto_bench.run_id": "other",
+                    }) + "\n",
+                    "",
+                )
+            return super().run(args, check=check, capture=capture, text=text, stdout=stdout, stderr=stderr)
+
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = OtherRunLabelRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    joined = [" ".join(cmd) for cmd in runner.commands]
+    assert result == 0
+    assert any("docker network create" in cmd for cmd in joined)
+    assert not any("docker network rm vllm-bench-net" in cmd for cmd in joined)
 
 
 def test_controller_skips_bench_when_vllm_not_ready(tmp_path, monkeypatch):
@@ -567,7 +624,7 @@ def test_controller_stop_during_vllm_start_cleans_container_and_network(tmp_path
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
 
 
-def test_controller_stop_during_network_create_attempts_network_cleanup(tmp_path):
+def test_controller_stop_during_network_create_does_not_remove_unowned_network(tmp_path):
     class StopDuringNetworkCreateRunner(FakeRunner):
         def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
             self.commands.append(list(args))
@@ -582,8 +639,91 @@ def test_controller_stop_during_network_create_attempts_network_cleanup(tmp_path
 
     joined = [" ".join(cmd) for cmd in runner.commands]
     assert result == 130
-    assert any("docker network create vllm-bench-net" in cmd for cmd in joined)
-    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+    assert any("docker network create" in cmd and "vllm-bench-net" in cmd for cmd in joined)
+    assert not any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+@pytest.mark.parametrize("failure_prefix", [
+    ["docker", "inspect", "--format"],
+    ["docker", "network", "rm"],
+])
+def test_controller_cleanup_stop_requested_marks_interrupted(tmp_path, failure_prefix):
+    class StopDuringCleanupRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.bench_finished = False
+
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if any("run_bench_multi.py" in str(arg) for arg in args):
+                self.bench_finished = True
+            if self.bench_finished and args[:len(failure_prefix)] == failure_prefix:
+                self.commands.append(list(args))
+                raise ab.StopRequested("stopped during cleanup")
+            return super().run(args, check=check, capture=capture, text=text, stdout=stdout, stderr=stderr)
+
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = StopDuringCleanupRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert result == 130
+    assert manifest["status"] == "interrupted"
+    assert state["status"] == "interrupted"
+
+
+def test_controller_validate_failure_writes_failed_state(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+
+    def fail_validate(config_arg):
+        raise ab.ConfigError("bad local paths")
+
+    monkeypatch.setattr(ab, "validate_local_paths", fail_validate)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert state["status"] == "failed"
+    assert "bad local paths" in state["error"]
+
+
+def test_controller_config_resolved_write_failure_writes_failed_state(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    original_write_json = ab.write_json_atomic
+
+    def fail_config_resolved(path, payload):
+        if path.name == "config.resolved.json":
+            raise OSError("cannot write resolved config")
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(ab, "write_json_atomic", fail_config_resolved)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert state["status"] == "failed"
+    assert "cannot write resolved config" in state["error"]
+
+
+def test_controller_init_stop_requested_writes_interrupted_state(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+
+    def stop_validate(config_arg):
+        raise ab.StopRequested("stopped during init")
+
+    monkeypatch.setattr(ab, "validate_local_paths", stop_validate)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    run_dir = tmp_path / "results" / "run123"
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert result == 130
+    assert state["status"] == "interrupted"
+    assert manifest["status"] == "interrupted"
 
 
 def test_controller_dry_run_prints_commands_without_result_files(tmp_path, capsys):
@@ -595,7 +735,8 @@ def test_controller_dry_run_prints_commands_without_result_files(tmp_path, capsy
     out = capsys.readouterr().out
     run_dir = tmp_path / "results" / "run123"
     assert result == 0
-    assert "docker network create vllm-bench-net" in out
+    assert "docker network create" in out
+    assert "vllm_auto_bench.run_id=run123" in out
     assert "docker run -d" in out
     assert "run_bench_multi.py" in out
     assert not (run_dir / "config.resolved.json").exists()
@@ -822,11 +963,27 @@ def matching_controller_cmdline(run_id="run123"):
     ]
 
 
+def write_controller_metadata(run_dir, pid=12345, run_id=None, command=None):
+    run_id = run_id or run_dir.name
+    command = command or matching_controller_cmdline(run_id)
+    (run_dir / "controller.json").write_text(
+        json.dumps({
+            "pid": pid,
+            "run_id": run_id,
+            "command": command,
+            "config_path": "config.json",
+            "started_at": 1,
+        }),
+        encoding="utf-8",
+    )
+
+
 def test_stop_run_sends_sigterm(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
     write_stop_state(run_dir)
+    write_controller_metadata(run_dir)
     signals = []
 
     def fake_kill(pid, sig):
@@ -871,6 +1028,7 @@ def test_stop_run_handles_missing_process(tmp_path, monkeypatch, capsys):
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
     write_stop_state(run_dir)
+    write_controller_metadata(run_dir)
 
     def missing_process(pid, sig):
         raise ProcessLookupError
@@ -907,6 +1065,7 @@ def test_stop_run_handles_os_error(tmp_path, monkeypatch, capsys):
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
     write_stop_state(run_dir)
+    write_controller_metadata(run_dir)
 
     def fail_stop(pid, sig):
         raise OSError("denied")
@@ -985,6 +1144,7 @@ def test_stop_run_rejects_mismatched_process(tmp_path, monkeypatch, capsys):
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
     write_stop_state(run_dir)
+    write_controller_metadata(run_dir)
 
     def fail_if_called(pid, sig):
         raise AssertionError("os.kill should not be called for mismatched process")
@@ -1009,6 +1169,7 @@ def test_stop_run_rejects_run_id_as_other_argument(tmp_path, monkeypatch, capsys
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
     write_stop_state(run_dir)
+    write_controller_metadata(run_dir)
 
     def fail_if_called(pid, sig):
         raise AssertionError("os.kill should not be called for mismatched run id")
@@ -1022,6 +1183,86 @@ def test_stop_run_rejects_run_id_as_other_argument(tmp_path, monkeypatch, capsys
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "process does not match controller" in captured.err or "stale pid" in captured.err
+
+
+def test_stop_run_requires_controller_metadata(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called without controller metadata")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+    monkeypatch.setattr(
+        ab,
+        "read_process_cmdline",
+        lambda pid: matching_controller_cmdline(run_dir.name),
+        raising=False,
+    )
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "metadata" in captured.err or "stale pid" in captured.err
+
+
+def test_stop_run_rejects_bad_controller_metadata(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    (run_dir / "controller.json").write_text("{bad json", encoding="utf-8")
+    write_stop_state(run_dir)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called with bad controller metadata")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+    monkeypatch.setattr(
+        ab,
+        "read_process_cmdline",
+        lambda pid: matching_controller_cmdline(run_dir.name),
+        raising=False,
+    )
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "metadata" in captured.err or "stale pid" in captured.err
+
+
+@pytest.mark.parametrize("metadata", [
+    {"pid": 999, "run_id": "run123", "command": matching_controller_cmdline("run123")},
+    {"pid": 12345, "run_id": "other", "command": matching_controller_cmdline("run123")},
+    {"pid": 12345, "run_id": "run123", "command": matching_controller_cmdline("other")},
+    {"pid": 12345, "run_id": "run123", "command": ["ok", 1]},
+])
+def test_stop_run_rejects_controller_metadata_mismatch(tmp_path, monkeypatch, capsys, metadata):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    (run_dir / "controller.json").write_text(json.dumps(metadata), encoding="utf-8")
+    write_stop_state(run_dir)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called with mismatched controller metadata")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+    monkeypatch.setattr(
+        ab,
+        "read_process_cmdline",
+        lambda pid: matching_controller_cmdline(run_dir.name),
+        raising=False,
+    )
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "metadata" in captured.err or "stale pid" in captured.err
 
 
 def test_stop_run_rejects_invalid_utf8_pid_file(tmp_path, monkeypatch, capsys):

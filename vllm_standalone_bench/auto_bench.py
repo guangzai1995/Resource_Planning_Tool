@@ -19,6 +19,8 @@ SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 MODEL_CONTAINER_ROOT = PurePosixPath("/models")
 SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat"})
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
+NETWORK_MANAGED_LABEL = "vllm_auto_bench.managed"
+NETWORK_RUN_ID_LABEL = "vllm_auto_bench.run_id"
 
 
 class ConfigError(ValueError):
@@ -620,17 +622,27 @@ def docker_network_exists(runner: Runner, network: str) -> bool:
     return result.returncode == 0
 
 
-def ensure_network(config: AutoBenchConfig, runner: Runner, dry_run: bool) -> bool:
+def build_network_create_command(config: AutoBenchConfig, run_id: str) -> list[str]:
+    return [
+        "docker", "network", "create",
+        "--label", f"{NETWORK_MANAGED_LABEL}=true",
+        "--label", f"{NETWORK_RUN_ID_LABEL}={run_id}",
+        config.run.network,
+    ]
+
+
+def ensure_network(config: AutoBenchConfig, runner: Runner,
+                   dry_run: bool, run_id: str | None = None) -> bool:
     if dry_run:
         if config.run.create_network:
-            print_cmd(["docker", "network", "create", config.run.network])
+            print_cmd(build_network_create_command(config, run_id or config.run.name))
             return True
         return False
     if docker_network_exists(runner, config.run.network):
         return False
     if not config.run.create_network:
         raise RuntimeError(f"Docker network does not exist: {config.run.network}")
-    cmd = ["docker", "network", "create", config.run.network]
+    cmd = build_network_create_command(config, run_id or config.run.name)
     if dry_run:
         print_cmd(cmd)
     else:
@@ -657,11 +669,48 @@ def connected_network_containers(runner: Runner, network: str) -> list[str]:
     return ["unknown"]
 
 
+def network_has_run_labels(runner: Runner, network: str, run_id: str) -> bool:
+    result = runner.run([
+        "docker", "network", "inspect", "--format",
+        "{{json .Labels}}", network,
+    ], check=False)
+    payload = result.stdout.strip()
+    if result.returncode != 0 or payload in ("", "null"):
+        return False
+    try:
+        labels = json.loads(payload)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(labels, dict):
+        return False
+    return (
+        labels.get(NETWORK_MANAGED_LABEL) == "true"
+        and labels.get(NETWORK_RUN_ID_LABEL) == run_id
+    )
+
+
 def cleanup_network(config: AutoBenchConfig, runner: Runner,
-                    owned: bool, dry_run: bool) -> None:
+                    owned: bool, dry_run: bool,
+                    run_id: str | None = None) -> bool:
     if not owned or not config.run.cleanup_network:
-        return
-    connected = [] if dry_run else connected_network_containers(runner, config.run.network)
+        return False
+    stop_requested = False
+    if not dry_run:
+        if run_id is None:
+            return False
+        try:
+            if not network_has_run_labels(runner, config.run.network, run_id):
+                return False
+        except StopRequested:
+            return True
+        except Exception:
+            return False
+    try:
+        connected = [] if dry_run else connected_network_containers(runner, config.run.network)
+    except StopRequested:
+        return True
+    except Exception:
+        return False
     if should_cleanup_network(
         owned=owned,
         cleanup_enabled=config.run.cleanup_network,
@@ -671,7 +720,13 @@ def cleanup_network(config: AutoBenchConfig, runner: Runner,
         if dry_run:
             print_cmd(cmd)
         else:
-            runner.run(cmd, check=False)
+            try:
+                runner.run(cmd, check=False)
+            except StopRequested:
+                stop_requested = True
+            except Exception:
+                pass
+    return stop_requested
 
 
 def print_cmd(cmd: list[str]) -> None:
@@ -872,6 +927,16 @@ def finished_state(run_id: str, manifest: Manifest) -> dict[str, Any]:
     }
 
 
+def write_terminal_state(run_dir: Path, run_id: str, manifest: Manifest,
+                         status: str, error: str | None = None) -> None:
+    manifest.terminal_status = status
+    write_manifest(run_dir, manifest)
+    state = finished_state(run_id, manifest)
+    if error:
+        state["error"] = error
+    write_state(run_dir, state)
+
+
 def _case_key(case: BenchmarkCase) -> tuple[str, str, str]:
     return (case.model.name, case.serve_profile.name, case.bench_profile.name)
 
@@ -944,7 +1009,7 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
     network_owned = config.run.create_network
     try:
         if config.run.create_network:
-            print_cmd(["docker", "network", "create", config.run.network])
+            print_cmd(build_network_create_command(config, run_id))
         for group_cases in _group_cases_by_serve(cases).values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
@@ -972,24 +1037,22 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
     manifest = Manifest(run_id=run_id, total=len(cases))
-    write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
-    if not dry_run:
-        validate_local_paths(config)
 
     network_owned = False
-    network_cleanup_requested = False
     exit_code = 0
     completed = 0
     interrupted = False
     try:
+        write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
+        validate_local_paths(config)
+
         if docker_network_exists(active_runner, config.run.network):
             network_owned = False
         else:
             if not config.run.create_network:
                 raise RuntimeError(f"Docker network does not exist: {config.run.network}")
-            network_cleanup_requested = True
             _check_result(active_runner.run(
-                ["docker", "network", "create", config.run.network],
+                build_network_create_command(config, run_id),
                 check=False,
             ))
             network_owned = True
@@ -1127,7 +1190,6 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                 break
 
         write_state(run_dir, finished_state(run_id, manifest))
-        return exit_code
     except StopRequested as exc:
         manifest.terminal_status = "interrupted"
         _record_interrupted_group(
@@ -1138,15 +1200,35 @@ def run_controller(config: AutoBenchConfig, run_id: str,
             config,
             str(exc) or "stop requested",
         )
-        write_state(run_dir, finished_state(run_id, manifest))
-        return 130
+        write_terminal_state(
+            run_dir,
+            run_id,
+            manifest,
+            "interrupted",
+            error=str(exc) or "stop requested",
+        )
+        exit_code = 130
+    except Exception as exc:
+        write_terminal_state(run_dir, run_id, manifest, "failed", error=str(exc))
+        exit_code = 1
     finally:
-        cleanup_network(
+        cleanup_interrupted = cleanup_network(
             config,
             active_runner,
-            network_owned or network_cleanup_requested,
-            dry_run,
+            network_owned,
+            False,
+            run_id=run_id,
         )
+        if cleanup_interrupted:
+            write_terminal_state(
+                run_dir,
+                run_id,
+                manifest,
+                "interrupted",
+                error="stop requested during network cleanup",
+            )
+            exit_code = 130
+    return exit_code
 
 
 def build_detach_command(config_path: Path, run_id: str) -> list[str]:
@@ -1342,24 +1424,23 @@ def _cmdline_matches_controller(cmdline: list[str], run_id: str) -> bool:
 
 
 def _controller_metadata_command(run_dir: Path, pid: int,
-                                 run_id: str) -> list[str] | None:
+                                 run_id: str) -> list[str]:
     metadata_path = run_dir / "controller.json"
     if not metadata_path.exists():
-        return None
+        raise ValueError(f"controller metadata not found: {metadata_path}")
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"controller metadata invalid: {exc}") from exc
     if not isinstance(metadata, dict):
-        return None
+        raise ValueError("controller metadata invalid: expected object")
     command = metadata.get("command")
-    if (
-        metadata.get("pid") != pid
-        or metadata.get("run_id") != run_id
-        or not isinstance(command, list)
-        or not all(isinstance(item, str) for item in command)
-    ):
-        return None
+    if metadata.get("pid") != pid:
+        raise ValueError("controller metadata pid mismatch")
+    if metadata.get("run_id") != run_id:
+        raise ValueError("controller metadata run_id mismatch")
+    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+        raise ValueError("controller metadata command invalid")
     return command
 
 
@@ -1409,7 +1490,11 @@ def stop_run(run_dir: Path) -> int:
         return 1
     if not _run_state_is_active(run_dir):
         return 1
-    expected_command = _controller_metadata_command(run_dir, pid, run_dir.name)
+    try:
+        expected_command = _controller_metadata_command(run_dir, pid, run_dir.name)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     if not is_controller_process(pid, run_dir.name, expected_command=expected_command):
         print(f"process does not match controller or stale pid: {pid}", file=sys.stderr)
         return 1
