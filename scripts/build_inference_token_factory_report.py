@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 from pathlib import Path
 from statistics import mean
+from typing import Sequence
 
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, Reference
@@ -692,3 +694,44 @@ def build_workbook(repo_root: Path) -> Workbook:
         if spec["title"] == "12_数据附录":
             _write_appendix(ws)
     return wb
+
+
+def default_repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def resolve_output_path(repo_root: Path, output: Path | str | None) -> Path:
+    output_path = Path("inference-report") / OUTPUT_FILENAME if output is None else Path(output)
+    if output_path.is_absolute():
+        return output_path
+    return repo_root / output_path
+
+
+def save_report(repo_root: Path, output: Path | str | None = None) -> Path:
+    output_path = resolve_output_path(repo_root, output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = build_workbook(repo_root)
+    workbook.save(output_path)
+    return output_path
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=f"输出 xlsx 路径；相对路径按 repo root 解析。默认 inference-report/{OUTPUT_FILENAME}",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    output_path = save_report(default_repo_root(), args.output)
+    print(output_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

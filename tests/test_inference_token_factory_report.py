@@ -5,12 +5,16 @@ from openpyxl import load_workbook
 import pytest
 
 from scripts.build_inference_token_factory_report import (
+    OUTPUT_FILENAME,
     REPORT_VERSION,
     SHEET_SPECS,
     STATUS_LABELS,
     build_workbook,
     compute_fp8_summary,
     load_context_summary,
+    main,
+    resolve_output_path,
+    save_report,
 )
 
 
@@ -259,6 +263,52 @@ def test_report_contains_visual_charts():
         "FP8" in str(chart.title) or "吞吐" in str(chart.title)
         for chart in quantization_charts
     )
+
+
+def assert_saved_report_content(output: Path):
+    loaded = load_workbook(output)
+    assert loaded.sheetnames == EXPECTED_SHEETS
+    assert len(loaded["01_背景与目标"]._charts) >= 1
+    assert len(loaded["04_模型量化"]._charts) >= 1
+
+    background_text = sheet_text(loaded["01_背景与目标"])
+    assert "100.8 万" in background_text
+
+    pd_text = sheet_text(loaded["08_PD分离"])
+    assert "H200 做 P、H20 做 D" in pd_text
+
+    appendix_text = sheet_text(loaded["12_数据附录"])
+    assert "data/H200/72B-FP8/2.csv" in appendix_text
+
+
+def test_save_report_writes_reloadable_workbook_with_charts_and_key_content(tmp_path):
+    output = tmp_path / "nested" / "report.xlsx"
+
+    saved_path = save_report(Path("."), output)
+
+    assert saved_path == output
+    assert output.exists()
+    assert_saved_report_content(output)
+
+
+def test_cli_writes_requested_output_path_from_non_repo_cwd(tmp_path, monkeypatch, capsys):
+    output = tmp_path / "cli" / "report.xlsx"
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["--output", str(output)])
+
+    assert exit_code == 0
+    assert output.exists()
+    assert str(output) in capsys.readouterr().out
+    assert_saved_report_content(output)
+
+
+def test_resolve_output_path_uses_default_and_repo_root_for_relative_paths():
+    repo_root = Path("/repo")
+
+    assert resolve_output_path(repo_root, None) == repo_root / "inference-report" / OUTPUT_FILENAME
+    assert resolve_output_path(repo_root, Path("custom/report.xlsx")) == repo_root / "custom" / "report.xlsx"
+    assert resolve_output_path(repo_root, Path("/tmp/report.xlsx")) == Path("/tmp/report.xlsx")
 
 
 def test_quantization_chart_degrades_when_all_fp8_data_is_missing(tmp_path):
