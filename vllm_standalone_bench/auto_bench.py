@@ -558,6 +558,7 @@ class Manifest:
     run_id: str
     total: int
     cases: list[dict[str, Any]] = field(default_factory=list)
+    terminal_status: str | None = None
 
     def record(self, case: BenchmarkCase, layout: CaseLayout, status: str,
                error: str | None = None) -> None:
@@ -574,6 +575,8 @@ class Manifest:
         self.cases.append(row)
 
     def status(self) -> str:
+        if self.terminal_status:
+            return self.terminal_status
         statuses = {case["status"] for case in self.cases}
         if "interrupted" in statuses:
             return "interrupted"
@@ -762,6 +765,8 @@ def save_vllm_artifacts_best_effort(config: AutoBenchConfig, runner: Runner,
                                     case: BenchmarkCase, layout: CaseLayout) -> None:
     try:
         save_vllm_artifacts(config, runner, case, layout)
+    except StopRequested:
+        raise
     except Exception as exc:
         try:
             layout.serve_dir.mkdir(parents=True, exist_ok=True)
@@ -769,6 +774,8 @@ def save_vllm_artifacts_best_effort(config: AutoBenchConfig, runner: Runner,
                 f"failed to save vLLM artifacts: {exc}",
                 encoding="utf-8",
             )
+        except StopRequested:
+            raise
         except Exception:
             pass
 
@@ -778,14 +785,19 @@ def stop_and_remove_container(runner: Runner, container_name: str, dry_run: bool
         ["docker", "stop", container_name],
         ["docker", "rm", "-f", container_name],
     ]
+    stop_requested: StopRequested | None = None
     for command in commands:
         try:
             if dry_run:
                 print_cmd(command)
             else:
                 runner.run(command, check=False)
+        except StopRequested as exc:
+            stop_requested = exc
         except Exception:
             pass
+    if stop_requested is not None:
+        raise stop_requested
 
 
 def _jsonable(value: Any) -> Any:
@@ -965,11 +977,22 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         validate_local_paths(config)
 
     network_owned = False
+    network_cleanup_requested = False
     exit_code = 0
     completed = 0
     interrupted = False
     try:
-        network_owned = ensure_network(config, active_runner, dry_run)
+        if docker_network_exists(active_runner, config.run.network):
+            network_owned = False
+        else:
+            if not config.run.create_network:
+                raise RuntimeError(f"Docker network does not exist: {config.run.network}")
+            network_cleanup_requested = True
+            _check_result(active_runner.run(
+                ["docker", "network", "create", config.run.network],
+                check=False,
+            ))
+            network_owned = True
         grouped = _group_cases_by_serve(cases)
 
         for group_cases in grouped.values():
@@ -977,11 +1000,13 @@ def run_controller(config: AutoBenchConfig, run_id: str,
             serve_layout = build_layout(config, run_id, serve_case)
             vllm_cmd = build_vllm_run_command(config, serve_case, serve_layout.run_dir)
             started = False
+            cleanup_container = False
             try:
                 if dry_run:
                     print_cmd(vllm_cmd)
                     ready = True
                 else:
+                    cleanup_container = True
                     active_runner.run(["docker", "rm", "-f", serve_case.container_name], check=False)
                     start_result = active_runner.run(vllm_cmd, check=False)
                     started = start_result.returncode == 0
@@ -1057,6 +1082,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
             except StopRequested as exc:
                 exit_code = 130
                 interrupted = True
+                manifest.terminal_status = "interrupted"
                 completed += _record_interrupted_group(
                     manifest,
                     run_dir,
@@ -1076,22 +1102,34 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                     str(exc),
                 )
             finally:
-                if not dry_run and started:
-                    save_vllm_artifacts_best_effort(
-                        config,
-                        active_runner,
-                        serve_case,
-                        serve_layout,
-                    )
-                    stop_and_remove_container(active_runner, serve_case.container_name, dry_run)
+                if not dry_run and cleanup_container:
+                    stop_requested: StopRequested | None = None
+                    if started:
+                        try:
+                            save_vllm_artifacts_best_effort(
+                                config,
+                                active_runner,
+                                serve_case,
+                                serve_layout,
+                            )
+                        except StopRequested as exc:
+                            stop_requested = exc
+                    try:
+                        stop_and_remove_container(active_runner, serve_case.container_name, dry_run)
+                    except StopRequested as exc:
+                        if stop_requested is None:
+                            stop_requested = exc
                     if config.run.cooldown_sec > 0:
                         time.sleep(config.run.cooldown_sec)
+                    if stop_requested is not None:
+                        raise stop_requested
             if interrupted:
                 break
 
         write_state(run_dir, finished_state(run_id, manifest))
         return exit_code
     except StopRequested as exc:
+        manifest.terminal_status = "interrupted"
         _record_interrupted_group(
             manifest,
             run_dir,
@@ -1103,7 +1141,12 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         write_state(run_dir, finished_state(run_id, manifest))
         return 130
     finally:
-        cleanup_network(config, active_runner, network_owned, dry_run)
+        cleanup_network(
+            config,
+            active_runner,
+            network_owned or network_cleanup_requested,
+            dry_run,
+        )
 
 
 def build_detach_command(config_path: Path, run_id: str) -> list[str]:
@@ -1119,34 +1162,70 @@ def build_detach_command(config_path: Path, run_id: str) -> list[str]:
     ]
 
 
-def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> int:
-    run_dir = config.run.results_dir / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    cases = expand_cases(config, run_id=run_id)
-    write_state(run_dir, {
+def _detached_state(run_id: str, status: str, total: int,
+                    error: str | None = None) -> dict[str, Any]:
+    state: dict[str, Any] = {
         "run_id": run_id,
-        "status": "starting",
+        "status": status,
         "current": None,
         "counts": {
             "passed": 0,
             "failed": 0,
             "skipped": 0,
             "running": 0,
-            "total": len(cases),
+            "total": total,
         },
-    })
+    }
+    if error:
+        state["error"] = error
+    return state
+
+
+def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> int:
+    run_dir = config.run.results_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cases = expand_cases(config, run_id=run_id)
+    total = len(cases)
+
+    def fail_start(error: str) -> int:
+        write_state(run_dir, _detached_state(run_id, "failed", total, error=error))
+        print(f"failed to start detached controller: {error}", file=sys.stderr)
+        return 1
+
+    try:
+        validate_local_paths(config)
+    except (ConfigError, OSError) as exc:
+        return fail_start(str(exc))
+
+    write_state(run_dir, _detached_state(run_id, "starting", total))
 
     log_path = run_dir / "controller.log"
     command = build_detach_command(config_path, run_id)
-    with log_path.open("ab") as log_file:
-        process = subprocess.Popen(
-            command,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    (run_dir / "controller.pid").write_text(f"{process.pid}\n", encoding="utf-8")
+    process: subprocess.Popen[Any] | None = None
+    try:
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(
+                command,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        (run_dir / "controller.pid").write_text(f"{process.pid}\n", encoding="utf-8")
+        write_json_atomic(run_dir / "controller.json", {
+            "pid": process.pid,
+            "run_id": run_id,
+            "command": command,
+            "config_path": str(config_path),
+            "started_at": time.time(),
+        })
+    except OSError as exc:
+        if process is not None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        return fail_start(str(exc))
     print(f"run_id: {run_id}")
     print(f"log: {log_path}")
     return 0
@@ -1182,6 +1261,9 @@ def print_status(run_dir: Path) -> int:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         print(f"state file invalid: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(state, dict):
+        print(f"state file invalid: expected object in {state_path}", file=sys.stderr)
         return 1
     print(f"run_id: {state.get('run_id', run_dir.name)}")
     print(f"status: {state.get('status', 'unknown')}")
@@ -1231,19 +1313,65 @@ def read_process_cmdline(pid: int) -> list[str]:
     ]
 
 
-def is_controller_process(pid: int, run_id: str) -> bool:
+def _is_current_script_arg(arg: str) -> bool:
+    try:
+        return Path(arg).resolve() == Path(__file__).resolve()
+    except (OSError, RuntimeError):
+        return arg == str(Path(__file__).resolve())
+
+
+def _cmdline_matches_controller(cmdline: list[str], run_id: str) -> bool:
+    script_indexes = [
+        index
+        for index, value in enumerate(cmdline)
+        if _is_current_script_arg(value)
+    ]
+    for script_index in script_indexes:
+        args = cmdline[script_index + 1:]
+        if not args or args[0] != "run":
+            continue
+        if "--child" not in args:
+            continue
+        try:
+            run_id_index = args.index("--run-id")
+        except ValueError:
+            continue
+        if run_id_index + 1 < len(args) and args[run_id_index + 1] == run_id:
+            return True
+    return False
+
+
+def _controller_metadata_command(run_dir: Path, pid: int,
+                                 run_id: str) -> list[str] | None:
+    metadata_path = run_dir / "controller.json"
+    if not metadata_path.exists():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    command = metadata.get("command")
+    if (
+        metadata.get("pid") != pid
+        or metadata.get("run_id") != run_id
+        or not isinstance(command, list)
+        or not all(isinstance(item, str) for item in command)
+    ):
+        return None
+    return command
+
+
+def is_controller_process(pid: int, run_id: str,
+                          expected_command: list[str] | None = None) -> bool:
     try:
         cmdline = read_process_cmdline(pid)
     except OSError:
         return False
-    joined = "\0".join(cmdline)
-    return (
-        "auto_bench.py" in joined
-        and "run" in cmdline
-        and "--child" in cmdline
-        and "--run-id" in cmdline
-        and run_id in cmdline
-    )
+    if expected_command is not None:
+        return cmdline == expected_command
+    return _cmdline_matches_controller(cmdline, run_id)
 
 
 def _run_state_is_active(run_dir: Path) -> bool:
@@ -1255,6 +1383,9 @@ def _run_state_is_active(run_dir: Path) -> bool:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         print(f"state invalid: {exc}", file=sys.stderr)
+        return False
+    if not isinstance(state, dict):
+        print(f"state invalid: expected object in {state_path}", file=sys.stderr)
         return False
     status = state.get("status")
     if status not in ("starting", "running"):
@@ -1270,15 +1401,16 @@ def stop_run(run_dir: Path) -> int:
         return 1
     try:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
-    except ValueError:
-        print(f"invalid pid file: {pid_path}", file=sys.stderr)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        print(f"invalid pid file: {pid_path}: {exc}", file=sys.stderr)
         return 1
     if pid <= 1:
         print(f"unsafe pid in {pid_path}: {pid}", file=sys.stderr)
         return 1
     if not _run_state_is_active(run_dir):
         return 1
-    if not is_controller_process(pid, run_dir.name):
+    expected_command = _controller_metadata_command(run_dir, pid, run_dir.name)
+    if not is_controller_process(pid, run_dir.name, expected_command=expected_command):
         print(f"process does not match controller or stale pid: {pid}", file=sys.stderr)
         return 1
     try:

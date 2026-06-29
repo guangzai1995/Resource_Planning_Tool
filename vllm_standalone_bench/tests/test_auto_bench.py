@@ -524,6 +524,68 @@ def test_controller_artifact_failure_still_stops_and_removes_container(tmp_path,
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
 
 
+def test_controller_artifact_stop_requested_interrupts_and_cleans(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+
+    def stop_artifact(*args, **kwargs):
+        raise ab.StopRequested("stopped")
+
+    monkeypatch.setattr(ab, "save_vllm_artifacts", stop_artifact)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    joined = [" ".join(cmd) for cmd in runner.commands]
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert result == 130
+    assert manifest["status"] == "interrupted"
+    assert state["status"] == "interrupted"
+    assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
+    assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
+    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_controller_stop_during_vllm_start_cleans_container_and_network(tmp_path):
+    class StopDuringVllmStartRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            self.commands.append(list(args))
+            if args[:3] == ["docker", "run", "-d"]:
+                raise ab.StopRequested("stopped during vllm start")
+            return super().run(args, check=check, capture=capture, text=text, stdout=stdout, stderr=stderr)
+
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = StopDuringVllmStartRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    joined = [" ".join(cmd) for cmd in runner.commands]
+    assert result == 130
+    assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
+    assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
+    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_controller_stop_during_network_create_attempts_network_cleanup(tmp_path):
+    class StopDuringNetworkCreateRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            self.commands.append(list(args))
+            if args[:3] == ["docker", "network", "create"]:
+                raise ab.StopRequested("stopped during network create")
+            return super().run(args, check=check, capture=capture, text=text, stdout=stdout, stderr=stderr)
+
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = StopDuringNetworkCreateRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    joined = [" ".join(cmd) for cmd in runner.commands]
+    assert result == 130
+    assert any("docker network create vllm-bench-net" in cmd for cmd in joined)
+    assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
 def test_controller_dry_run_prints_commands_without_result_files(tmp_path, capsys):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     runner = FakeRunner()
@@ -651,6 +713,19 @@ def test_status_invalid_utf8_state_returns_error(tmp_path, capsys):
     run_dir = tmp_path / "results" / "run123"
     run_dir.mkdir(parents=True)
     (run_dir / "state.json").write_bytes(b"\xff")
+
+    exit_code = ab.print_status(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "state" in captured.err.lower()
+    assert "invalid" in captured.err.lower()
+
+
+def test_status_rejects_non_object_state(tmp_path, capsys):
+    run_dir = tmp_path / "results" / "run123"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text("[]", encoding="utf-8")
 
     exit_code = ab.print_status(run_dir)
 
@@ -887,6 +962,24 @@ def test_stop_run_invalid_utf8_state_returns_error(tmp_path, monkeypatch, capsys
     assert "state invalid" in captured.err
 
 
+def test_stop_run_rejects_non_object_state(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    (run_dir / "state.json").write_text("[]", encoding="utf-8")
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for invalid state")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "state invalid" in captured.err
+
+
 def test_stop_run_rejects_mismatched_process(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()
@@ -909,6 +1002,70 @@ def test_stop_run_rejects_mismatched_process(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "process does not match controller" in captured.err or "stale pid" in captured.err
+
+
+def test_stop_run_rejects_run_id_as_other_argument(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for mismatched run id")
+
+    malicious_cmdline = matching_controller_cmdline("other") + ["--config", "run123"]
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+    monkeypatch.setattr(ab, "read_process_cmdline", lambda pid: malicious_cmdline, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "process does not match controller" in captured.err or "stale pid" in captured.err
+
+
+def test_stop_run_rejects_invalid_utf8_pid_file(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_bytes(b"\xff")
+    write_stop_state(run_dir)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for invalid pid")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "invalid pid" in captured.err
+
+
+def test_stop_run_handles_pid_file_read_error(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    pid_path = run_dir / "controller.pid"
+    pid_path.write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
+    original_read_text = Path.read_text
+
+    def fail_pid_read(self, *args, **kwargs):
+        if self == pid_path:
+            raise OSError("cannot read pid")
+        return original_read_text(self, *args, **kwargs)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called when pid cannot be read")
+
+    monkeypatch.setattr(Path, "read_text", fail_pid_read)
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "invalid pid" in captured.err
 
 
 def test_prepare_model_args_parse_expected_options():
@@ -997,3 +1154,58 @@ def test_start_detached_uses_devnull_stdin(tmp_path, monkeypatch):
     assert exit_code == 0
     assert calls
     assert calls[0][1]["stdin"] is ab.subprocess.DEVNULL
+
+
+def test_start_detached_popen_failure_writes_failed_state(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+
+    def fail_popen(*args, **kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fail_popen)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "failed"
+    assert "spawn failed" in captured.err
+
+
+def test_start_detached_pid_write_failure_terminates_child(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    original_write_text = Path.write_text
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    process = FakeProcess()
+
+    def fake_popen(*args, **kwargs):
+        return process
+
+    def fail_pid_write(self, *args, **kwargs):
+        if self.name == "controller.pid":
+            raise OSError("pid write failed")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(Path, "write_text", fail_pid_write)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert process.terminated is True
+    assert state["status"] == "failed"
+    assert "pid write failed" in captured.err
