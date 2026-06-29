@@ -464,11 +464,12 @@ def _append_many(cmd: list[str], flag: str, values: tuple[int, ...]) -> None:
 def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                             bench_dir: Path) -> list[str]:
     bench = case.bench_profile
+    resolved_bench_dir = Path(bench_dir).resolve()
     cmd = [
         "docker", "run", "--rm",
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
-        "-v", f"{Path(bench_dir)}:/results",
+        "-v", f"{resolved_bench_dir}:/results",
         config.run.bench_image,
         "python", "/opt/vllm_standalone_bench/run_bench_multi.py",
         "--base-url", f"http://{case.container_name}:{config.run.container_port}/v1",

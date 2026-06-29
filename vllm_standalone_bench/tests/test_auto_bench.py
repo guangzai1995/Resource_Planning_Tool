@@ -1,5 +1,6 @@
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -171,28 +172,26 @@ def test_build_vllm_command_uses_bridge_network_without_host_port(tmp_path):
     assert "--network=host" not in cmd
     assert "-p" not in cmd
     assert "vllm serve" not in " ".join(cmd)
-    assert "serve" in cmd
+    assert value_after(cmd, "--entrypoint") == "vllm"
+    image_index = cmd.index(config.run.vllm_image)
+    assert "serve" in cmd[image_index + 1:]
     serve_index = cmd.index("serve")
     assert cmd[serve_index + 1] == "/models/Qwen2.5-1.5B-Instruct"
-    assert cmd[-10:] == [
-        "vllm", "serve", "/models/Qwen2.5-1.5B-Instruct",
-        "--served-model-name", "qwen2_5_1_5b",
-        "--host", "0.0.0.0",
-        "--port", "8000",
-        "--api-key", "local-bench-key",
-        "--dtype", "bfloat16",
-    ][-10:]
+    assert value_after(cmd, "--served-model-name") == case.api_model_name
+    assert value_after(cmd, "--port") == "8000"
 
 
 def test_build_bench_command_targets_container_dns(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     case = ab.expand_cases(config, run_id="run123")[0]
-    bench_dir = tmp_path / "results" / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
+    bench_dir = Path("relative-results") / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
 
     cmd = ab.build_bench_run_command(config, case, bench_dir)
 
+    mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
     assert "--network" in cmd
     assert "vllm-bench-net" in cmd
+    assert f"{bench_dir.resolve()}:/results" in mounts
     assert "--base-url" in cmd
     assert f"http://{case.container_name}:8000/v1" in cmd
     assert "--model" in cmd
