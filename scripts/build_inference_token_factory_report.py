@@ -56,6 +56,16 @@ TECH_ROWS = [
     ("连续批处理", "已具备无需独立测试", "框架原生支持，作为能力现状说明"),
 ]
 
+PRINCIPLE_DIAGRAMS = {
+    "04_模型量化": ["BF16/FP16 权重与激活", "FP8/量化模型", "显存下降", "吞吐提升"],
+    "05_KVCache量化": ["KV Cache Block", "fp16/bf16 KV", "fp8 KV", "fp4 H200 不支持"],
+    "06_Prefix_KV命中": ["共享前缀", "Prefix Hash", "复用 KV", "TTFT 降低"],
+    "07_投机解码": ["Draft 候选 token", "Verify", "Accept/Reject", "TPOT 降低"],
+    "08_PD分离": ["Prefill(H200)", "KV 传输", "Decode(H200/H20)", "H200 P + H20 D"],
+    "09_MOE专家并行": ["Router", "多 GPU Experts", "All2All 聚合", "GLM5.1/GLM5.2 FP8"],
+    "10_连续批处理": ["Scheduler", "新请求 Prefill", "旧请求 Decode", "框架原生支持"],
+}
+
 
 def _style_range(ws, min_row: int, max_row: int, min_col: int, max_col: int) -> None:
     for row in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
@@ -111,6 +121,26 @@ def _write_summary(ws) -> None:
         ws.append(list(row))
     _style_range(ws, header_row, ws.max_row, 1, 3)
     _style_table_header(ws, header_row, 3)
+
+
+def _write_principle_diagram(ws, labels: list[str]) -> None:
+    ws["A6"] = "V2.2 方案：原理简图"
+    ws["A6"].font = Font(bold=True, color="1F4E78")
+    start_row = 8
+    start_col = 1
+    for idx, label in enumerate(labels):
+        col = start_col + idx * 2
+        ws.cell(start_row, col, label)
+        ws.cell(start_row, col).fill = SUB_FILL
+        ws.cell(start_row, col).font = Font(bold=True)
+        ws.cell(start_row, col).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.cell(start_row, col).border = THIN_BORDER
+        ws.column_dimensions[ws.cell(start_row, col).column_letter].width = 20
+        if idx < len(labels) - 1:
+            ws.cell(start_row, col + 1, "→")
+            ws.cell(start_row, col + 1).alignment = Alignment(horizontal="center", vertical="center")
+    ws["A10"] = "说明"
+    ws["B10"] = "该图用于快速解释技术机制，详细参数与测试设计见下方表格。"
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -182,6 +212,8 @@ def build_workbook(repo_root: Path) -> Workbook:
     for spec in SHEET_SPECS:
         ws = wb.create_sheet(spec["title"])
         _write_header(ws, spec)
+        if spec["title"] in PRINCIPLE_DIAGRAMS:
+            _write_principle_diagram(ws, PRINCIPLE_DIAGRAMS[spec["title"]])
         if spec["title"] == "00_目录与版本":
             _write_sheet_index(ws)
         if spec["title"] == "02_总览结论":

@@ -29,6 +29,16 @@ EXPECTED_SHEETS = [
     "12_数据附录",
 ]
 
+PRINCIPLE_EXPECTATIONS = {
+    "04_模型量化": ["BF16/FP16", "FP8", "吞吐提升"],
+    "05_KVCache量化": ["KV Cache Block", "fp8 KV", "fp4 H200 不支持"],
+    "06_Prefix_KV命中": ["共享前缀", "Prefix Hash", "复用 KV"],
+    "07_投机解码": ["Draft", "Verify", "Accept/Reject"],
+    "08_PD分离": ["Prefill", "KV 传输", "Decode", "H200 P + H20 D"],
+    "09_MOE专家并行": ["Router", "Experts", "All2All", "GLM5.1/GLM5.2 FP8"],
+    "10_连续批处理": ["Scheduler", "Prefill", "Decode", "框架原生支持"],
+}
+
 
 def assert_cell_has_table_style(cell):
     assert cell.alignment.wrap_text is True
@@ -108,3 +118,17 @@ def test_compute_h200_fp8_summary_from_existing_csvs():
     assert summary["32B"]["matched_rows"] >= 30
     assert summary["32B"]["avg_throughput_gain_pct"] == pytest.approx(30.3, rel=0.08)
     assert summary["32B"]["avg_tpot_ratio_pct"] == pytest.approx(77.8, rel=0.08)
+
+
+def test_each_technology_sheet_has_principle_diagram(tmp_path):
+    output = tmp_path / "report.xlsx"
+    wb = build_workbook(Path("."))
+    wb.save(output)
+    loaded = load_workbook(output)
+    for sheet_name, expected_labels in PRINCIPLE_EXPECTATIONS.items():
+        ws = loaded[sheet_name]
+        values = [cell.value for row in ws.iter_rows(min_row=6, max_row=18) for cell in row if cell.value]
+        text = " ".join(str(v) for v in values)
+        assert "V2.2 方案：原理简图" in text
+        for label in expected_labels:
+            assert label in text
