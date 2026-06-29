@@ -160,6 +160,19 @@ def test_csv_headers_match_row_keys():
     assert not missing, f"CSV_HEADERS 有列在 row 中缺失: {missing}"
     # 新增列必须被写入 CSV/XLSX
     for required in ("total_input_len", "input_compliance", "output_compliance",
-                     "finish_reason_length_pct", "token_source"):
+                     "finish_reason_length_pct", "token_source", "seed"):
         assert required in m.CSV_HEADERS, f"新列 {required} 未进 CSV_HEADERS"
+    assert row["seed"] == 0
     assert len(m.CSV_HEADERS) == len(m.CSV_HEADERS_ZH), "中英文表头数量不一致"
+
+
+def test_extract_row_records_effective_seed():
+    row = m._extract_row(
+        {"completed": 1, "total_input_tokens": 5, "total_output_tokens": 8,
+         "usage_reported_count": 1, "tokenizer_fallback_count": 0,
+         "finish_reason_length": 1, "num_prompts": 1,
+         "request_throughput": 1.0, "output_throughput": 8.0, "duration": 1.0},
+        in_len=5, out_len=8, parallel_num=1, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True, seed=98765)
+
+    assert row["seed"] == 98765

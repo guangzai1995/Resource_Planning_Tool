@@ -50,6 +50,7 @@ def _run_to_rows(monkeypatch, results_seq):
         input_lens=[128], output_lens=[8], cross_product=False,
         parallel_nums=[1], epochs=1, sleep_between=0, warmup_requests=0,
         prefix_ratio=0.0,
+        seed=0, no_vary_seed_by_config=False,
         max_ttft_ms=None, min_throughput_tok_s=None, min_output_compliance=0.95,
         output_csv=None, output_xlsx=None, result_dir=None,
     )
@@ -97,6 +98,7 @@ def test_run_all_prefix_ratio_uses_total_input_budget(monkeypatch, tmp_path, cap
         input_lens=[128], output_lens=[8], cross_product=False,
         parallel_nums=[1], epochs=1, sleep_between=0,
         warmup_requests=0, prefix_ratio=0.8,
+        seed=0, no_vary_seed_by_config=False,
         output_csv=str(tmp_path / "out.csv"), output_xlsx=None,
         result_dir=None, max_ttft_ms=None, min_throughput_tok_s=None,
         min_output_compliance=0.0,
@@ -126,6 +128,7 @@ def test_run_all_rejects_invalid_prefix_ratio_before_serving(monkeypatch):
         input_lens=[128], output_lens=[8], cross_product=False,
         parallel_nums=[1], epochs=1, sleep_between=0,
         warmup_requests=0, prefix_ratio=float("nan"),
+        seed=0, no_vary_seed_by_config=False,
         output_csv=None, output_xlsx=None,
         result_dir=None, max_ttft_ms=None, min_throughput_tok_s=None,
         min_output_compliance=0.0,
@@ -155,6 +158,7 @@ def test_run_all_reraises_random_prompt_generation_errors(monkeypatch, message):
         input_lens=[128], output_lens=[8], cross_product=False,
         parallel_nums=[1], epochs=1, sleep_between=0,
         warmup_requests=0, prefix_ratio=0.8,
+        seed=0, no_vary_seed_by_config=False,
         output_csv=None, output_xlsx=None,
         result_dir=None, max_ttft_ms=None, min_throughput_tok_s=None,
         min_output_compliance=0.0,
@@ -162,3 +166,171 @@ def test_run_all_reraises_random_prompt_generation_errors(monkeypatch, message):
 
     with pytest.raises(ValueError, match=message.split(":")[0]):
         m._run_all(args)
+
+
+def test_save_csv_persists_seed_column(tmp_path):
+    csv_path = str(tmp_path / "bench.csv")
+
+    m.save_csv([{"seed": 98765}], csv_path)
+
+    with open(csv_path, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        data = list(reader)
+
+    assert "seed" in (reader.fieldnames or [])
+    assert data[0]["seed"] == "98765"
+
+
+def test_seed_column_is_reported_after_num_prompts():
+    seed_index = m.CSV_HEADERS.index("seed")
+
+    assert m.CSV_HEADERS[m.CSV_HEADERS.index("num_prompts") + 1] == "seed"
+    assert m.CSV_HEADERS_ZH[seed_index] == "随机种子"
+    assert len(m.CSV_HEADERS) == len(m.CSV_HEADERS_ZH)
+
+
+def test_save_xlsx_persists_seed_column(tmp_path):
+    pytest.importorskip("openpyxl")
+    xlsx_path = str(tmp_path / "bench.xlsx")
+
+    m.save_xlsx([{"seed": 98765}], xlsx_path)
+
+    import openpyxl
+    wb = openpyxl.load_workbook(xlsx_path)
+    ws = wb["基准测试结果"]
+    headers = [cell.value for cell in ws[1]]
+    seed_col = headers.index("seed") + 1
+
+    assert headers[headers.index("num_prompts") + 1] == "seed"
+    assert ws.cell(row=3, column=seed_col).value == 98765
+
+
+def _run_and_capture_seeds(monkeypatch, *, seed=123, no_vary_seed_by_config=False):
+    import argparse
+
+    captured = []
+
+    async def _fake_main_async(cfg):
+        captured.append(cfg.seed)
+        return _fake_result(cfg.input_len, cfg.output_len, completed=cfg.num_prompts)
+
+    monkeypatch.setattr(serve, "main_async", _fake_main_async)
+
+    our_args = argparse.Namespace(
+        model="m", served_model_name=None, backend="openai-chat",
+        base_url=None, host="127.0.0.1", port=8000, insecure=False, api_key=None,
+        tokenizer="/some/tok",
+        input_lens=[128], output_lens=[8], cross_product=False,
+        parallel_nums=[1, 4, 8], epochs=1, sleep_between=0, warmup_requests=0,
+        prefix_ratio=0.8,
+        seed=seed, no_vary_seed_by_config=no_vary_seed_by_config,
+        max_ttft_ms=None, min_throughput_tok_s=None, min_output_compliance=0.95,
+        output_csv=None, output_xlsx=None, result_dir=None,
+    )
+    rows = m._run_all(our_args)
+    return captured, rows
+
+
+def test_run_all_rejects_invalid_seed_before_benchmark(monkeypatch):
+    import argparse
+
+    async def _fake_main_async(cfg):
+        pytest.fail("main_async should not be called for an invalid seed")
+
+    monkeypatch.setattr(serve, "main_async", _fake_main_async)
+
+    our_args = argparse.Namespace(
+        model="m", served_model_name=None, backend="openai-chat",
+        base_url=None, host="127.0.0.1", port=8000, insecure=False, api_key=None,
+        tokenizer="/some/tok",
+        input_lens=[128], output_lens=[8], cross_product=False,
+        parallel_nums=[1], epochs=1, sleep_between=0, warmup_requests=0,
+        prefix_ratio=0.0,
+        seed=2**32, no_vary_seed_by_config=False,
+        max_ttft_ms=None, min_throughput_tok_s=None, min_output_compliance=0.95,
+        output_csv=None, output_xlsx=None, result_dir=None,
+    )
+
+    with pytest.raises(ValueError, match="--seed"):
+        m._run_all(our_args)
+
+
+def test_run_all_varies_seed_by_config_by_default(monkeypatch):
+    captured, rows = _run_and_capture_seeds(monkeypatch)
+    expected = [
+        m.derive_config_seed(
+            base_seed=123,
+            input_len=128,
+            output_len=8,
+            parallel_num=parallel_num,
+            prefix_ratio=0.8,
+            config_index=config_index,
+        )
+        for config_index, parallel_num in enumerate([1, 4, 8], start=1)
+    ]
+
+    assert captured == expected
+    assert [row["seed"] for row in rows] == expected
+
+
+def test_run_all_uses_current_io_pair_when_deriving_seed(monkeypatch):
+    import argparse
+
+    captured = []
+
+    async def _fake_main_async(cfg):
+        captured.append((cfg.input_len, cfg.output_len, cfg.max_concurrency, cfg.seed))
+        return _fake_result(cfg.input_len, cfg.output_len, completed=cfg.num_prompts)
+
+    monkeypatch.setattr(serve, "main_async", _fake_main_async)
+
+    our_args = argparse.Namespace(
+        model="m", served_model_name=None, backend="openai-chat",
+        base_url=None, host="127.0.0.1", port=8000, insecure=False, api_key=None,
+        tokenizer="/some/tok",
+        input_lens=[128, 256], output_lens=[8, 16], cross_product=False,
+        parallel_nums=[1], epochs=1, sleep_between=0, warmup_requests=0,
+        prefix_ratio=0.25,
+        seed=123, no_vary_seed_by_config=False,
+        max_ttft_ms=None, min_throughput_tok_s=None, min_output_compliance=0.95,
+        output_csv=None, output_xlsx=None, result_dir=None,
+    )
+    rows = m._run_all(our_args)
+
+    expected_configs = [(128, 8, 1), (256, 16, 1)]
+    expected_seeds = [
+        m.derive_config_seed(
+            base_seed=123,
+            input_len=input_len,
+            output_len=output_len,
+            parallel_num=parallel_num,
+            prefix_ratio=0.25,
+            config_index=config_index,
+        )
+        for config_index, (input_len, output_len, parallel_num)
+        in enumerate(expected_configs, start=1)
+    ]
+
+    assert captured == [
+        (input_len, output_len, parallel_num, seed)
+        for (input_len, output_len, parallel_num), seed
+        in zip(expected_configs, expected_seeds)
+    ]
+    assert [row["seed"] for row in rows] == expected_seeds
+
+
+def test_run_all_default_seed_derivation_depends_on_base_seed(monkeypatch):
+    first_captured, _ = _run_and_capture_seeds(monkeypatch, seed=123)
+    second_captured, _ = _run_and_capture_seeds(monkeypatch, seed=456)
+
+    assert first_captured != second_captured
+
+
+def test_run_all_can_use_fixed_seed_for_compatibility(monkeypatch):
+    captured, rows = _run_and_capture_seeds(
+        monkeypatch,
+        no_vary_seed_by_config=True,
+    )
+
+    assert captured == [123, 123, 123]
+    assert [row["seed"] for row in rows] == [123, 123, 123]

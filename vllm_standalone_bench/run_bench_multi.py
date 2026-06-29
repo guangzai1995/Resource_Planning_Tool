@@ -37,6 +37,7 @@ import argparse
 import asyncio
 import copy
 import csv
+import hashlib
 import importlib.util
 import itertools
 import logging
@@ -164,6 +165,53 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
 
 # ─── 从 serve.py 返回的 result_json 提取 CSV 行 ───────────────────────────────
 
+MAX_SEED_VALUE = 2**32
+
+
+def validate_seed(seed: int) -> None:
+    if not 0 <= seed < MAX_SEED_VALUE:
+        raise ValueError(f"--seed 必须满足 0 <= seed < {MAX_SEED_VALUE}，当前值: {seed}")
+
+
+def derive_config_seed(
+    *,
+    base_seed: int,
+    input_len: int,
+    output_len: int,
+    parallel_num: int,
+    prefix_ratio: float,
+    config_index: int,
+) -> int:
+    key = (
+        f"{base_seed}:{input_len}:{output_len}:{parallel_num}:"
+        f"{prefix_ratio:.12g}:{config_index}"
+    )
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def effective_config_seed(
+    *,
+    base_seed: int,
+    input_len: int,
+    output_len: int,
+    parallel_num: int,
+    prefix_ratio: float,
+    config_index: int,
+    vary_seed_by_config: bool,
+) -> int:
+    validate_seed(base_seed)
+    if not vary_seed_by_config:
+        return base_seed
+    return derive_config_seed(
+        base_seed=base_seed,
+        input_len=input_len,
+        output_len=output_len,
+        parallel_num=parallel_num,
+        prefix_ratio=prefix_ratio,
+        config_index=config_index,
+    )
+
+
 def decide_token_usage_source(*, usage_reported_count: int,
                               tokenizer_fallback_count: int,
                               completed: int,
@@ -212,6 +260,7 @@ def _extract_row(
     prefix_tokens: int = 0,
     prefix_ratio: float = 0.0,
     has_tokenizer: bool = False,
+    seed: int = 0,
 ) -> dict:
     """从 _serve.main_async() 返回的字典中提取并重命名需要的指标字段。
 
@@ -272,6 +321,7 @@ def _extract_row(
         'parallel_num':    parallel_num,
         'epochs':          epochs,
         'num_prompts':     _i('num_prompts', parallel_num * epochs),
+        'seed':            seed,
         # ── 请求统计 ────────────────────────────────
         'n_success':           completed,
         'n_failed':            _i('failed'),
@@ -309,7 +359,7 @@ def _extract_row(
 CSV_HEADERS = [
     'model', 'backend',
     'input_len', 'output_len', 'total_input_len', 'prefix_ratio', 'prefix_tokens',
-    'parallel_num', 'epochs', 'num_prompts',
+    'parallel_num', 'epochs', 'num_prompts', 'seed',
     'n_success', 'n_failed',
     'avg_input_tokens', 'avg_output_tokens',
     'input_compliance', 'output_compliance',
@@ -324,7 +374,7 @@ CSV_HEADERS = [
 CSV_HEADERS_ZH = [
     '模型', '接口类型',
     '输入长度(token)', '输出长度(token)', '总输入长度(token)', '前缀比例', '前缀tokens数',
-    '并发数', '测试轮数', '总请求数',
+    '并发数', '测试轮数', '总请求数', '随机种子',
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
     '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
@@ -439,6 +489,9 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
     为每组构建 serve.py 所需 args，调用 _serve.main_async()，
     收集并返回所有指标行。
     """
+    validate_seed(our_args.seed)
+    vary_seed_by_config = not our_args.no_vary_seed_by_config
+
     # 构建基础 Namespace（含全部 serve.py 默认值）
     base = _build_base_args(our_args)
     _derive_prefix_suffix_tokens(1, our_args.prefix_ratio)
@@ -473,6 +526,8 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
     logger.info("  (输入,输出) 组合: %s", io_pairs)
     logger.info("  并发数    : %s", sorted_parallels)
     logger.info("  每组轮数  : %d  → num_prompts = parallel × epochs", our_args.epochs)
+    logger.info("  随机种子  : base=%d  vary_by_config=%s",
+                our_args.seed, vary_seed_by_config)
     logger.info("  并发模型  : 滑动窗口（Semaphore=parallel_num, request_rate=inf）")
     logger.info("             每组一次性提交 parallel×epochs 个任务，Semaphore 保证")
     logger.info("             最多 parallel_num 个请求同时在途，非严格批次轮转")
@@ -500,14 +555,24 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
 
             prefix_ratio = our_args.prefix_ratio
             prefix_tokens, suffix_tokens = _derive_prefix_suffix_tokens(in_len, prefix_ratio)
+            effective_seed = effective_config_seed(
+                base_seed=our_args.seed,
+                input_len=in_len,
+                output_len=out_len,
+                parallel_num=parallel_num,
+                prefix_ratio=prefix_ratio,
+                config_index=config_count,
+                vary_seed_by_config=vary_seed_by_config,
+            )
 
             logger.info(
                 "\n%s\n[%d/%d] 开始测试: input=%d, output=%d, parallel=%d, "
-                "num_prompts=%d (=%d×%d epochs)%s\n%s",
+                "num_prompts=%d (=%d×%d epochs), seed=%d%s\n%s",
                 "─" * 65,
                 config_count, total_configs,
                 in_len, out_len, parallel_num,
                 parallel_num * our_args.epochs, parallel_num, our_args.epochs,
+                effective_seed,
                 (f"  total_input={in_len} prefix={prefix_tokens}tok({prefix_ratio * 100:.0f}%)"
                  f" suffix={suffix_tokens}tok"),
                 "─" * 65,
@@ -519,6 +584,7 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
             cfg.output_len      = out_len       # serve.py 内部映射到 random_output_len
             cfg.max_concurrency = parallel_num  # 最大并发数
             cfg.num_prompts     = parallel_num * our_args.epochs  # 总请求数
+            cfg.seed            = effective_seed
 
             # input_len 表示总 prompt token 预算；prefix_tokens 是其中共享前缀部分。
             # run_bench_serve.py 会生成 shared_prefix + unique_suffix，总长约等于 input_len。
@@ -552,7 +618,8 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                                our_args.epochs, model, our_args.backend,
                                prefix_tokens=prefix_tokens,
                                prefix_ratio=prefix_ratio,
-                               has_tokenizer=bool(our_args.tokenizer))
+                               has_tokenizer=bool(our_args.tokenizer),
+                               seed=effective_seed)
             all_rows.append(row)
 
             # 打印摘要行
@@ -693,6 +760,10 @@ def _parse_args() -> argparse.Namespace:
                             '后缀包含 request-index token 加随机 tail，用于保证非 full-prefix 请求差异。'
                             '实际 prompt_len ≈ input_len；共享前缀 token 数约为 input_len × prefix_ratio。'
                             '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。')
+    bench.add_argument('--seed', type=int, default=0,
+                       help='随机种子基值。默认每个配置会基于该值派生独立 seed（默认: 0）')
+    bench.add_argument('--no-vary-seed-by-config', action='store_true', default=False,
+                       help='兼容旧行为：所有配置复用 --seed，不再按配置派生独立 seed')
 
     # ── Tokenizer ────────────────────────────────────────────────────────────
     tok = p.add_argument_group('Tokenizer（可选）')

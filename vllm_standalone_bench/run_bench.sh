@@ -149,7 +149,18 @@ MIN_THROUGHPUT_TOK_S="5"
 WARMUP_REQUESTS=1
 
 # =============================================================================
-# ▌ 七、输出文件配置
+# ▌ 七、随机种子配置
+# =============================================================================
+#
+# SEED 是随机种子基值。默认情况下，每个 (input, output, parallel) 配置会
+# 基于该值派生独立 seed，避免高并发档位复用低并发档位的 prompt 序列。
+#
+# 如需复现旧行为（所有配置复用同一个 seed），设为 false。
+SEED=0
+VARY_SEED_BY_CONFIG=true
+
+# =============================================================================
+# ▌ 八、输出文件配置
 # =============================================================================
 
 # 结果保存目录（不存在时自动创建）
@@ -165,7 +176,7 @@ OUTPUT_CSV="${RESULT_DIR}/bench_${TIMESTAMP}.csv"
 OUTPUT_XLSX="${RESULT_DIR}/bench_${TIMESTAMP}.xlsx"
 
 # =============================================================================
-# ▌ 八、以下内容通常无需修改
+# ▌ 九、以下内容通常无需修改
 # =============================================================================
 
 # 脚本所在目录（自动识别，支持软链接）
@@ -191,6 +202,7 @@ CMD=(
     --parallel-nums ${PARALLEL_NUMS}
     --epochs "${EPOCHS}"
     --sleep-between "${SLEEP_BETWEEN}"
+    --seed "${SEED}"
     --output-csv "${OUTPUT_CSV}"
 )
 
@@ -246,6 +258,10 @@ if [[ "${CROSS_PRODUCT}" == "true" ]]; then
     CMD+=(--cross-product)
 fi
 
+if [[ "${VARY_SEED_BY_CONFIG}" != "true" ]]; then
+    CMD+=(--no-vary-seed-by-config)
+fi
+
 # 预热请求数
 CMD+=(--warmup-requests "${WARMUP_REQUESTS}")
 
@@ -265,6 +281,8 @@ printf "║  输出长度  : %-48s║\n" "${OUTPUT_LENS}"
 printf "║  并发数    : %-48s║\n" "${PARALLEL_NUMS}"
 printf "║  测试轮数  : %-48s║\n" "${EPOCHS}"
 printf "║  配置间隔  : %-48s║\n" "${SLEEP_BETWEEN}s"
+printf "║  随机种子  : %-48s║\n" "${SEED}"
+printf "║  配置派生  : %-48s║\n" "${VARY_SEED_BY_CONFIG}"
 printf "║  CSV 输出  : %-48s║\n" "${OUTPUT_CSV}"
 if [[ -n "${OUTPUT_XLSX:-}" ]]; then
     printf "║  XLSX 输出 : %-48s║\n" "${OUTPUT_XLSX}"
