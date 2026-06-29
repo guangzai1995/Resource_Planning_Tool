@@ -73,6 +73,29 @@ def sheet_text(ws):
     )
 
 
+TOPIC_CONTENT_EXPECTATIONS = {
+    "05_KVCache量化": ["显存节省约 50%", "fp4 因 H200 不支持", "TPS/Tokens/s"],
+    "06_Prefix_KV命中": ["后续补测", "prefix_ratio", "cache hit rate"],
+    "07_投机解码": ["候选 token 1/3/5", "接受率", "TPOT"],
+    "09_MOE专家并行": ["需要验证测试", "GLM5.1 或 GLM5.2 FP8", "All2All"],
+    "10_连续批处理": ["原生支持", "无法关闭", "无需独立测试"],
+    "11_汇总建议与资源计划": [
+        "FP8/量化优先落地",
+        "Prefix/KV 命中补系统数据",
+        "PD 分离申请异构资源验证",
+        "MOE EP 按 GLM5.1/GLM5.2 FP8 申请资源验证",
+        "Continuous Batching 已具备",
+    ],
+}
+
+
+def assert_topic_content(wb):
+    for sheet_name, expected_keywords in TOPIC_CONTENT_EXPECTATIONS.items():
+        text = sheet_text(wb[sheet_name])
+        for keyword in expected_keywords:
+            assert keyword in text
+
+
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -256,6 +279,12 @@ def test_report_contains_key_business_and_quantization_conclusions():
     assert "data/H200/72B-FP8/2.csv" in appendix_text
 
 
+def test_report_contains_required_topic_body_content():
+    wb = build_workbook(Path("."))
+
+    assert_topic_content(wb)
+
+
 def test_report_contains_visual_charts():
     wb = build_workbook(Path("."))
 
@@ -285,6 +314,8 @@ def assert_saved_report_content(output: Path):
 
     appendix_text = sheet_text(loaded["12_数据附录"])
     assert "data/H200/72B-FP8/2.csv" in appendix_text
+
+    assert_topic_content(loaded)
 
 
 def test_save_report_writes_reloadable_workbook_with_charts_and_key_content(tmp_path):

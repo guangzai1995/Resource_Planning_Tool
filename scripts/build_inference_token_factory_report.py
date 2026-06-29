@@ -458,6 +458,223 @@ def _write_model_quantization(ws, fp8_summary: dict[str, dict[str, float | int |
     )
 
 
+def _write_kv_cache_quantization(ws) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "KV Cache 量化结论与补测方向")
+    row = _append_table(
+        ws,
+        row,
+        ["主题", "正文口径", "状态/下一步"],
+        [
+            [
+                "H200 已有口径",
+                "H200 上 fp8 vs fp16/bf16 类 KV Cache 量化已有结论口径：KV 显存节省约 50%。",
+                "有结论但缺系统数据/后续补测。",
+            ],
+            [
+                "收益数据缺口",
+                "吞吐/延迟收益待胡正升补齐系统测试数据，或以现有历史数据补录同口径对比。",
+                "补齐后再写 TPS/Tokens/s、TTFT、TPOT/平均延迟收益。",
+            ],
+            [
+                "fp4 范围",
+                "fp4 因 H200 不支持，本期暂不测；汇报中只说明硬件限制，不作为本期收益结论。",
+                "本期不纳入测试矩阵。",
+            ],
+        ],
+    )
+    row = _write_section_title(ws, row + 1, "验证指标")
+    _append_table(
+        ws,
+        row,
+        ["指标", "验证目的", "当前口径"],
+        [
+            ["TPS/Tokens/s", "验证吞吐是否随 KV Cache 量化提升。", "待胡正升补齐系统测试数据。"],
+            ["TTFT", "验证 prefill 和 KV 分配对首 token 延迟的影响。", "待补测。"],
+            ["TPOT/平均延迟", "验证 decode 阶段平均生成延迟是否下降。", "待补测。"],
+            ["显存水位", "确认 KV 显存节省约 50% 是否反映到实际 GPU 显存水位。", "已有结论但缺系统数据。"],
+            ["gpu_cache_utilization", "观察 cache 使用率和水位变化，避免只看理论节省。", "后续补测。"],
+        ],
+    )
+
+
+def _write_prefix_kv_hit_plan(ws) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "Prefix/KV 命中结论与后续补测")
+    _append_table(
+        ws,
+        row,
+        ["主题", "正文口径", "状态/验证方向"],
+        [
+            [
+                "当前状态",
+                "Prefix/KV 命中已有机制结论，但缺少端到端系统压测数据。",
+                "有结论但缺系统数据，必须安排后续补测。",
+            ],
+            [
+                "验证变量",
+                "按 prefix_ratio 分层构造共享前缀请求，统计 cache hit rate 和 GPU cache 命中变化。",
+                "覆盖不同上下文长度和不同并发组合。",
+            ],
+            [
+                "收益指标",
+                "重点验证 TTFT 降幅、吞吐提升和 GPU cache 命中变化，避免只用单一命中率说明收益。",
+                "后续补测需同时记录 prefix_ratio、cache hit rate、TTFT、吞吐。",
+            ],
+            [
+                "组合矩阵",
+                "短/中/长上下文分别叠加低/中/高并发，观察前缀复用在并发压力下是否稳定。",
+                "输出不同上下文/并发组合的对比表。",
+            ],
+        ],
+    )
+
+
+def _write_speculative_decoding_plan(ws) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "投机解码原理与测试方案")
+    _append_table(
+        ws,
+        row,
+        ["主题", "正文口径", "状态/指标"],
+        [
+            [
+                "原理",
+                "draft 模型先生成候选 token，目标模型批量 Verify 后接受或拒绝候选，收益来自减少目标模型逐 token 调用次数。",
+                "待胡正升测试返回。",
+            ],
+            [
+                "候选配置",
+                "测试候选 token 1/3/5，分别观察低候选和高候选下的吞吐、延迟和回退成本。",
+                "候选 token 1/3/5 为本轮固定对比项。",
+            ],
+            [
+                "核心指标",
+                "关注接受率、TPS/Tokens/s、TTFT、TPOT/平均延迟，并记录高并发衰减。",
+                "接受率偏低时需同步解释 TPOT 收益下降原因。",
+            ],
+            [
+                "并发压力",
+                "低/中/高并发分别测试，观察 draft 模型开销、Verify 批处理和调度开销是否抵消收益。",
+                "待胡正升测试返回。",
+            ],
+        ],
+    )
+
+
+def _write_moe_expert_parallel_plan(ws) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "MOE 专家并行验证计划")
+    row = _append_table(
+        ws,
+        row,
+        ["主题", "正文口径", "状态/资源"],
+        [
+            [
+                "验证结论",
+                "MOE 专家并行需要验证测试，用于确认 GLM 大参数 MOE 在多卡专家切分下的吞吐和延迟边界。",
+                "需要验证测试。",
+            ],
+            [
+                "资源申请",
+                "资源申请按 GLM5.1 或 GLM5.2 FP8 部署口径，优先申请可支撑多 GPU Experts 的 H200 资源。",
+                "GLM5.1 或 GLM5.2 FP8 资源待申请。",
+            ],
+            [
+                "EP 原理",
+                "Router 将 token 分配给不同专家，专家切分到多 GPU Experts 上执行，再通过 All2All 完成跨卡交换和聚合。",
+                "重点关注跨卡通信是否成为瓶颈。",
+            ],
+        ],
+    )
+    row = _write_section_title(ws, row + 1, "指标与资源申请")
+    _append_table(
+        ws,
+        row,
+        ["项目", "验证内容", "指标"],
+        [
+            ["专家切分", "对比不同专家切分和专家副本策略。", "吞吐、TTFT、TPOT。"],
+            ["多 GPU Experts", "验证专家分布在多卡后的负载均衡和显存压力。", "显存水位、GPU 利用率。"],
+            ["All2All", "记录跨卡 All2All 通信量、等待时间和抖动。", "跨卡通信、TPOT。"],
+            ["端到端收益", "和非 EP 或单机基线对比，判断是否支撑 GLM5.1/GLM5.2 FP8 部署。", "吞吐、TTFT、TPOT、显存水位。"],
+        ],
+    )
+
+
+def _write_continuous_batching_note(ws) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "Continuous Batching 能力说明")
+    _append_table(
+        ws,
+        row,
+        ["主题", "正文口径", "状态/影响"],
+        [
+            [
+                "能力状态",
+                "连续批处理为框架原生支持能力，当前调度默认依赖该能力。",
+                "已具备。",
+            ],
+            [
+                "测试范围",
+                "该能力无法关闭，且无需独立测试；本期不作为独立测试项。",
+                "无法关闭/无需独立测试。",
+            ],
+            [
+                "汇报口径",
+                "只作为已具备能力说明，不单独申请资源或产出专项收益结论。",
+                "作为基线能力写入汇总。",
+            ],
+            [
+                "对基线影响",
+                "Continuous Batching 会作为并发吞吐基线前提，影响请求合批、排队和 decode 调度表现。",
+                "解读并发吞吐时需说明该前提。",
+            ],
+        ],
+    )
+
+
+def _write_leadership_priority_plan(ws) -> None:
+    start_row = ws.max_row + 2
+    row = _write_section_title(ws, start_row, "面向领导的优先级建议")
+    _append_table(
+        ws,
+        row,
+        ["优先级", "建议项", "领导汇报口径", "下一步"],
+        [
+            [
+                "P0",
+                "FP8/量化优先落地",
+                "H200 历史数据已支撑 FP8/量化作为近期最确定的容量收益方向。",
+                "优先推进 GLM5.1/GLM5.2 FP8 部署口径和峰值场景复测。",
+            ],
+            [
+                "P1",
+                "Prefix/KV 命中补系统数据",
+                "机制结论明确，但需要系统数据补齐 prefix_ratio、cache hit rate、TTFT 降幅和吞吐。",
+                "安排胡正升完成不同上下文/并发组合补测。",
+            ],
+            [
+                "P1",
+                "PD 分离申请异构资源验证",
+                "PD 分离需要 H200 做 P、H20 做 D 的异构资源验证，确认长上下文 Prefill 与 Decode 拆分收益。",
+                "申请 H200+H20 资源并按三组基线跑端到端压测。",
+            ],
+            [
+                "P2",
+                "MOE EP 按 GLM5.1/GLM5.2 FP8 申请资源验证",
+                "MOE 专家并行需要按 GLM5.1/GLM5.2 FP8 部署资源验证专家切分、All2All 和跨卡通信成本。",
+                "申请多 GPU Experts 资源并补充吞吐、TTFT、TPOT、显存水位。",
+            ],
+            [
+                "说明",
+                "Continuous Batching 已具备",
+                "连续批处理为框架原生支持，无法关闭且无需独立测试。",
+                "作为并发吞吐基线前提写入能力说明。",
+            ],
+        ],
+    )
+
+
 def _write_pd_plan(ws) -> None:
     start_row = ws.max_row + 2
     row = _write_section_title(ws, start_row, "PD 分离资源方案")
@@ -695,8 +912,20 @@ def build_workbook(repo_root: Path) -> Workbook:
         if spec["title"] == "04_模型量化":
             _write_model_quantization(ws, fp8_summary)
             _add_fp8_comparison_chart(ws, fp8_summary)
+        if spec["title"] == "05_KVCache量化":
+            _write_kv_cache_quantization(ws)
+        if spec["title"] == "06_Prefix_KV命中":
+            _write_prefix_kv_hit_plan(ws)
+        if spec["title"] == "07_投机解码":
+            _write_speculative_decoding_plan(ws)
         if spec["title"] == "08_PD分离":
             _write_pd_plan(ws)
+        if spec["title"] == "09_MOE专家并行":
+            _write_moe_expert_parallel_plan(ws)
+        if spec["title"] == "10_连续批处理":
+            _write_continuous_batching_note(ws)
+        if spec["title"] == "11_汇总建议与资源计划":
+            _write_leadership_priority_plan(ws)
         if spec["title"] == "12_数据附录":
             _write_appendix(ws)
     return wb
