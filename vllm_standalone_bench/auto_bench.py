@@ -1145,6 +1145,47 @@ def print_log(path: Path) -> int:
     return 0
 
 
+def read_process_cmdline(pid: int) -> list[str]:
+    data = Path(f"/proc/{pid}/cmdline").read_bytes()
+    return [
+        part.decode("utf-8", "replace")
+        for part in data.split(b"\0")
+        if part
+    ]
+
+
+def is_controller_process(pid: int, run_id: str) -> bool:
+    try:
+        cmdline = read_process_cmdline(pid)
+    except OSError:
+        return False
+    joined = "\0".join(cmdline)
+    return (
+        "auto_bench.py" in joined
+        and "run" in cmdline
+        and "--child" in cmdline
+        and "--run-id" in cmdline
+        and run_id in cmdline
+    )
+
+
+def _run_state_is_active(run_dir: Path) -> bool:
+    state_path = run_dir / "state.json"
+    if not state_path.exists():
+        print(f"state invalid: {state_path} not found", file=sys.stderr)
+        return False
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"state invalid: {exc}", file=sys.stderr)
+        return False
+    status = state.get("status")
+    if status not in ("starting", "running"):
+        print(f"run is not active: {status}", file=sys.stderr)
+        return False
+    return True
+
+
 def stop_run(run_dir: Path) -> int:
     pid_path = run_dir / "controller.pid"
     if not pid_path.exists():
@@ -1157,6 +1198,11 @@ def stop_run(run_dir: Path) -> int:
         return 1
     if pid <= 1:
         print(f"unsafe pid in {pid_path}: {pid}", file=sys.stderr)
+        return 1
+    if not _run_state_is_active(run_dir):
+        return 1
+    if not is_controller_process(pid, run_dir.name):
+        print(f"process does not match controller or stale pid: {pid}", file=sys.stderr)
         return 1
     try:
         os.kill(pid, signal.SIGTERM)

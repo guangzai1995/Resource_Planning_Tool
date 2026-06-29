@@ -611,16 +611,45 @@ def test_logs_prints_controller_log(tmp_path, capsys):
     assert "line 2" in captured.out
 
 
+def write_stop_state(run_dir, status="running"):
+    ab.write_state(run_dir, {
+        "run_id": run_dir.name,
+        "status": status,
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+
+
+def matching_controller_cmdline(run_id="run123"):
+    return [
+        sys.executable,
+        str(Path(ab.__file__).resolve()),
+        "run",
+        "--config",
+        "config.json",
+        "--run-id",
+        run_id,
+        "--child",
+    ]
+
+
 def test_stop_run_sends_sigterm(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
     signals = []
 
     def fake_kill(pid, sig):
         signals.append((pid, sig))
 
     monkeypatch.setattr(ab.os, "kill", fake_kill, raising=False)
+    monkeypatch.setattr(
+        ab,
+        "read_process_cmdline",
+        lambda pid: matching_controller_cmdline(run_dir.name),
+        raising=False,
+    )
 
     exit_code = ab.stop_run(run_dir)
 
@@ -634,6 +663,7 @@ def test_stop_run_rejects_unsafe_pid(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("0\n", encoding="utf-8")
+    write_stop_state(run_dir)
 
     def fail_if_called(pid, sig):
         raise AssertionError("os.kill should not be called for unsafe pid")
@@ -651,11 +681,18 @@ def test_stop_run_handles_missing_process(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
 
     def missing_process(pid, sig):
         raise ProcessLookupError
 
     monkeypatch.setattr(ab.os, "kill", missing_process, raising=False)
+    monkeypatch.setattr(
+        ab,
+        "read_process_cmdline",
+        lambda pid: matching_controller_cmdline(run_dir.name),
+        raising=False,
+    )
 
     exit_code = ab.stop_run(run_dir)
 
@@ -680,17 +717,66 @@ def test_stop_run_handles_os_error(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()
     (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
 
     def fail_stop(pid, sig):
         raise OSError("denied")
 
     monkeypatch.setattr(ab.os, "kill", fail_stop, raising=False)
+    monkeypatch.setattr(
+        ab,
+        "read_process_cmdline",
+        lambda pid: matching_controller_cmdline(run_dir.name),
+        raising=False,
+    )
 
     exit_code = ab.stop_run(run_dir)
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "failed to stop" in captured.err
+
+
+def test_stop_run_rejects_inactive_state(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir, status="completed")
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for inactive state")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "run is not active" in captured.err or "state invalid" in captured.err
+
+
+def test_stop_run_rejects_mismatched_process(tmp_path, monkeypatch, capsys):
+    run_dir = tmp_path / "run123"
+    run_dir.mkdir()
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    write_stop_state(run_dir)
+
+    def fail_if_called(pid, sig):
+        raise AssertionError("os.kill should not be called for mismatched process")
+
+    monkeypatch.setattr(ab.os, "kill", fail_if_called, raising=False)
+    monkeypatch.setattr(
+        ab,
+        "read_process_cmdline",
+        lambda pid: [sys.executable, str(Path(ab.__file__).resolve()), "run", "--run-id", "other"],
+        raising=False,
+    )
+
+    exit_code = ab.stop_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "process does not match controller" in captured.err or "stale pid" in captured.err
 
 
 def test_prepare_model_args_parse_expected_options():
