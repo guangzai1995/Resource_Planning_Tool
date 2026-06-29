@@ -1,3 +1,5 @@
+import pytest
+
 import run_bench_multi as m
 
 
@@ -30,6 +32,18 @@ def test_token_source_none_when_all_failed():
     assert m.decide_token_usage_source(
         usage_reported_count=0, tokenizer_fallback_count=0,
         completed=0, has_tokenizer=True) == "none"
+
+
+def test_derive_prefix_suffix_tokens_from_total_input():
+    assert m._derive_prefix_suffix_tokens(128, 0.8) == (102, 26)
+    assert m._derive_prefix_suffix_tokens(128, 0.0) == (0, 128)
+    assert m._derive_prefix_suffix_tokens(128, 1.0) == (128, 0)
+
+
+@pytest.mark.parametrize("ratio", [-0.1, 1.1])
+def test_derive_prefix_suffix_tokens_rejects_invalid_ratio(ratio):
+    with pytest.raises(ValueError, match="--prefix-ratio"):
+        m._derive_prefix_suffix_tokens(128, ratio)
 
 
 # ---------- _extract_row: 真实 avg（不再回显 requested） ----------

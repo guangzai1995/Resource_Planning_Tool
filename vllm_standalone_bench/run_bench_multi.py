@@ -187,6 +187,15 @@ def decide_token_usage_source(*, usage_reported_count: int,
     return "client_estimate"
 
 
+def _derive_prefix_suffix_tokens(input_len: int, prefix_ratio: float) -> Tuple[int, int]:
+    """Return shared-prefix and unique-suffix lengths within total input_len."""
+    if prefix_ratio < 0.0 or prefix_ratio > 1.0:
+        raise ValueError("--prefix-ratio must be between 0.0 and 1.0")
+    prefix_tokens = int(input_len * prefix_ratio)
+    suffix_tokens = input_len - prefix_tokens
+    return prefix_tokens, suffix_tokens
+
+
 def _extract_row(
     result: dict,
     in_len: int,
