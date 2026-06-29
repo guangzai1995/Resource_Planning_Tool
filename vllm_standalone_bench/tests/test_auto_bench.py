@@ -1659,6 +1659,128 @@ def test_main_prepare_model_calls_stub_with_expected_keywords(monkeypatch):
     assert isinstance(captured["runner"], ab.DockerRunner)
 
 
+def write_model_files(path, *, safetensors=True, marker="complete"):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text("{}", encoding="utf-8")
+    (path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    if safetensors:
+        (path / "model.safetensors").write_text(marker, encoding="utf-8")
+
+
+def test_model_dir_requires_complete_safetensors(tmp_path):
+    target = tmp_path / "model"
+    target.mkdir()
+    (target / "config.json").write_text("{}", encoding="utf-8")
+    (target / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (target / "model.safetensors.parts").mkdir()
+
+    with pytest.raises(ab.ConfigError, match="safetensors"):
+        ab.validate_prepared_model_dir(target)
+
+
+def test_prepare_model_uses_bench_image_and_temp_dir(tmp_path):
+    target = tmp_path / "Qwen2.5-1.5B-Instruct"
+    tmp_download = tmp_path / "Qwen2.5-1.5B-Instruct.download-tmp"
+    write_model_files(tmp_download)
+    runner = FakeRunner()
+
+    result = ab.prepare_model(
+        modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
+        target=target,
+        bench_image="bench:offline",
+        runner=runner,
+    )
+
+    assert result == 0
+    assert target.is_dir()
+    assert (target / "model.safetensors").exists()
+    cmd = runner.commands[0]
+    assert cmd[:3] == ["docker", "run", "--rm"]
+    assert f"{tmp_path.resolve()}:/model-target" in cmd
+    assert "bench:offline" in cmd
+    assert "Qwen/Qwen2.5-1.5B-Instruct" in cmd
+    assert "/model-target/Qwen2.5-1.5B-Instruct.download-tmp" in cmd
+
+
+def test_prepare_model_existing_complete_skips_download(tmp_path, capsys):
+    target = tmp_path / "model"
+    write_model_files(target)
+    runner = FakeRunner()
+
+    result = ab.prepare_model(
+        modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
+        target=target,
+        bench_image="bench:offline",
+        runner=runner,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert runner.commands == []
+    assert "already exists" in captured.out
+
+
+def test_prepare_model_existing_incomplete_without_force_fails(tmp_path):
+    target = tmp_path / "model"
+    write_model_files(target, safetensors=False)
+    runner = FakeRunner()
+
+    with pytest.raises(ab.ConfigError, match="safetensors"):
+        ab.prepare_model(
+            modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
+            target=target,
+            bench_image="bench:offline",
+            runner=runner,
+        )
+
+    assert runner.commands == []
+
+
+def test_prepare_model_force_backs_up_existing_target(tmp_path):
+    target = tmp_path / "model"
+    tmp_download = tmp_path / "model.download-tmp"
+    write_model_files(target, marker="old")
+    write_model_files(tmp_download, marker="new")
+    runner = FakeRunner()
+
+    result = ab.prepare_model(
+        modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
+        target=target,
+        bench_image="bench:offline",
+        force=True,
+        runner=runner,
+    )
+
+    backups = list(tmp_path.glob("model.backup-*"))
+    assert result == 0
+    assert (target / "model.safetensors").read_text(encoding="utf-8") == "new"
+    assert len(backups) == 1
+    assert (backups[0] / "model.safetensors").read_text(encoding="utf-8") == "old"
+
+
+def test_prepare_model_download_failure_keeps_tmp_and_no_target(tmp_path):
+    class FailingDownloadRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            self.commands.append(list(args))
+            return ab.Completed(list(args), 1, "", "download failed")
+
+    target = tmp_path / "model"
+    tmp_download = tmp_path / "model.download-tmp"
+    tmp_download.mkdir()
+    runner = FailingDownloadRunner()
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        ab.prepare_model(
+            modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
+            target=target,
+            bench_image="bench:offline",
+            runner=runner,
+        )
+
+    assert not target.exists()
+    assert tmp_download.exists()
+
+
 def test_main_dry_run_takes_precedence_over_detach(tmp_path, monkeypatch):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     calls = []

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -1670,11 +1671,91 @@ def stop_run(run_dir: Path) -> int:
     return 0
 
 
+def validate_prepared_model_dir(target: Path) -> None:
+    model_dir = Path(target)
+    if not model_dir.is_dir():
+        raise ConfigError(f"model directory does not exist: {model_dir}")
+    if not (model_dir / "config.json").is_file():
+        raise ConfigError(f"model directory missing config.json: {model_dir}")
+    if not (
+        (model_dir / "tokenizer.json").is_file()
+        or (model_dir / "tokenizer_config.json").is_file()
+    ):
+        raise ConfigError(
+            f"model directory missing tokenizer.json or tokenizer_config.json: {model_dir}"
+        )
+    safetensors = [
+        path for path in model_dir.glob("*.safetensors")
+        if path.is_file() and path.stat().st_size > 0
+    ]
+    if not safetensors:
+        raise ConfigError(f"model directory missing complete safetensors weights: {model_dir}")
+
+
+PREPARE_MODEL_SCRIPT = """import sys
+from modelscope.hub.snapshot_download import snapshot_download
+
+snapshot_download(sys.argv[1], local_dir=sys.argv[2])
+"""
+
+
+def _download_tmp_for_target(target: Path) -> Path:
+    return target.with_name(f"{target.name}.download-tmp")
+
+
+def _backup_path_for_target(target: Path) -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    candidate = target.with_name(f"{target.name}.backup-{stamp}")
+    suffix = 1
+    while candidate.exists():
+        candidate = target.with_name(f"{target.name}.backup-{stamp}-{suffix}")
+        suffix += 1
+    return candidate
+
+
+def build_prepare_model_command(modelscope_id: str, target: Path,
+                                bench_image: str) -> list[str]:
+    resolved_target = Path(target).resolve()
+    tmp_dir = _download_tmp_for_target(resolved_target)
+    return [
+        "docker", "run", "--rm",
+        "-v", f"{resolved_target.parent}:/model-target",
+        bench_image,
+        "python", "-c", PREPARE_MODEL_SCRIPT,
+        modelscope_id,
+        f"/model-target/{tmp_dir.name}",
+    ]
+
+
 def prepare_model(*, modelscope_id: str, target: Path,
                   bench_image: str, force: bool = False,
                   runner: Runner | None = None) -> int:
-    _ = (modelscope_id, target, bench_image, force, runner)
-    raise NotImplementedError("prepare-model is implemented in task 6")
+    resolved_target = Path(target).resolve()
+    active_runner: Runner = runner or DockerRunner()
+    tmp_dir = _download_tmp_for_target(resolved_target)
+
+    if resolved_target.exists() and not force:
+        validate_prepared_model_dir(resolved_target)
+        print(f"model already exists: {resolved_target}")
+        return 0
+
+    resolved_target.parent.mkdir(parents=True, exist_ok=True)
+    result = active_runner.run(
+        build_prepare_model_command(modelscope_id, resolved_target, bench_image),
+        check=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr or result.stdout or "model download failed"
+        raise RuntimeError(message)
+
+    validate_prepared_model_dir(tmp_dir)
+
+    if resolved_target.exists():
+        if not force:
+            raise ConfigError(f"target already exists: {resolved_target}")
+        shutil.move(str(resolved_target), str(_backup_path_for_target(resolved_target)))
+    tmp_dir.rename(resolved_target)
+    return 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
