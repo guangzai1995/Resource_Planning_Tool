@@ -11,12 +11,12 @@ def _req(prompt_len, out_len):
 
 
 def _out(success, *, output_tokens=0, finish_reason="", prompt_len=10,
-         ttft=0.05, latency=1.0, itl=None):
+         ttft=0.05, latency=1.0, itl=None, generated_text="abc"):
     return RequestFuncOutput(
         success=success, output_tokens=output_tokens,
         finish_reason=finish_reason, prompt_len=prompt_len,
         ttft=ttft, latency=latency, itl=itl or [0.05, 0.05],
-        generated_text="abc",
+        generated_text=generated_text,
     )
 
 
@@ -57,3 +57,26 @@ def test_metrics_reported_without_tokenizer_when_usage_present():
     )
     assert metrics.mean_tpot_ms > 0
     assert metrics.mean_ttft_ms > 0
+
+
+def test_metrics_counts_tokenizer_fallback_outputs():
+    class Tok:
+        def __call__(self, text, add_special_tokens=False):
+            class Encoded:
+                input_ids = text.split()
+
+            return Encoded()
+
+    outputs = [
+        _out(True, output_tokens=0, finish_reason="stop",
+             generated_text="a b c", ttft=0.05, latency=0.35, itl=[0.1, 0.1]),
+    ]
+    metrics, lens = serve.calculate_metrics(
+        input_requests=[_req(10, 8)], outputs=outputs, dur_s=1.0,
+        tokenizer=Tok(), selected_percentiles=[50], goodput_config_dict={},
+    )
+
+    assert lens == [3]
+    assert metrics.usage_reported_count == 0
+    assert metrics.tokenizer_fallback_count == 1
+    assert metrics.total_output == 3
