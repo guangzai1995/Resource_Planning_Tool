@@ -1220,6 +1220,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         config = load_config(args.config)
         run_id = args.run_id or make_run_id(config.run.name)
+        if args.dry_run:
+            return run_controller(config, run_id=run_id, dry_run=True)
         if args.detach and not args.child:
             return start_detached(args.config, config, run_id)
         return run_controller(config, run_id=run_id, dry_run=args.dry_run)

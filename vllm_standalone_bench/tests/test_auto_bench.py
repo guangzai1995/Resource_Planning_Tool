@@ -733,6 +733,33 @@ def test_main_prepare_model_calls_stub_with_expected_keywords(monkeypatch):
     assert isinstance(captured["runner"], ab.DockerRunner)
 
 
+def test_main_dry_run_takes_precedence_over_detach(tmp_path, monkeypatch):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    calls = []
+
+    def fake_start_detached(*args, **kwargs):
+        calls.append("detach")
+        return 0
+
+    def fake_run_controller(config, run_id, runner=None, dry_run=False):
+        calls.append(("controller", dry_run))
+        return 0
+
+    monkeypatch.setattr(ab, "start_detached", fake_start_detached)
+    monkeypatch.setattr(ab, "run_controller", fake_run_controller)
+
+    exit_code = ab.main([
+        "run",
+        "--config", str(config_path),
+        "--dry-run",
+        "--detach",
+        "--run-id", "run123",
+    ])
+
+    assert exit_code == 0
+    assert calls == [("controller", True)]
+
+
 def test_start_detached_uses_devnull_stdin(tmp_path, monkeypatch):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     config = ab.load_config(config_path)
