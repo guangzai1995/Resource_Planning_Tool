@@ -756,19 +756,35 @@ def cleanup_network(config: AutoBenchConfig, runner: Runner,
     stop_requested = False
     if not dry_run:
         if run_id is None:
+            print("warning: network cleanup skipped because run_id is unknown", file=sys.stderr)
             return False
         try:
             if not network_has_run_labels(runner, config.run.network, run_id):
+                print(
+                    f"warning: network cleanup skipped because labels do not match: {config.run.network}",
+                    file=sys.stderr,
+                )
                 return False
         except StopRequested:
             return True
-        except Exception:
+        except Exception as exc:
+            print(
+                f"warning: network cleanup skipped after label inspect failed: {exc}",
+                file=sys.stderr,
+            )
             return False
     try:
         connected = [] if dry_run else connected_network_containers(runner, config.run.network)
     except StopRequested:
         return True
-    except Exception:
+    except Exception as exc:
+        print(f"warning: network cleanup skipped after inspect failed: {exc}", file=sys.stderr)
+        return False
+    if connected:
+        print(
+            f"warning: network cleanup skipped because containers are still connected: {connected}",
+            file=sys.stderr,
+        )
         return False
     if should_cleanup_network(
         owned=owned,
@@ -780,11 +796,16 @@ def cleanup_network(config: AutoBenchConfig, runner: Runner,
             print_cmd(cmd)
         else:
             try:
-                runner.run(cmd, check=False)
+                result = runner.run(cmd, check=False)
+                if result.returncode != 0:
+                    print(
+                        f"warning: network cleanup failed ({result.returncode}): {result.stderr}",
+                        file=sys.stderr,
+                    )
             except StopRequested:
                 stop_requested = True
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"warning: network cleanup failed: {exc}", file=sys.stderr)
     return stop_requested
 
 
@@ -1065,7 +1086,9 @@ def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, s
 
 def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
     cases = expand_cases(config, run_id=run_id)
+    run_dir = config.run.results_dir / run_id
     network_owned = config.run.create_network
+    write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
     try:
         if config.run.create_network:
             print_cmd(build_network_create_command(config, run_id))
@@ -1422,7 +1445,37 @@ def print_status(run_dir: Path) -> int:
     print(f"status: {state.get('status', 'unknown')}")
     print(f"current: {_format_current(state.get('current'))}")
     print(f"counts: {_format_counts(state.get('counts'))}")
-    return 0
+    exit_code = 0
+    pid_path = run_dir / "controller.pid"
+    if pid_path.exists():
+        try:
+            pid = pid_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"warning: pid file invalid: {exc}", file=sys.stderr)
+            pid = "-"
+            exit_code = 1
+        if not pid:
+            pid = "-"
+    else:
+        pid = "-"
+    print(f"pid: {pid}")
+
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        print("manifest: -")
+        return exit_code
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"warning: manifest file invalid: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(manifest, dict):
+        print(f"warning: manifest file invalid: expected object in {manifest_path}", file=sys.stderr)
+        return 1
+    cases = manifest.get("cases")
+    case_count = len(cases) if isinstance(cases, list) else 0
+    print(f"manifest: {manifest.get('status', 'unknown')} cases={case_count}")
+    return exit_code
 
 
 def follow_file(path: Path) -> int:

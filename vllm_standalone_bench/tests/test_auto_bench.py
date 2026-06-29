@@ -824,13 +824,53 @@ def test_controller_dry_run_prints_commands_without_result_files(tmp_path, capsy
     assert "vllm_auto_bench.run_id=run123" in out
     assert "docker run -d" in out
     assert "run_bench_multi.py" in out
-    assert not (run_dir / "config.resolved.json").exists()
+    assert (run_dir / "config.resolved.json").exists()
     assert not (run_dir / "manifest.json").exists()
     assert not (run_dir / "state.json").exists()
     assert not (
         run_dir / "qwen2_5_1_5b" / "bf16_default" / "smoke" / "status.json"
     ).exists()
     assert runner.commands == []
+
+
+def test_cleanup_network_warns_when_external_containers_connected(tmp_path, capsys):
+    class ConnectedNetworkRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if args[:4] == ["docker", "inspect", "--format", "{{json .Containers}}"]:
+                self.commands.append(list(args))
+                return ab.Completed(list(args), 0, json.dumps({"external": {}}), "")
+            return super().run(args, check=check, capture=capture, text=text, stdout=stdout, stderr=stderr)
+
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = ConnectedNetworkRunner()
+
+    stop_requested = ab.cleanup_network(config, runner, owned=True, dry_run=False, run_id="run123")
+
+    captured = capsys.readouterr()
+    assert stop_requested is False
+    assert not any(command[:3] == ["docker", "network", "rm"] for command in runner.commands)
+    assert "warning" in captured.err.lower()
+    assert "external" in captured.err.lower()
+
+
+def test_cleanup_network_warns_when_network_rm_fails(tmp_path, capsys):
+    class FailingNetworkRmRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if args[:3] == ["docker", "network", "rm"]:
+                self.commands.append(list(args))
+                return ab.Completed(list(args), 1, "", "network busy")
+            return super().run(args, check=check, capture=capture, text=text, stdout=stdout, stderr=stderr)
+
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FailingNetworkRmRunner()
+
+    stop_requested = ab.cleanup_network(config, runner, owned=True, dry_run=False, run_id="run123")
+
+    captured = capsys.readouterr()
+    assert stop_requested is False
+    assert any(command[:3] == ["docker", "network", "rm"] for command in runner.commands)
+    assert "warning" in captured.err.lower()
+    assert "network busy" in captured.err
 
 
 def test_controller_group_exception_skips_only_unrecorded_cases(tmp_path, monkeypatch):
@@ -916,6 +956,15 @@ def test_status_reads_state_file(tmp_path, capsys):
         "current": {"model": "m", "serve_profile": "s", "bench_profile": "b"},
         "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
     })
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    (run_dir / "manifest.json").write_text(
+        json.dumps({
+            "run_id": "run123",
+            "status": "completed_with_failures",
+            "cases": [{}, {}, {}],
+        }),
+        encoding="utf-8",
+    )
 
     exit_code = ab.print_status(run_dir)
 
@@ -923,6 +972,8 @@ def test_status_reads_state_file(tmp_path, capsys):
     assert exit_code == 0
     assert "running" in captured.out
     assert "m/s/b" in captured.out
+    assert "pid: 12345" in captured.out
+    assert "manifest: completed_with_failures cases=3" in captured.out
 
 
 def test_status_corrupt_state_returns_error(tmp_path, capsys):
