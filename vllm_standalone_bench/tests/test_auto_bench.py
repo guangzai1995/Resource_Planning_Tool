@@ -343,3 +343,7 @@ def test_controller_skips_bench_when_vllm_not_ready(tmp_path, monkeypatch):
     assert result == 1
     manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["cases"][0]["status"] == "skipped"
+
+
+def test_runner_protocol_type_is_exposed():
+    assert hasattr(ab, "RunnerProtocol")

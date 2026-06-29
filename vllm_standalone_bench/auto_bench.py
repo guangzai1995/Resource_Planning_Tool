@@ -8,7 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -584,14 +584,15 @@ def write_manifest(run_dir: Path, manifest: Manifest) -> None:
     write_json_atomic(run_dir / "manifest.json", manifest.to_dict())
 
 
-class FakeRunnerProtocol:
+class RunnerProtocol(Protocol):
     def run(self, args: list[str], *, check: bool = False,
             capture: bool = True, text: bool = True,
             stdout: Any = None, stderr: Any = None) -> Completed:
-        raise NotImplementedError
+        ...
 
 
-Runner = DockerRunner | FakeRunnerProtocol
+FakeRunnerProtocol = RunnerProtocol
+Runner = DockerRunner | RunnerProtocol
 
 
 def _check_result(result: Completed) -> Completed:
