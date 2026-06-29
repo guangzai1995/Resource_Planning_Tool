@@ -39,7 +39,6 @@ SHEET_SPECS = [
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 SUB_FILL = PatternFill("solid", fgColor="D9EAF7")
-NOTE_FILL = PatternFill("solid", fgColor="FFF2CC")
 THIN_BORDER = Border(
     left=Side(style="thin", color="D9E2F3"),
     right=Side(style="thin", color="D9E2F3"),
@@ -89,18 +88,20 @@ def _write_header(ws, spec: dict[str, str]) -> None:
 
 def _write_sheet_index(ws) -> None:
     ws.append([])
+    header_row = ws.max_row + 1
     ws.append(["Sheet", "名称", "责任人", "状态", "说明"])
     for index, spec in enumerate(SHEET_SPECS):
         ws.append([index, spec["title"], spec["owner"], spec["status"], "按规格生成"])
-    _style_range(ws, 6, 6 + len(SHEET_SPECS), 1, 5)
+    _style_range(ws, header_row, ws.max_row, 1, 5)
 
 
 def _write_summary(ws) -> None:
     ws.append([])
+    header_row = ws.max_row + 1
     ws.append(["技术点", "状态", "汇报口径"])
     for row in TECH_ROWS:
         ws.append(list(row))
-    _style_range(ws, 6, 6 + len(TECH_ROWS), 1, 3)
+    _style_range(ws, header_row, ws.max_row, 1, 3)
 
 
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:

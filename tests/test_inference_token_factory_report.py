@@ -30,6 +30,11 @@ EXPECTED_SHEETS = [
 ]
 
 
+def assert_cell_has_table_style(cell):
+    assert cell.alignment.wrap_text is True
+    assert cell.border.left.style == "thin"
+
+
 def test_static_sheet_specs_and_status_labels():
     assert REPORT_VERSION == "v2.0"
     assert [item["title"] for item in SHEET_SPECS] == EXPECTED_SHEETS
@@ -58,6 +63,10 @@ def test_workbook_contains_required_sheet_headers(tmp_path):
         assert ws["B2"].value == REPORT_VERSION
         assert ws["A4"].value == "当前状态"
 
+    index_ws = loaded["00_目录与版本"]
+    assert index_ws.cell(row=index_ws.max_row, column=2).value == "12_数据附录"
+    assert_cell_has_table_style(index_ws.cell(row=index_ws.max_row, column=2))
+
 
 def test_summary_sheet_has_expected_technology_states(tmp_path):
     output = tmp_path / "report.xlsx"
@@ -70,6 +79,8 @@ def test_summary_sheet_has_expected_technology_states(tmp_path):
     assert "待验证" in values
     assert "连续批处理" in values
     assert "已具备无需独立测试" in values
+    assert ws.cell(row=ws.max_row, column=1).value == "连续批处理"
+    assert_cell_has_table_style(ws.cell(row=ws.max_row, column=1))
 
 
 def test_load_context_summary_from_existing_outputs():
