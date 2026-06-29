@@ -18,6 +18,10 @@ def write_config_at(path, data):
     return path
 
 
+def value_after(cmd, flag):
+    return cmd[cmd.index(flag) + 1]
+
+
 def minimal_config(tmp_path):
     model_root = tmp_path / "model"
     model_dir = model_root / "Qwen2.5-1.5B-Instruct"
@@ -163,9 +167,13 @@ def test_build_vllm_command_uses_bridge_network_without_host_port(tmp_path):
 
     assert "--network" in cmd
     assert "vllm-bench-net" in cmd
+    assert value_after(cmd, "--name") == case.container_name
     assert "--network=host" not in cmd
     assert "-p" not in cmd
     assert "vllm serve" not in " ".join(cmd)
+    assert "serve" in cmd
+    serve_index = cmd.index("serve")
+    assert cmd[serve_index + 1] == "/models/Qwen2.5-1.5B-Instruct"
     assert cmd[-10:] == [
         "vllm", "serve", "/models/Qwen2.5-1.5B-Instruct",
         "--served-model-name", "qwen2_5_1_5b",
@@ -191,6 +199,8 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert "qwen2_5_1_5b" in cmd
     assert "--output-csv" in cmd
     assert "/results/result.csv" in cmd
+    assert value_after(cmd, "--served-model-name") == "qwen2_5_1_5b"
+    assert value_after(cmd, "--output-xlsx") == "/results/result.xlsx"
 
 
 def test_network_cleanup_only_removes_owned_empty_network():
