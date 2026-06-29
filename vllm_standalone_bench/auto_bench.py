@@ -609,16 +609,15 @@ def docker_network_exists(runner: Runner, network: str) -> bool:
 
 
 def ensure_network(config: AutoBenchConfig, runner: Runner, dry_run: bool) -> bool:
-    if dry_run:
-        if not config.run.create_network:
-            raise RuntimeError(f"Docker network does not exist: {config.run.network}")
-        print_cmd(["docker", "network", "create", config.run.network])
-        return True
     if docker_network_exists(runner, config.run.network):
         return False
     if not config.run.create_network:
         raise RuntimeError(f"Docker network does not exist: {config.run.network}")
-    _check_result(runner.run(["docker", "network", "create", config.run.network], check=False))
+    cmd = ["docker", "network", "create", config.run.network]
+    if dry_run:
+        print_cmd(cmd)
+    else:
+        _check_result(runner.run(cmd, check=False))
     return True
 
 
@@ -813,10 +812,37 @@ def _record_skipped_group(manifest: Manifest, run_dir: Path, run_id: str,
     write_manifest(run_dir, manifest)
 
 
+def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, str], list[BenchmarkCase]]:
+    grouped: dict[tuple[str, str], list[BenchmarkCase]] = {}
+    for case in cases:
+        grouped.setdefault((case.model.name, case.serve_profile.name), []).append(case)
+    return grouped
+
+
+def _run_controller_dry_run(config: AutoBenchConfig, run_id: str, runner: Runner) -> int:
+    cases = expand_cases(config, run_id=run_id)
+    network_owned = False
+    try:
+        network_owned = ensure_network(config, runner, dry_run=True)
+        for group_cases in _group_cases_by_serve(cases).values():
+            serve_case = group_cases[0]
+            serve_layout = build_layout(config, run_id, serve_case)
+            print_cmd(build_vllm_run_command(config, serve_case, serve_layout.run_dir))
+            for case in group_cases:
+                layout = build_layout(config, run_id, case)
+                print_cmd(build_bench_run_command(config, case, layout.bench_dir))
+        return 0
+    finally:
+        cleanup_network(config, runner, network_owned, dry_run=True)
+
+
 def run_controller(config: AutoBenchConfig, run_id: str,
                    runner: Runner | None = None,
                    dry_run: bool = False) -> int:
     active_runner: Runner = runner or DockerRunner()
+    if dry_run:
+        return _run_controller_dry_run(config, run_id, active_runner)
+
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
     manifest = Manifest(run_id=run_id, total=len(cases))
@@ -829,9 +855,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     completed = 0
     try:
         network_owned = ensure_network(config, active_runner, dry_run)
-        grouped: dict[tuple[str, str], list[BenchmarkCase]] = {}
-        for case in cases:
-            grouped.setdefault((case.model.name, case.serve_profile.name), []).append(case)
+        grouped = _group_cases_by_serve(cases)
 
         for group_cases in grouped.values():
             serve_case = group_cases[0]

@@ -402,6 +402,27 @@ def test_controller_artifact_failure_still_stops_and_removes_container(tmp_path,
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
 
 
+def test_controller_dry_run_prints_commands_without_result_files(tmp_path, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=True)
+
+    out = capsys.readouterr().out
+    run_dir = tmp_path / "results" / "run123"
+    assert result == 0
+    assert "docker network create vllm-bench-net" in out
+    assert "docker run -d" in out
+    assert "run_bench_multi.py" in out
+    assert not (run_dir / "config.resolved.json").exists()
+    assert not (run_dir / "manifest.json").exists()
+    assert not (run_dir / "state.json").exists()
+    assert not (
+        run_dir / "qwen2_5_1_5b" / "bf16_default" / "smoke" / "status.json"
+    ).exists()
+    assert runner.commands == [["docker", "network", "inspect", "vllm-bench-net"]]
+
+
 def test_current_state_counts_manifest_cases(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     case = ab.expand_cases(config, run_id="run123")[0]
