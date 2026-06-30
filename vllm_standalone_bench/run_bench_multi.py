@@ -276,6 +276,11 @@ def _extract_row(
     def _i(key: str, default=0) -> int:
         return int(result.get(key, default) or default)
 
+    def _rate(numerator: float, denominator_s: float) -> float:
+        if denominator_s <= 0:
+            return 0.0
+        return round(float(numerator) / float(denominator_s), 4)
+
     completed = _i('completed')
     total_in = _i('total_input_tokens')
     total_out = _i('total_output_tokens')
@@ -309,6 +314,13 @@ def _extract_row(
         if completed > 0 else 0.0
     )
 
+    duration_s = float(result.get('duration', 0.0) or 0.0)
+    mean_ttft_ms = float(result.get('mean_ttft_ms', 0.0) or 0.0)
+    mean_tpot_ms = float(result.get('mean_tpot_ms', 0.0) or 0.0)
+    input_throughput_tok_s = _rate(total_in, duration_s)
+    prefill_effective_tok_s = _rate(raw_avg_in, mean_ttft_ms / 1000.0)
+    decode_effective_tok_s = _rate(1.0, mean_tpot_ms / 1000.0)
+
     return {
         # ── 测试配置 ────────────────────────────────
         'model':           model,
@@ -333,7 +345,10 @@ def _extract_row(
         'token_source':        token_source,
         # ── 吞吐量 ──────────────────────────────────
         'throughput_req_s':   _f('request_throughput'),
-        'throughput_tok_s':   _f('output_throughput'),
+        'throughput_tok_s':   _f('output_throughput'),  # 输出 Token 系统吞吐，vLLM 官方口径
+        'input_throughput_tok_s': input_throughput_tok_s,
+        'prefill_effective_tok_s': prefill_effective_tok_s,
+        'decode_effective_tok_s': decode_effective_tok_s,
         # ── TTFT：首 token 时延 (ms) ─────────────────
         'ttft_mean_ms':  _f('mean_ttft_ms'),
         'ttft_p50_ms':   _f('p50_ttft_ms'),
@@ -364,7 +379,8 @@ CSV_HEADERS = [
     'avg_input_tokens', 'avg_output_tokens',
     'input_compliance', 'output_compliance',
     'finish_reason_length_pct', 'token_source',
-    'throughput_req_s', 'throughput_tok_s',
+    'throughput_req_s', 'throughput_tok_s', 'input_throughput_tok_s',
+    'prefill_effective_tok_s', 'decode_effective_tok_s',
     'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
     'tpot_mean_ms', 'tpot_p50_ms', 'tpot_p90_ms', 'tpot_p99_ms',
     'e2el_mean_ms', 'e2el_p50_ms', 'e2el_p90_ms', 'e2el_p99_ms',
@@ -378,7 +394,8 @@ CSV_HEADERS_ZH = [
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
     '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
-    '请求吞吐(req/s)', '输出Token吞吐(tok/s)',
+    '请求吞吐(req/s)', '输出Token系统吞吐(tok/s)', '输入Token系统吞吐(tok/s)',
+    'Prefill有效速率(tok/s)', 'Decode有效速率(tok/s)',
     'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
     'TPOT均值(ms)', 'TPOT_P50(ms)', 'TPOT_P90(ms)', 'TPOT_P99(ms)',
     'E2EL均值(ms)', 'E2EL_P50(ms)', 'E2EL_P90(ms)', 'E2EL_P99(ms)',
@@ -458,7 +475,10 @@ def save_xlsx(rows: List[dict], path: str) -> None:
         ('TPOT', '每输出 Token 时延 (Time-Per-Output-Token)', '(E2EL − TTFT) ÷ (output_tokens − 1)'),
         ('E2EL', '端到端延迟 (End-to-End Latency)', '最后一个 token 到达时间 − 请求发出时间'),
         ('throughput_req_s', '请求吞吐量', 'completed ÷ benchmark_duration'),
-        ('throughput_tok_s', '输出 Token 吞吐量', 'total_output_tokens ÷ benchmark_duration'),
+        ('throughput_tok_s', '输出 Token 系统吞吐量', 'total_output_tokens ÷ benchmark_duration（vLLM 官方 output_throughput 口径）'),
+        ('input_throughput_tok_s', '输入 Token 系统吞吐量', 'total_input_tokens ÷ benchmark_duration'),
+        ('prefill_effective_tok_s', 'Prefill 有效速率', 'avg_input_tokens ÷ mean_TTFT_s；TTFT 含排队、调度和首 token'),
+        ('decode_effective_tok_s', 'Decode 有效速率', '1 ÷ mean_TPOT_s；基于 TPOT 的 next-token decode 近似速率'),
         ('P50/P90/P99', '百分位数', 'P90 表示 90% 请求低于该延迟值'),
         ('', '', ''),
         ('并发控制说明', '',
@@ -624,9 +644,14 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
 
             # 打印摘要行
             logger.info(
-                "  ✓ 结果: tok/s=%.1f  TTFT_mean=%.1fms  TTFT_p90=%.1fms  "
-                "TPOT_mean=%.3fms  E2EL_mean=%.1fms  成功=%d",
+                "  ✓ 结果: out_sys_tok/s=%.1f  in_sys_tok/s=%.1f  "
+                "prefill_eff_tok/s=%.1f  decode_eff_tok/s=%.1f  "
+                "TTFT_mean=%.1fms  TTFT_p90=%.1fms  TPOT_mean=%.3fms  "
+                "E2EL_mean=%.1fms  成功=%d",
                 row['throughput_tok_s'],
+                row['input_throughput_tok_s'],
+                row['prefill_effective_tok_s'],
+                row['decode_effective_tok_s'],
                 row['ttft_mean_ms'], row['ttft_p90_ms'],
                 row['tpot_mean_ms'],
                 row['e2el_mean_ms'],
@@ -777,7 +802,7 @@ def _parse_args() -> argparse.Namespace:
                        help='最大允许的 TTFT 均值（ms）；超过后跳过该 (input,output) '
                             '组合的更高并发测试')
     limit.add_argument('--min-throughput-tok-s', type=float, default=None,
-                       help='最低输出 Token 吞吐量阈值（tok/s）；低于此值时跳过该 '
+                       help='最低输出 Token 系统吞吐量阈值（tok/s）；低于此值时跳过该 '
                             '(input,output) 组合的更高并发测试。\n'
                             '通常在 parallel=1（单用户）时触发：若单用户吞吐已低于预期，'
                             '说明服务在该请求规格下性能不达标，无需继续测试更高并发。')
@@ -826,22 +851,26 @@ def main() -> None:
 
     # 终端汇总表
     print()
-    print('=' * 96)
+    print('=' * 120)
     print(
         f"{'输入':>6} {'输出':>6} {'并发':>5} "
-        f"{'tok/s':>10} {'req/s':>8} "
+        f"{'out_sys':>10} {'in_sys':>10} {'prefill':>10} {'decode':>10} {'req/s':>8} "
         f"{'TTFT均值':>10} {'TTFT_P90':>10} "
         f"{'TPOT均值':>10} {'E2EL均值':>10} {'成功':>6}"
     )
-    print('-' * 96)
+    print('-' * 120)
     for r in rows:
         print(
             f"{r['input_len']:>6} {r['output_len']:>6} {r['parallel_num']:>5} "
-            f"{r['throughput_tok_s']:>10.1f} {r['throughput_req_s']:>8.3f} "
+            f"{r['throughput_tok_s']:>10.1f} "
+            f"{r['input_throughput_tok_s']:>10.1f} "
+            f"{r['prefill_effective_tok_s']:>10.1f} "
+            f"{r['decode_effective_tok_s']:>10.1f} "
+            f"{r['throughput_req_s']:>8.3f} "
             f"{r['ttft_mean_ms']:>10.1f} {r['ttft_p90_ms']:>10.1f} "
             f"{r['tpot_mean_ms']:>10.3f} {r['e2el_mean_ms']:>10.1f} {r['n_success']:>6}"
         )
-    print('=' * 96)
+    print('=' * 120)
     if args.output_csv:
         print(f"CSV  → {args.output_csv}")
     if args.output_xlsx:

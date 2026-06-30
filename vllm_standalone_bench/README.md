@@ -205,10 +205,14 @@ python3 vllm_standalone_bench/run_bench_serve.py \
 | **E2EL** | 端到端延迟 | `最后一个 token 时刻 - 请求发出时刻` |
 | **Goodput** | 有效吞吐 | 满足所有 SLO 约束的请求数 / 总时间 |
 | **Peak tok/s** | 峰值输出吞吐 | 按秒桶统计的最大每秒输出 token 数 |
+| **throughput_tok_s** | 输出 Token 系统吞吐 | `total_output_tokens / benchmark_duration`，保留 vLLM 官方 `output_throughput` 口径 |
+| **input_throughput_tok_s** | 输入 Token 系统吞吐 | `total_input_tokens / benchmark_duration` |
+| **prefill_effective_tok_s** | Prefill 有效速率 | `avg_input_tokens / mean_TTFT_s`，TTFT 包含排队、调度和首 token |
+| **decode_effective_tok_s** | Decode 有效速率 | `1 / mean_TPOT_s`，基于 TPOT 的 next-token decode 近似速率 |
 
 ## 与 benchmark_tools 的关键差异
 
-1. **TPOT 分母**：本工具用 `output_len - 1`（排除首 token），benchmark_tools 用 `output_len`
+1. **TPOT 分母**：本工具和当前 benchmark_tools 都按 `(E2E - TTFT) / (output_tokens - 1)` 计算，排除首 token
 2. **ITL**：本工具完整计算，benchmark_tools 缺失
 3. **统计维度**：本工具提供 mean/median/std + 完整分位数，benchmark_tools 仅提供均值
-4. **吞吐含义**：本工具计算全局系统吞吐，benchmark_tools 计算单请求平均速率
+4. **吞吐展示**：本工具同时展示系统吞吐和阶段有效速率，benchmark_tools 主要展示输出 Token 系统吞吐与延迟均值

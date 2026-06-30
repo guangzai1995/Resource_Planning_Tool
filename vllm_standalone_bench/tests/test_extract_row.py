@@ -76,6 +76,25 @@ def test_extract_row_real_avg_from_totals():
     assert row["finish_reason_length_pct"] == 100.0
 
 
+def test_extract_row_throughput_and_effective_token_rates():
+    row = m._extract_row(
+        {
+            **_result(total_in=384, total_out=24, completed=3),
+            "duration": 2.0,
+            "output_throughput": 12.0,
+            "mean_ttft_ms": 50.0,
+            "mean_tpot_ms": 25.0,
+        },
+        in_len=128, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+
+    assert row["throughput_tok_s"] == 12.0
+    assert row["input_throughput_tok_s"] == 192.0
+    assert row["prefill_effective_tok_s"] == 2560.0
+    assert row["decode_effective_tok_s"] == 40.0
+    assert "total_throughput_tok_s" not in row
+
+
 def test_extract_row_compliance_when_undergenerated():
     # 服务端只生成了 12 token（请求 8×3=24，实测 12/3=4 < 8）
     row = m._extract_row(
@@ -160,8 +179,11 @@ def test_csv_headers_match_row_keys():
     assert not missing, f"CSV_HEADERS 有列在 row 中缺失: {missing}"
     # 新增列必须被写入 CSV/XLSX
     for required in ("total_input_len", "input_compliance", "output_compliance",
-                     "finish_reason_length_pct", "token_source", "seed"):
+                     "finish_reason_length_pct", "token_source", "seed",
+                     "input_throughput_tok_s", "prefill_effective_tok_s",
+                     "decode_effective_tok_s"):
         assert required in m.CSV_HEADERS, f"新列 {required} 未进 CSV_HEADERS"
+    assert "total_throughput_tok_s" not in m.CSV_HEADERS
     assert row["seed"] == 0
     assert len(m.CSV_HEADERS) == len(m.CSV_HEADERS_ZH), "中英文表头数量不一致"
 
