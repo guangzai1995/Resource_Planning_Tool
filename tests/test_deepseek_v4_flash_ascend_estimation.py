@@ -1,11 +1,17 @@
+from pathlib import Path
+
+import pandas as pd
 import pytest
 
 from scripts.estimate_deepseek_v4_flash_ascend import (
     DEFAULT_GPU_ASSUMPTIONS,
     DEFAULT_MODEL_ASSUMPTION,
     DEFAULT_RUNTIME_SCENARIOS,
+    SOURCE_COLUMNS,
     BaselineRow,
+    build_estimates,
     estimate_row,
+    load_p800_baseline,
     required_memory_per_card_gb,
 )
 
@@ -63,3 +69,61 @@ def test_910c_compute_scale_uses_target_hardware_ratio():
     )
     assert result["输出tokens总吞吐"] == pytest.approx(100.0 * result["decode_scale"])
     assert 0.0 <= result["confidence"] <= 1.0
+
+
+def write_baseline_workbook(path: Path) -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "输入长度": 512,
+                "输出长度": 1024,
+                "并发数": 5,
+                "输出tokens总吞吐": 117.0,
+                "首tokens时延TP90（ms）": 476.0,
+                "首tokens时延TP99（ms）": 500.0,
+                "最大首tokens时延（ms）": 501.0,
+                "平均首tokens时延（ms）": 381.0,
+                "增量时延TP90（ms）": 43.0,
+                "增量时延TP99（ms）": 44.0,
+                "最大增量时延（ms）": 46.0,
+                "平均增量时延（ms）": 42.0,
+            },
+            {
+                "输入长度": 1024,
+                "输出长度": 1024,
+                "并发数": 10,
+                "输出tokens总吞吐": 150.0,
+                "首tokens时延TP90（ms）": 600.0,
+                "首tokens时延TP99（ms）": 650.0,
+                "最大首tokens时延（ms）": 700.0,
+                "平均首tokens时延（ms）": 500.0,
+                "增量时延TP90（ms）": 55.0,
+                "增量时延TP99（ms）": 58.0,
+                "最大增量时延（ms）": 70.0,
+                "平均增量时延（ms）": 50.0,
+            },
+        ]
+    )
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="671B-P800-8测试数据", index=False)
+
+
+def test_load_p800_baseline_preserves_excel_row_numbers(tmp_path):
+    workbook = tmp_path / "资源规划工具.xlsx"
+    write_baseline_workbook(workbook)
+    rows = load_p800_baseline(workbook)
+    assert len(rows) == 2
+    assert rows[0].excel_row == 2
+    assert rows[1].excel_row == 3
+    assert rows[0].throughput_tokens_s == 117.0
+
+
+def test_build_estimates_creates_910b_and_910c_rows(tmp_path):
+    workbook = tmp_path / "资源规划工具.xlsx"
+    write_baseline_workbook(workbook)
+    baseline_rows = load_p800_baseline(workbook)
+    estimates = build_estimates(baseline_rows)
+    assert set(estimates["target_gpu"]) == {"910B", "910C"}
+    assert len(estimates) == 4
+    assert list(estimates.columns[: len(SOURCE_COLUMNS)]) == SOURCE_COLUMNS
+    assert {"base_row", "compute_scale", "bandwidth_scale", "decode_scale", "confidence"}.issubset(estimates.columns)

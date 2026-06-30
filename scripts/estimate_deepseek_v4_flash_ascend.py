@@ -31,6 +31,21 @@ SOURCE_COLUMNS = [
     "平均增量时延（ms）",
 ]
 
+AUDIT_COLUMNS = [
+    "base_sheet",
+    "base_row",
+    "target_gpu",
+    "gpu_count",
+    "runtime_efficiency",
+    "compute_scale",
+    "bandwidth_scale",
+    "decode_scale",
+    "bottleneck",
+    "required_per_card_gb",
+    "confidence",
+    "assumption_notes",
+]
+
 
 @dataclass(frozen=True)
 class GpuAssumption:
@@ -252,3 +267,52 @@ def estimate_row(
         "confidence": confidence_for(target_gpu),
         "assumption_notes": f"{model.spec_source}; {target_gpu.spec_source}; runtime={runtime.label}",
     }
+
+
+def load_p800_baseline(workbook_path: Path) -> list[BaselineRow]:
+    df = pd.read_excel(workbook_path, sheet_name=SOURCE_SHEET)
+    missing = [col for col in SOURCE_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required baseline columns: {missing}")
+    rows: list[BaselineRow] = []
+    for index, row in df.dropna(subset=["输入长度", "并发数"]).iterrows():
+        rows.append(
+            BaselineRow(
+                excel_row=int(index) + 2,
+                input_tokens=float(row["输入长度"]),
+                output_tokens=float(row["输出长度"]),
+                concurrency=float(row["并发数"]),
+                throughput_tokens_s=float(row["输出tokens总吞吐"]),
+                ttft_p90_ms=float(row["首tokens时延TP90（ms）"]),
+                ttft_p99_ms=float(row["首tokens时延TP99（ms）"]),
+                ttft_max_ms=float(row["最大首tokens时延（ms）"]),
+                ttft_mean_ms=float(row["平均首tokens时延（ms）"]),
+                decode_latency_p90_ms=float(row["增量时延TP90（ms）"]),
+                decode_latency_p99_ms=float(row["增量时延TP99（ms）"]),
+                decode_latency_max_ms=float(row["最大增量时延（ms）"]),
+                decode_latency_mean_ms=float(row["平均增量时延（ms）"]),
+            )
+        )
+    return rows
+
+
+def build_estimates(
+    baseline_rows: list[BaselineRow],
+    *,
+    model: ModelAssumption = DEFAULT_MODEL_ASSUMPTION,
+    runtime: RuntimeScenario = DEFAULT_RUNTIME_SCENARIOS["base"],
+) -> pd.DataFrame:
+    output_rows: list[dict[str, Any]] = []
+    base_gpu = DEFAULT_GPU_ASSUMPTIONS["P800"]
+    for baseline in baseline_rows:
+        for gpu_name in ("910B", "910C"):
+            output_rows.append(
+                estimate_row(
+                    baseline=baseline,
+                    target_gpu=DEFAULT_GPU_ASSUMPTIONS[gpu_name],
+                    base_gpu=base_gpu,
+                    model=model,
+                    runtime=runtime,
+                )
+            )
+    return pd.DataFrame(output_rows, columns=SOURCE_COLUMNS + AUDIT_COLUMNS)
