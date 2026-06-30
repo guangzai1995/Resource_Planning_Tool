@@ -9,6 +9,7 @@
     "cleanup_network": true,
     "container_port": 8000,
     "publish_host_port": false,
+    "host_port": 18000,
     "api_key": "local-bench-key",
     "ready_timeout_sec": 1800,
     "cooldown_sec": 5

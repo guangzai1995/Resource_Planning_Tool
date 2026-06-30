@@ -2007,6 +2007,7 @@ def test_example_configs_are_parseable():
         assert config.bench_profiles
         assert data["mounts"]["models"] == "/Resource_Planning_Tool/model"
         assert data["run"]["results_dir"] == "vllm_standalone_bench/results"
+        assert data["run"]["host_port"] == 18000
         assert any(
             model["model_path"] == "/models/Qwen2.5-1.5B-Instruct"
             for model in data["models"]
@@ -2042,3 +2043,11 @@ def test_bench_runner_dockerfile_contains_offline_dependencies():
         "requirements.txt",
     ]:
         assert expected in dockerfile
+
+    for line in dockerfile.splitlines():
+        if not line.startswith("COPY "):
+            continue
+        parts = line.split()
+        sources = parts[1:-1]
+        for source in sources:
+            assert (root / source).exists(), f"COPY source does not exist: {source}"
