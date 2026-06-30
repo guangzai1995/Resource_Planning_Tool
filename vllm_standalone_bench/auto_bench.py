@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import re
@@ -12,9 +13,14 @@ import signal
 import subprocess
 import sys
 import time
+import types
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
+
+from bench_compare import aggregate_compare
+
+logger = logging.getLogger("auto_bench")
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -33,6 +39,9 @@ class ConfigError(ValueError):
     """Raised when the auto bench configuration is invalid."""
 
 
+SUPPORTED_ENGINES = ("vllm", "sglang")
+
+
 class StopRequested(Exception):
     """Raised when the detached controller is asked to stop gracefully."""
 
@@ -41,7 +50,6 @@ class StopRequested(Exception):
 class RunConfig:
     name: str
     results_dir: Path
-    vllm_image: str
     bench_image: str
     network: str = "vllm-bench-net"
     create_network: bool = True
@@ -52,6 +60,10 @@ class RunConfig:
     api_key: str | None = None
     ready_timeout_sec: int = 1800
     cooldown_sec: float = 20.0
+    vllm_image: str | None = None
+    images: Mapping[str, str] = field(
+        default_factory=lambda: types.MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)
@@ -72,6 +84,7 @@ class ModelConfig:
 @dataclass(frozen=True)
 class ServeProfile:
     name: str
+    engine: str = "vllm"
     gpus: str = "all"
     args: tuple[str, ...] = field(default_factory=tuple)
 
@@ -282,11 +295,12 @@ def _container_path_to_host(path_value: Any, model_root: Path, field_name: str) 
 def _parse_run(data: dict[str, Any]) -> RunConfig:
     run = _require_mapping(data.get("run"), "run")
     host_port = run.get("host_port")
+    vllm_image = _optional_string(run.get("vllm_image"), "run.vllm_image")
+    images = _parse_engine_images(run, vllm_image)
     return RunConfig(
         name=_safe_name(_required(run, "name", "run.name"), "run.name"),
         results_dir=Path(_string(run.get("results_dir", "vllm_standalone_bench/results"),
                                  "run.results_dir")),
-        vllm_image=_string(_required(run, "vllm_image", "run.vllm_image"), "run.vllm_image"),
         bench_image=_string(_required(run, "bench_image", "run.bench_image"), "run.bench_image"),
         network=_network_name(run.get("network", "vllm-bench-net"), "run.network"),
         create_network=_bool(run.get("create_network", True), "run.create_network"),
@@ -301,7 +315,27 @@ def _parse_run(data: dict[str, Any]) -> RunConfig:
         ready_timeout_sec=_positive_int(run.get("ready_timeout_sec", 1800),
                                         "run.ready_timeout_sec"),
         cooldown_sec=_non_negative_float(run.get("cooldown_sec", 20.0), "run.cooldown_sec"),
+        vllm_image=vllm_image,
+        images=images,
     )
+
+
+def _parse_engine_images(
+    run: dict[str, Any], vllm_image: str | None
+) -> Mapping[str, str]:
+    raw = run.get("images")
+    images: dict[str, str] = {}
+    if raw is not None:
+        if not isinstance(raw, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+        ):
+            raise ConfigError("run.images must be an object mapping engine -> image string")
+        images = dict(raw)
+    if vllm_image is not None:
+        images.setdefault("vllm", vllm_image)
+    if not images:
+        raise ConfigError("run.images (or run.vllm_image) must define at least one engine image")
+    return types.MappingProxyType(images)
 
 
 def _parse_mounts(data: dict[str, Any], config_dir: Path) -> MountConfig:
@@ -355,9 +389,15 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
         args = profile.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ConfigError("serve_profile.args must be a string array")
+        engine = _string(profile.get("engine", "vllm"), "serve_profile.engine")
+        if engine not in SUPPORTED_ENGINES:
+            raise ConfigError(
+                f"serve_profile.engine must be one of {SUPPORTED_ENGINES}, got {engine!r}"
+            )
         parsed.append(ServeProfile(
             name=_safe_name(_required(profile, "name", "serve_profile.name"),
                             "serve_profile.name"),
+            engine=engine,
             gpus=_string(profile.get("gpus", "all"), "serve_profile.gpus"),
             args=tuple(args),
         ))
@@ -422,7 +462,18 @@ def load_config(path: str | Path) -> AutoBenchConfig:
     models = _parse_models(config_data, mounts)
     serve_profiles = _parse_serve_profiles(config_data)
     bench_profiles = _parse_bench_profiles(config_data)
-    return AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    config = AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    _validate_images_cover_engines(config)
+    return config
+
+
+def _validate_images_cover_engines(config: AutoBenchConfig) -> None:
+    engines = {profile.engine for profile in config.serve_profiles}
+    missing = sorted(engine for engine in engines if engine not in config.run.images)
+    if missing:
+        raise ConfigError(
+            f"run.images missing image for engine(s): {', '.join(missing)}"
+        )
 
 
 def make_run_id(run_name: str, now: float | None = None) -> str:
@@ -487,11 +538,53 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
             f"127.0.0.1:{config.run.host_port}:{config.run.container_port}",
         ])
     cmd.extend([
-        config.run.vllm_image,
+        config.run.images["vllm"],
         "serve", case.model.model_path,
         "--served-model-name", case.api_model_name,
         "--host", "0.0.0.0",
         "--port", str(config.run.container_port),
+    ])
+    if config.run.api_key:
+        cmd.extend(["--api-key", config.run.api_key])
+    cmd.extend(case.serve_profile.args)
+    return cmd
+
+
+def build_serve_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                            run_dir: Path) -> list[str]:
+    """按 serve_profile.engine 分派服务启动命令。args 原样透传，不做参数翻译。"""
+    if case.serve_profile.engine == "sglang":
+        return _build_sglang_run_command(config, case, run_dir)
+    return build_vllm_run_command(config, case, run_dir)
+
+
+def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                              run_dir: Path) -> list[str]:
+    resolved_run_dir = Path(run_dir).resolve()
+    cmd = [
+        "docker", "run", "-d",
+        "--name", case.container_name,
+        "--label", f"{NETWORK_MANAGED_LABEL}=true",
+        "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
+        "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
+        "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
+        "--gpus", case.serve_profile.gpus,
+        "--network", config.run.network,
+        "-v", f"{config.mounts.models}:/models:ro",
+        "--entrypoint", "python3",
+    ]
+    if config.run.publish_host_port:
+        if config.run.host_port is None:
+            raise ConfigError("host_port is required when publish_host_port=true")
+        cmd.extend(["-p", f"127.0.0.1:{config.run.host_port}:{config.run.container_port}"])
+    cmd.extend([
+        config.run.images["sglang"],
+        "-m", "sglang.launch_server",
+        "--model-path", case.model.model_path,
+        "--host", "0.0.0.0",
+        "--port", str(config.run.container_port),
+        "--served-model-name", case.api_model_name,
     ])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
@@ -1033,7 +1126,7 @@ def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
     inspect = runner.run(["docker", "inspect", case.container_name], check=False)
     (layout.serve_dir / "docker.inspect.json").write_text(inspect.stdout, encoding="utf-8")
     (layout.serve_dir / "serve_command.txt").write_text(
-        " ".join(build_vllm_run_command(config, case, layout.run_dir)),
+        " ".join(build_serve_run_command(config, case, layout.run_dir)),
         encoding="utf-8",
     )
 
@@ -1354,6 +1447,8 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(item) for item in value]
     if isinstance(value, list):
         return [_jsonable(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if hasattr(value, "__dataclass_fields__"):
@@ -1507,7 +1602,7 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
         for group_cases in _group_cases_by_serve(cases).values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
-            print_cmd(build_vllm_run_command(config, serve_case, serve_layout.run_dir))
+            print_cmd(build_serve_run_command(config, serve_case, serve_layout.run_dir))
             for case in group_cases:
                 layout = build_layout(config, run_id, case)
                 print_cmd(build_bench_run_command(config, case, layout.bench_dir))
@@ -1568,12 +1663,12 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         for group_cases in grouped.values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
-            vllm_cmd = build_vllm_run_command(config, serve_case, serve_layout.run_dir)
+            serve_cmd = build_serve_run_command(config, serve_case, serve_layout.run_dir)
             started = False
             cleanup_container = False
             try:
                 if dry_run:
-                    print_cmd(vllm_cmd)
+                    print_cmd(serve_cmd)
                     ready = True
                 else:
                     cleanup_container = True
@@ -1582,7 +1677,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         serve_case,
                         serve_layout.run_dir,
                     )
-                    start_result = active_runner.run(vllm_cmd, check=False)
+                    start_result = active_runner.run(serve_cmd, check=False)
                     started = start_result.returncode == 0
                     if not started:
                         ready = False
@@ -1733,6 +1828,12 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         raise stop_requested
             if interrupted:
                 break
+
+        if not dry_run and not interrupted:
+            try:
+                aggregate_compare(config, run_dir)
+            except Exception as exc:
+                logger.warning("结果对比聚合失败：%s", exc)
 
         write_state(run_dir, finished_state(run_id, manifest))
     except StopRequested as exc:
