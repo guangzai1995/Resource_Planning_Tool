@@ -2960,3 +2960,17 @@ def test_shipped_sglang_compare_config_parses():
     assert engines == {"vllm", "sglang"}
     assert "vllm" in config.run.images
     assert "sglang" in config.run.images
+
+
+def test_controller_dry_run_prints_sglang_command(tmp_path, capsys):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
+    data["serve_profiles"][0]["engine"] = "sglang"
+    config = ab.load_config(write_config(tmp_path, data))
+
+    ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+    out = capsys.readouterr().out
+    assert "sglang.launch_server" in out
+    assert "sglang:latest" in out
+    assert "--model-path" in out
