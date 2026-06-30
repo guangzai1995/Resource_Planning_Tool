@@ -120,6 +120,8 @@ class RequestFuncOutput:
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
     finish_reason: str = ""  # 停止原因（"length"/"stop"/...），来自末帧 choices[0].finish_reason
+    cached_tokens: int = 0   # 命中 prefix cache 的 prompt token 数（来自 usage.cached_tokens）
+    cached_reported: bool = False  # 服务端是否在 usage 中上报了 cached_tokens 字段
 
 
 class RequestFunc(Protocol):
@@ -129,6 +131,21 @@ class RequestFunc(Protocol):
         session: aiohttp.ClientSession,
         pbar: tqdm | None = None,
     ) -> Awaitable[RequestFuncOutput]: ...
+
+
+def _extract_cached_tokens(usage: dict) -> int | None:
+    """从 usage 取缓存命中的 prompt token 数。
+
+    OpenAI 标准：嵌套于 prompt_tokens_details.cached_tokens；
+    兼容回退：平铺于 usage.cached_tokens。
+    任一存在即返回 int 值；都不存在返回 None（表示服务端未上报）。
+    """
+    details = usage.get("prompt_tokens_details") or {}
+    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+        return int(details["cached_tokens"])
+    if usage.get("cached_tokens") is not None:
+        return int(usage["cached_tokens"])
+    return None
 
 
 def _validate_api_url(
@@ -268,6 +285,9 @@ async def async_request_openai_completions(
                                     output.output_tokens = ct
                                 if (pt := usage.get("prompt_tokens")) is not None:
                                     output.prompt_len = pt
+                                if (cached := _extract_cached_tokens(usage)) is not None:
+                                    output.cached_tokens = cached
+                                    output.cached_reported = True
                 if first_chunk_received:
                     output.success = True
                 else:
@@ -455,6 +475,9 @@ async def async_request_openai_chat_completions(
                                     output.output_tokens = ct
                                 if (pt := usage.get("prompt_tokens")) is not None:
                                     output.prompt_len = pt
+                                if (cached := _extract_cached_tokens(usage)) is not None:
+                                    output.cached_tokens = cached
+                                    output.cached_reported = True
 
                 output.generated_text = generated_text
                 output.success = True

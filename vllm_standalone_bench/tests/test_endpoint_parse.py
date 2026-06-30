@@ -94,3 +94,50 @@ def test_usage_without_completion_tokens_keeps_zero():
     assert out.success
     assert out.output_tokens == 0          # 不是 None
     assert out.prompt_len == 3
+
+
+def test_chat_parses_cached_tokens_nested():
+    """OpenAI 标准：usage.prompt_tokens_details.cached_tokens（嵌套）。"""
+    completions_fn, chat_fn, RequestFuncInput = _load()
+    chunks = sse(
+        {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "length"}],
+         "usage": {"prompt_tokens": 100, "completion_tokens": 8,
+                   "prompt_tokens_details": {"cached_tokens": 80}}},
+        "[DONE]",
+    )
+    out = _run(chat_fn, RequestFuncInput, "/v1/chat/completions", chunks)
+    assert out.success
+    assert out.cached_tokens == 80
+    assert out.cached_reported is True
+
+
+def test_completions_parses_cached_tokens_flat():
+    """兼容：部分版本平铺为 usage.cached_tokens。"""
+    completions_fn, chat_fn, RequestFuncInput = _load()
+    chunks = sse(
+        {"choices": [{"text": "ab", "finish_reason": None}]},
+        {"choices": [{"text": "", "finish_reason": "length"}],
+         "usage": {"prompt_tokens": 100, "completion_tokens": 8,
+                   "cached_tokens": 60}},
+        "[DONE]",
+    )
+    out = _run(completions_fn, RequestFuncInput, "/v1/completions", chunks)
+    assert out.success
+    assert out.cached_tokens == 60
+    assert out.cached_reported is True
+
+
+def test_cached_tokens_absent_keeps_zero_and_unreported():
+    """服务端未上报 cached_tokens（如未开 prefix caching）：保持 0、reported=False。"""
+    completions_fn, chat_fn, RequestFuncInput = _load()
+    chunks = sse(
+        {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "length"}],
+         "usage": {"prompt_tokens": 100, "completion_tokens": 8}},
+        "[DONE]",
+    )
+    out = _run(chat_fn, RequestFuncInput, "/v1/chat/completions", chunks)
+    assert out.success
+    assert out.cached_tokens == 0
+    assert out.cached_reported is False
