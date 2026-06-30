@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -25,6 +26,7 @@ NETWORK_RUN_ID_LABEL = "vllm_auto_bench.run_id"
 CONTAINER_RUN_DIR_LABEL = "vllm_auto_bench.run_dir"
 CONTAINER_MODEL_LABEL = "vllm_auto_bench.model"
 CONTAINER_SERVE_PROFILE_LABEL = "vllm_auto_bench.serve_profile"
+CONTAINER_BENCH_PROFILE_LABEL = "vllm_auto_bench.bench_profile"
 
 
 class ConfigError(ValueError):
@@ -245,6 +247,13 @@ def _backend(value: Any, field_name: str) -> str:
     return backend
 
 
+def _network_name(value: Any, field_name: str) -> str:
+    network = _string(value, field_name)
+    if network in {"host", "none"}:
+        raise ConfigError(f"{field_name} must be a Docker bridge network, not {network!r}")
+    return network
+
+
 def _positive_int_list(value: Any, field_name: str) -> tuple[int, ...]:
     if not isinstance(value, list) or not value:
         raise ConfigError(f"{field_name} must be a non-empty list")
@@ -279,7 +288,7 @@ def _parse_run(data: dict[str, Any]) -> RunConfig:
                                  "run.results_dir")),
         vllm_image=_string(_required(run, "vllm_image", "run.vllm_image"), "run.vllm_image"),
         bench_image=_string(_required(run, "bench_image", "run.bench_image"), "run.bench_image"),
-        network=_string(run.get("network", "vllm-bench-net"), "run.network"),
+        network=_network_name(run.get("network", "vllm-bench-net"), "run.network"),
         create_network=_bool(run.get("create_network", True), "run.create_network"),
         cleanup_network=_bool(run.get("cleanup_network", True), "run.cleanup_network"),
         container_port=_positive_int(run.get("container_port", 8000), "run.container_port"),
@@ -420,12 +429,19 @@ def make_run_id(run_name: str, now: float | None = None) -> str:
     safe_run_name = _safe_name(run_name, "run.name")
     resolved_now = time.time() if now is None else now
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(resolved_now))
-    return f"{safe_run_name}_{stamp}"
+    return f"{safe_run_name}_{stamp}_{secrets.token_hex(3)}"
 
 
 def make_container_name(model: ModelConfig, serve_profile: ServeProfile, run_id: str) -> str:
     safe_run_id = _safe_name(run_id, "run_id")
     return f"bench-vllm-{model.name}-{serve_profile.name}-{safe_run_id}"
+
+
+def make_bench_container_name(case: BenchmarkCase) -> str:
+    return (
+        f"bench-runner-{case.model.name}-{case.serve_profile.name}-"
+        f"{case.bench_profile.name}-{_safe_name(case.run_id, 'run_id')}"
+    )
 
 
 def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[BenchmarkCase, ...]:
@@ -492,8 +508,16 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                             bench_dir: Path) -> list[str]:
     bench = case.bench_profile
     resolved_bench_dir = Path(bench_dir).resolve()
+    resolved_run_dir = resolved_bench_dir.parents[2]
     cmd = [
         "docker", "run", "--rm",
+        "--name", make_bench_container_name(case),
+        "--label", f"{NETWORK_MANAGED_LABEL}=true",
+        "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
+        "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
+        "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
+        "--label", f"{CONTAINER_BENCH_PROFILE_LABEL}={case.bench_profile.name}",
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
         "-v", f"{resolved_bench_dir}:/results",
@@ -631,6 +655,21 @@ def docker_network_exists(runner: Runner, network: str) -> bool:
     return result.returncode == 0
 
 
+def docker_network_driver(runner: Runner, network: str) -> str | None:
+    result = runner.run([
+        "docker", "network", "inspect", "--format", "{{.Driver}}", network,
+    ], check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def validate_bridge_network_driver(runner: Runner, network: str) -> None:
+    driver = docker_network_driver(runner, network)
+    if driver != "bridge":
+        raise RuntimeError(f"Docker network must use bridge driver: {network} ({driver or 'unknown'})")
+
+
 def build_network_create_command(config: AutoBenchConfig, run_id: str) -> list[str]:
     return [
         "docker", "network", "create",
@@ -648,6 +687,7 @@ def ensure_network(config: AutoBenchConfig, runner: Runner,
             return True
         return False
     if docker_network_exists(runner, config.run.network):
+        validate_bridge_network_driver(runner, config.run.network)
         return False
     if not config.run.create_network:
         raise RuntimeError(f"Docker network does not exist: {config.run.network}")
@@ -724,6 +764,17 @@ def vllm_container_labels_match(labels: dict[str, str],
     )
 
 
+def bench_container_labels_match(labels: dict[str, str],
+                                 case: BenchmarkCase,
+                                 run_dir: Path) -> bool:
+    return (
+        vllm_container_labels_match(labels, case, run_dir)
+        and labels.get(CONTAINER_MODEL_LABEL) == case.model.name
+        and labels.get(CONTAINER_SERVE_PROFILE_LABEL) == case.serve_profile.name
+        and labels.get(CONTAINER_BENCH_PROFILE_LABEL) == case.bench_profile.name
+    )
+
+
 def remove_existing_vllm_container_if_owned(runner: Runner, case: BenchmarkCase,
                                             run_dir: Path) -> None:
     labels = inspect_container_labels(runner, case.container_name)
@@ -747,6 +798,29 @@ def stop_and_remove_vllm_container_if_owned(runner: Runner, case: BenchmarkCase,
     if not vllm_container_labels_match(labels, case, run_dir):
         return
     stop_and_remove_container(runner, case.container_name, dry_run=False)
+
+
+def remove_existing_bench_container_if_owned(runner: Runner, case: BenchmarkCase,
+                                             run_dir: Path) -> bool:
+    container_name = make_bench_container_name(case)
+    labels = inspect_container_labels(runner, container_name)
+    if labels is None:
+        return True
+    if not bench_container_labels_match(labels, case, run_dir):
+        return False
+    stop_and_remove_container(runner, container_name, dry_run=False)
+    return True
+
+
+def cleanup_bench_container_if_owned(runner: Runner, case: BenchmarkCase,
+                                     run_dir: Path) -> None:
+    container_name = make_bench_container_name(case)
+    labels = inspect_container_labels(runner, container_name)
+    if labels is None:
+        return
+    if not bench_container_labels_match(labels, case, run_dir):
+        return
+    stop_and_remove_container(runner, container_name, dry_run=False)
 
 
 def cleanup_network(config: AutoBenchConfig, runner: Runner,
@@ -992,6 +1066,45 @@ def stop_and_remove_container(runner: Runner, container_name: str, dry_run: bool
         raise stop_requested
 
 
+def is_process_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def active_run_pid(run_dir: Path) -> int | None:
+    state_path = run_dir / "state.json"
+    pid_path = run_dir / "controller.pid"
+    if not state_path.exists() or not pid_path.exists():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    if state.get("status") not in ("starting", "running"):
+        return None
+    if pid <= 1 or not is_process_running(pid):
+        return None
+    return pid
+
+
+def reject_active_run(run_dir: Path, *, allow_pid: int | None = None) -> bool:
+    pid = active_run_pid(run_dir)
+    if pid is None or pid == allow_pid:
+        return False
+    print(f"run is already active: {run_dir} (pid {pid})", file=sys.stderr)
+    return True
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -1175,6 +1288,8 @@ def run_controller(config: AutoBenchConfig, run_id: str,
 
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
+    if reject_active_run(run_dir, allow_pid=os.getpid()):
+        return 1
     manifest = Manifest(run_id=run_id, total=len(cases))
 
     network_owned = False
@@ -1186,6 +1301,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         validate_local_paths(config)
 
         if docker_network_exists(active_runner, config.run.network):
+            validate_bridge_network_driver(active_runner, config.run.network)
             network_owned = False
         else:
             if not config.run.create_network:
@@ -1264,14 +1380,43 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         status = "passed"
                         error = None
                     else:
-                        with (layout.bench_dir / "bench.log").open("w", encoding="utf-8") as log:
-                            result = active_runner.run(
-                                bench_cmd,
-                                check=False,
-                                capture=False,
-                                stdout=log,
-                                stderr=log,
+                        if not remove_existing_bench_container_if_owned(
+                            active_runner,
+                            case,
+                            layout.run_dir,
+                        ):
+                            raise RuntimeError(
+                                "benchmark container exists but is not owned by this run: "
+                                f"{make_bench_container_name(case)}"
                             )
+                        bench_interrupted: BaseException | None = None
+                        try:
+                            with (layout.bench_dir / "bench.log").open(
+                                "w",
+                                encoding="utf-8",
+                            ) as log:
+                                result = active_runner.run(
+                                    bench_cmd,
+                                    check=False,
+                                    capture=False,
+                                    stdout=log,
+                                    stderr=log,
+                                )
+                        except (StopRequested, KeyboardInterrupt) as exc:
+                            bench_interrupted = exc
+                            raise
+                        finally:
+                            try:
+                                cleanup_bench_container_if_owned(
+                                    active_runner,
+                                    case,
+                                    layout.run_dir,
+                                )
+                            except (StopRequested, KeyboardInterrupt):
+                                if bench_interrupted is None:
+                                    raise
+                            except Exception:
+                                pass
                         status = "passed" if result.returncode == 0 else "failed"
                         error = None if result.returncode == 0 else (
                             f"benchmark exited {result.returncode}"
@@ -1416,6 +1561,8 @@ def _detached_state(run_id: str, status: str, total: int,
 
 def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> int:
     run_dir = config.run.results_dir / run_id
+    if reject_active_run(run_dir):
+        return 1
     run_dir.mkdir(parents=True, exist_ok=True)
     cases = expand_cases(config, run_id=run_id)
     total = len(cases)

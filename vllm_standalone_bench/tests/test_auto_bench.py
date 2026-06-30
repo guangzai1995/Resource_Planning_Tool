@@ -92,11 +92,28 @@ def test_load_config_applies_defaults_and_expands_cases(tmp_path):
     assert cases[0].container_name.startswith("bench-vllm-qwen2_5_1_5b-bf16_default-")
 
 
+def test_make_run_id_is_unique_within_same_second():
+    first = ab.make_run_id("smoke", now=1782849600.0)
+    second = ab.make_run_id("smoke", now=1782849600.0)
+
+    assert first != second
+    assert ab.SAFE_NAME_RE.fullmatch(first)
+    assert ab.SAFE_NAME_RE.fullmatch(second)
+
+
 def test_invalid_name_is_rejected(tmp_path):
     data = minimal_config(tmp_path)
     data["models"][0]["name"] = "bad/name"
 
     with pytest.raises(ab.ConfigError, match="safe filename"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_host_network_is_rejected(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["network"] = "host"
+
+    with pytest.raises(ab.ConfigError, match="bridge|host|network"):
         ab.load_config(write_config(tmp_path, data))
 
 
@@ -226,6 +243,23 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert value_after(cmd, "--output-xlsx") == "/results/result.xlsx"
 
 
+def test_build_bench_command_includes_name_and_ownership_labels(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = tmp_path / "results" / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
+
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+
+    assert value_after(cmd, "--name") == "bench-runner-qwen2_5_1_5b-bf16_default-smoke-run123"
+    labels = values_after(cmd, "--label")
+    assert "vllm_auto_bench.managed=true" in labels
+    assert "vllm_auto_bench.run_id=run123" in labels
+    assert f"vllm_auto_bench.run_dir={(tmp_path / 'results' / 'run123').resolve()}" in labels
+    assert "vllm_auto_bench.model=qwen2_5_1_5b" in labels
+    assert "vllm_auto_bench.serve_profile=bf16_default" in labels
+    assert "vllm_auto_bench.bench_profile=smoke" in labels
+
+
 def test_network_cleanup_only_removes_owned_empty_network():
     assert ab.should_cleanup_network(owned=True, cleanup_enabled=True, connected_containers=[]) is True
     assert ab.should_cleanup_network(owned=False, cleanup_enabled=True, connected_containers=[]) is False
@@ -332,6 +366,8 @@ class FakeRunner:
             if labels is None:
                 return ab.Completed(list(args), 1, "", "not found")
             return ab.Completed(list(args), 0, json.dumps(labels) + "\n", "")
+        if args[:5] == ["docker", "network", "inspect", "--format", "{{.Driver}}"]:
+            return ab.Completed(list(args), 0, "bridge\n", "")
         if args[:4] == ["docker", "network", "inspect", "--format"]:
             return ab.Completed(
                 list(args),
@@ -383,6 +419,14 @@ def ready_probe_commands(commands):
     ]
 
 
+def bench_run_commands(commands):
+    return [
+        command for command in commands
+        if command[:3] == ["docker", "run", "--rm"]
+        and any("run_bench_multi.py" in str(arg) for arg in command)
+    ]
+
+
 def network_create_command(commands):
     for command in commands:
         if command[:3] == ["docker", "network", "create"]:
@@ -418,6 +462,33 @@ def test_network_create_command_has_ownership_labels(tmp_path):
     assert result == 0
     assert "vllm_auto_bench.managed=true" in labels
     assert "vllm_auto_bench.run_id=run123" in labels
+
+
+def test_controller_rejects_existing_non_bridge_network(tmp_path):
+    class HostNetworkRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if args[:3] == ["docker", "network", "inspect"] and len(args) == 4:
+                self.commands.append(list(args))
+                return ab.Completed(list(args), 0, "network\n", "")
+            if args[:5] == ["docker", "network", "inspect", "--format", "{{.Driver}}"]:
+                self.commands.append(list(args))
+                return ab.Completed(list(args), 0, "host\n", "")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = HostNetworkRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 1
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
 def test_controller_does_not_remove_network_with_other_run_label(tmp_path):
@@ -753,6 +824,59 @@ def test_ready_probe_label_mismatch_fails_closed_without_removing_container(tmp_
     assert not any(command[:3] == ["docker", "stop", probe_name] for command in runner.commands)
     assert not any(command[:4] == ["docker", "rm", "-f", probe_name] for command in runner.commands)
     assert runner.container_labels[probe_name]["vllm_auto_bench.run_id"] == "other-run"
+
+
+def test_controller_stop_during_bench_removes_owned_bench_container(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    bench_name = "bench-runner-qwen2_5_1_5b-bf16_default-smoke-run123"
+
+    class StopBenchRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if bench_run_commands([list(args)]):
+                self.commands.append(list(args))
+                self.container_labels[value_after(args, "--name")] = {
+                    label.split("=", 1)[0]: label.split("=", 1)[1]
+                    for label in values_after(args, "--label")
+                    if "=" in label
+                }
+                raise ab.StopRequested("bench interrupted")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    runner = StopBenchRunner()
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 130
+    assert any(command[:3] == ["docker", "stop", bench_name] for command in runner.commands)
+    assert any(command[:4] == ["docker", "rm", "-f", bench_name] for command in runner.commands)
+
+
+def test_controller_rejects_existing_bench_container_with_foreign_labels(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    bench_name = "bench-runner-qwen2_5_1_5b-bf16_default-smoke-run123"
+    runner = FakeRunner()
+    runner.container_labels[bench_name] = {
+        "vllm_auto_bench.managed": "true",
+        "vllm_auto_bench.run_id": "other-run",
+        "vllm_auto_bench.run_dir": str((tmp_path / "other-results" / "run123").resolve()),
+    }
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 1
+    assert bench_run_commands(runner.commands) == []
+    assert not any(command[:3] == ["docker", "stop", bench_name] for command in runner.commands)
+    assert not any(command[:4] == ["docker", "rm", "-f", bench_name] for command in runner.commands)
+    assert runner.container_labels[bench_name]["vllm_auto_bench.run_id"] == "other-run"
 
 
 def test_controller_published_port_ready_uses_localhost(tmp_path, monkeypatch):
@@ -2032,6 +2156,56 @@ def test_start_detached_uses_devnull_stdin(tmp_path, monkeypatch):
     assert exit_code == 0
     assert calls
     assert calls[0][1]["stdin"] is ab.subprocess.DEVNULL
+
+
+def test_start_detached_rejects_existing_active_run_dir(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    monkeypatch.setattr(ab, "is_process_running", lambda pid: pid == 12345, raising=False)
+
+    def fail_popen(*args, **kwargs):
+        raise AssertionError("active run should not start another controller")
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fail_popen)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "running"
+    assert "active" in captured.err
+
+
+def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    monkeypatch.setattr(ab, "is_process_running", lambda pid: pid == 12345, raising=False)
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert state["status"] == "running"
+    assert "active" in captured.err
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
 def test_start_detached_popen_failure_writes_failed_state(tmp_path, monkeypatch, capsys):
