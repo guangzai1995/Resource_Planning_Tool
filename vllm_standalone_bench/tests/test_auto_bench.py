@@ -92,11 +92,28 @@ def test_load_config_applies_defaults_and_expands_cases(tmp_path):
     assert cases[0].container_name.startswith("bench-vllm-qwen2_5_1_5b-bf16_default-")
 
 
+def test_make_run_id_is_unique_within_same_second():
+    first = ab.make_run_id("smoke", now=1782849600.0)
+    second = ab.make_run_id("smoke", now=1782849600.0)
+
+    assert first != second
+    assert ab.SAFE_NAME_RE.fullmatch(first)
+    assert ab.SAFE_NAME_RE.fullmatch(second)
+
+
 def test_invalid_name_is_rejected(tmp_path):
     data = minimal_config(tmp_path)
     data["models"][0]["name"] = "bad/name"
 
     with pytest.raises(ab.ConfigError, match="safe filename"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_host_network_is_rejected(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["network"] = "host"
+
+    with pytest.raises(ab.ConfigError, match="bridge|host|network"):
         ab.load_config(write_config(tmp_path, data))
 
 
@@ -226,6 +243,23 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert value_after(cmd, "--output-xlsx") == "/results/result.xlsx"
 
 
+def test_build_bench_command_includes_name_and_ownership_labels(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = tmp_path / "results" / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
+
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+
+    assert value_after(cmd, "--name") == "bench-runner-qwen2_5_1_5b-bf16_default-smoke-run123"
+    labels = values_after(cmd, "--label")
+    assert "vllm_auto_bench.managed=true" in labels
+    assert "vllm_auto_bench.run_id=run123" in labels
+    assert f"vllm_auto_bench.run_dir={(tmp_path / 'results' / 'run123').resolve()}" in labels
+    assert "vllm_auto_bench.model=qwen2_5_1_5b" in labels
+    assert "vllm_auto_bench.serve_profile=bf16_default" in labels
+    assert "vllm_auto_bench.bench_profile=smoke" in labels
+
+
 def test_network_cleanup_only_removes_owned_empty_network():
     assert ab.should_cleanup_network(owned=True, cleanup_enabled=True, connected_containers=[]) is True
     assert ab.should_cleanup_network(owned=False, cleanup_enabled=True, connected_containers=[]) is False
@@ -258,6 +292,26 @@ def test_case_paths_and_state_files_are_written(tmp_path):
     })
     state = json.loads((layout.run_dir / "state.json").read_text(encoding="utf-8"))
     assert state["status"] == "running"
+
+
+def test_write_json_atomic_uses_unique_tmp_for_interleaved_writes(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    original_replace = Path.replace
+    triggered = False
+
+    def interleaved_replace(self, target):
+        nonlocal triggered
+        if Path(target) == path and not triggered:
+            triggered = True
+            ab.write_json_atomic(path, {"writer": "nested"})
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", interleaved_replace)
+
+    ab.write_json_atomic(path, {"writer": "outer"})
+
+    assert triggered is True
+    assert json.loads(path.read_text(encoding="utf-8"))["writer"] == "outer"
 
 
 def test_manifest_records_relative_artifact_paths(tmp_path):
@@ -332,6 +386,8 @@ class FakeRunner:
             if labels is None:
                 return ab.Completed(list(args), 1, "", "not found")
             return ab.Completed(list(args), 0, json.dumps(labels) + "\n", "")
+        if args[:5] == ["docker", "network", "inspect", "--format", "{{.Driver}}"]:
+            return ab.Completed(list(args), 0, "bridge\n", "")
         if args[:4] == ["docker", "network", "inspect", "--format"]:
             return ab.Completed(
                 list(args),
@@ -383,6 +439,14 @@ def ready_probe_commands(commands):
     ]
 
 
+def bench_run_commands(commands):
+    return [
+        command for command in commands
+        if command[:3] == ["docker", "run", "--rm"]
+        and any("run_bench_multi.py" in str(arg) for arg in command)
+    ]
+
+
 def network_create_command(commands):
     for command in commands:
         if command[:3] == ["docker", "network", "create"]:
@@ -418,6 +482,33 @@ def test_network_create_command_has_ownership_labels(tmp_path):
     assert result == 0
     assert "vllm_auto_bench.managed=true" in labels
     assert "vllm_auto_bench.run_id=run123" in labels
+
+
+def test_controller_rejects_existing_non_bridge_network(tmp_path):
+    class HostNetworkRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if args[:3] == ["docker", "network", "inspect"] and len(args) == 4:
+                self.commands.append(list(args))
+                return ab.Completed(list(args), 0, "network\n", "")
+            if args[:5] == ["docker", "network", "inspect", "--format", "{{.Driver}}"]:
+                self.commands.append(list(args))
+                return ab.Completed(list(args), 0, "host\n", "")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = HostNetworkRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 1
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
 def test_controller_does_not_remove_network_with_other_run_label(tmp_path):
@@ -753,6 +844,59 @@ def test_ready_probe_label_mismatch_fails_closed_without_removing_container(tmp_
     assert not any(command[:3] == ["docker", "stop", probe_name] for command in runner.commands)
     assert not any(command[:4] == ["docker", "rm", "-f", probe_name] for command in runner.commands)
     assert runner.container_labels[probe_name]["vllm_auto_bench.run_id"] == "other-run"
+
+
+def test_controller_stop_during_bench_removes_owned_bench_container(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    bench_name = "bench-runner-qwen2_5_1_5b-bf16_default-smoke-run123"
+
+    class StopBenchRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if bench_run_commands([list(args)]):
+                self.commands.append(list(args))
+                self.container_labels[value_after(args, "--name")] = {
+                    label.split("=", 1)[0]: label.split("=", 1)[1]
+                    for label in values_after(args, "--label")
+                    if "=" in label
+                }
+                raise ab.StopRequested("bench interrupted")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    runner = StopBenchRunner()
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 130
+    assert any(command[:3] == ["docker", "stop", bench_name] for command in runner.commands)
+    assert any(command[:4] == ["docker", "rm", "-f", bench_name] for command in runner.commands)
+
+
+def test_controller_rejects_existing_bench_container_with_foreign_labels(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    bench_name = "bench-runner-qwen2_5_1_5b-bf16_default-smoke-run123"
+    runner = FakeRunner()
+    runner.container_labels[bench_name] = {
+        "vllm_auto_bench.managed": "true",
+        "vllm_auto_bench.run_id": "other-run",
+        "vllm_auto_bench.run_dir": str((tmp_path / "other-results" / "run123").resolve()),
+    }
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 1
+    assert bench_run_commands(runner.commands) == []
+    assert not any(command[:3] == ["docker", "stop", bench_name] for command in runner.commands)
+    assert not any(command[:4] == ["docker", "rm", "-f", bench_name] for command in runner.commands)
+    assert runner.container_labels[bench_name]["vllm_auto_bench.run_id"] == "other-run"
 
 
 def test_controller_published_port_ready_uses_localhost(tmp_path, monkeypatch):
@@ -1165,6 +1309,72 @@ def test_parse_args_run_dry_run():
     assert args.command == "run"
     assert args.config == Path("c.json")
     assert args.dry_run is True
+
+
+def test_child_startup_exception_releases_lock_when_state_write_fails(tmp_path, monkeypatch):
+    calls = []
+
+    def fail_load_config(path):
+        raise ab.ConfigError("bad config")
+
+    def fail_startup_state(*args, **kwargs):
+        raise OSError("state write failed")
+
+    def fake_release(run_dir, token):
+        calls.append((run_dir, token))
+
+    monkeypatch.setattr(ab, "load_config", fail_load_config)
+    monkeypatch.setattr(ab, "write_child_startup_state", fail_startup_state)
+    monkeypatch.setattr(ab, "release_run_lock_for_token", fake_release)
+
+    exit_code = ab.main([
+        "run",
+        "--config",
+        str(tmp_path / "config.json"),
+        "--run-id",
+        "run123",
+        "--child",
+        "--results-dir",
+        str(tmp_path / "results"),
+        "--lock-token",
+        "token123",
+    ])
+
+    assert exit_code == 1
+    assert calls == [(tmp_path / "results" / "run123", "token123")]
+
+
+def test_child_startup_stop_releases_lock_when_state_write_fails(tmp_path, monkeypatch):
+    calls = []
+
+    def stop_during_signal_install():
+        raise ab.StopRequested("stopped")
+
+    def fail_startup_state(*args, **kwargs):
+        raise OSError("state write failed")
+
+    def fake_release(run_dir, token):
+        calls.append((run_dir, token))
+
+    monkeypatch.setattr(ab, "install_signal_handlers", stop_during_signal_install)
+    monkeypatch.setattr(ab, "write_child_startup_state", fail_startup_state)
+    monkeypatch.setattr(ab, "release_run_lock_for_token", fake_release)
+
+    exit_code = ab.main([
+        "run",
+        "--config",
+        str(tmp_path / "config.json"),
+        "--run-id",
+        "run123",
+        "--child",
+        "--results-dir",
+        str(tmp_path / "results"),
+        "--lock-token",
+        "token123",
+    ])
+
+    assert exit_code == 130
+    assert calls == [(tmp_path / "results" / "run123", "token123")]
 
 
 def test_main_status_reads_state_file(tmp_path, capsys):
@@ -2034,6 +2244,296 @@ def test_start_detached_uses_devnull_stdin(tmp_path, monkeypatch):
     assert calls[0][1]["stdin"] is ab.subprocess.DEVNULL
 
 
+def test_start_detached_rejects_existing_active_run_dir(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    monkeypatch.setattr(ab, "is_process_running", lambda pid: pid == 12345, raising=False)
+
+    def fail_popen(*args, **kwargs):
+        raise AssertionError("active run should not start another controller")
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fail_popen)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "running"
+    assert "active" in captured.err
+
+
+def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    monkeypatch.setattr(ab, "is_process_running", lambda pid: pid == 12345, raising=False)
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert state["status"] == "running"
+    assert "active" in captured.err
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_run_controller_rejects_active_state_without_pid_file(tmp_path, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert state["status"] == "running"
+    assert "active" in captured.err
+    assert not (run_dir / "config.resolved.json").exists()
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_run_controller_rejects_active_state_with_invalid_pid_file(tmp_path, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "starting",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    (run_dir / "controller.pid").write_text("not-a-pid\n", encoding="utf-8")
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert state["status"] == "starting"
+    assert "active" in captured.err
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".run.lock").write_text("locked\n", encoding="utf-8")
+
+    def fail_popen(*args, **kwargs):
+        raise AssertionError("locked run should not start another controller")
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fail_popen)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "active" in captured.err
+    assert (run_dir / ".run.lock").exists()
+
+
+def test_start_detached_invalid_run_id_does_not_create_lock_path(tmp_path):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+
+    with pytest.raises(ab.ConfigError, match="run_id"):
+        ab.start_detached(config_path, config, "bad/name")
+
+    assert not (tmp_path / "results" / "bad").exists()
+
+
+def test_run_controller_releases_lock_after_success(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    first_runner = FakeRunner()
+
+    first = ab.run_controller(config, run_id="run123", runner=first_runner, dry_run=False)
+    second = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert first == 0
+    assert second == 0
+    assert not (run_dir / ".run.lock").exists()
+
+
+def test_run_controller_reclaims_terminal_stale_lock(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "completed",
+        "current": None,
+        "counts": {"passed": 1, "failed": 0, "skipped": 0, "running": 0, "total": 1},
+    })
+    (run_dir / ".run.lock").write_text(
+        json.dumps({"pid": 12345, "token": "old-token", "created_at": 1.0}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ab, "is_process_running", lambda pid: False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert not (run_dir / ".run.lock").exists()
+
+
+def test_run_controller_does_not_delete_new_lock_after_stale_recheck(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "completed",
+        "current": None,
+        "counts": {"passed": 1, "failed": 0, "skipped": 0, "running": 0, "total": 1},
+    })
+    stale_payload = {"pid": 12345, "token": "old-token", "created_at": 1.0}
+    new_payload = {"pid": 67890, "token": "new-token", "created_at": 2.0}
+    (run_dir / ".run.lock").write_text(json.dumps(stale_payload), encoding="utf-8")
+    original_read_run_lock = ab._read_run_lock
+    reads = 0
+
+    def racing_read_run_lock(lock_run_dir):
+        nonlocal reads
+        reads += 1
+        payload = original_read_run_lock(lock_run_dir)
+        if reads == 1:
+            (run_dir / ".run.lock").write_text(json.dumps(new_payload), encoding="utf-8")
+        return payload
+
+    monkeypatch.setattr(ab, "_read_run_lock", racing_read_run_lock)
+    monkeypatch.setattr(ab, "is_process_running", lambda pid: False)
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "active" in captured.err
+    assert json.loads((run_dir / ".run.lock").read_text(encoding="utf-8")) == new_payload
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_release_run_lock_does_not_delete_replaced_lock(tmp_path, monkeypatch):
+    run_dir = tmp_path / "results" / "run123"
+    run_dir.mkdir(parents=True)
+    lock_path = run_dir / ".run.lock"
+    old_payload = {"pid": 12345, "token": "old-token", "created_at": 1.0}
+    new_payload = {"pid": 67890, "token": "new-token", "created_at": 2.0}
+    lock_path.write_text(json.dumps(old_payload), encoding="utf-8")
+    original_read_run_lock = ab._read_run_lock
+    reads = 0
+
+    def racing_read_run_lock(lock_run_dir):
+        nonlocal reads
+        reads += 1
+        payload = original_read_run_lock(lock_run_dir)
+        if reads == 1:
+            lock_path.write_text(json.dumps(new_payload), encoding="utf-8")
+        return payload
+
+    monkeypatch.setattr(ab, "_read_run_lock", racing_read_run_lock)
+
+    ab.release_run_lock(ab.RunLock(run_dir=run_dir, token="old-token"))
+
+    assert json.loads(lock_path.read_text(encoding="utf-8")) == new_payload
+
+
+def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeypatch, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    (run_dir / "controller.pid").write_text("12345\n", encoding="utf-8")
+    (run_dir / ".run.lock").write_text(
+        json.dumps({"pid": 12345, "token": "old-token", "created_at": 1.0}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ab, "is_process_running", lambda pid: False)
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "active" in captured.err
+    assert (run_dir / ".run.lock").exists()
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_run_controller_corrupt_lock_fail_closed(tmp_path, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "completed",
+        "current": None,
+        "counts": {"passed": 1, "failed": 0, "skipped": 0, "running": 0, "total": 1},
+    })
+    (run_dir / ".run.lock").write_text("not-json", encoding="utf-8")
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "active" in captured.err
+    assert (run_dir / ".run.lock").exists()
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_run_controller_releases_lock_when_cleanup_terminal_state_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+
+    monkeypatch.setattr(ab, "cleanup_network", lambda *args, **kwargs: True)
+
+    def fail_terminal_state(*args, **kwargs):
+        raise OSError("terminal state write failed")
+
+    monkeypatch.setattr(ab, "write_terminal_state", fail_terminal_state)
+
+    with pytest.raises(OSError, match="terminal state write failed"):
+        ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert not (run_dir / ".run.lock").exists()
+
+
 def test_start_detached_popen_failure_writes_failed_state(tmp_path, monkeypatch, capsys):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     config = ab.load_config(config_path)
@@ -2049,6 +2549,75 @@ def test_start_detached_popen_failure_writes_failed_state(tmp_path, monkeypatch,
     state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
     assert exit_code == 1
     assert state["status"] == "failed"
+    assert "spawn failed" in captured.err
+
+
+def test_start_detached_validate_local_paths_failure_releases_lock(tmp_path, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    config.models[0].host_model_path.rename(tmp_path / "missing-model")
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "failed"
+    assert "model path does not exist" in captured.err
+    assert not (run_dir / ".run.lock").exists()
+
+
+def test_start_detached_starting_state_write_failure_releases_lock(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    original_write_state = ab.write_state
+
+    def fail_starting_state(path, state):
+        if state.get("status") == "starting":
+            raise OSError("starting write failed")
+        return original_write_state(path, state)
+
+    monkeypatch.setattr(ab, "write_state", fail_starting_state)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "failed"
+    assert "starting write failed" in captured.err
+    assert not (run_dir / ".run.lock").exists()
+
+
+def test_start_detached_writes_failed_state_before_releasing_lock(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    real_release = ab.release_run_lock
+
+    def fail_popen(*args, **kwargs):
+        raise OSError("spawn failed")
+
+    def racing_release(lock):
+        real_release(lock)
+        ab.write_state(run_dir, {
+            "run_id": "run123",
+            "status": "running",
+            "current": None,
+            "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+        })
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(ab, "release_run_lock", racing_release)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "running"
     assert "spawn failed" in captured.err
 
 
@@ -2087,6 +2656,116 @@ def test_start_detached_pid_write_failure_terminates_child(tmp_path, monkeypatch
     assert process.terminated is True
     assert state["status"] == "failed"
     assert "pid write failed" in captured.err
+
+
+def test_start_detached_metadata_failure_keeps_child_lock_when_exit_unconfirmed(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    lock_path = run_dir / ".run.lock"
+    original_write_text = Path.write_text
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self):
+            self.terminated = False
+            self.wait_calls = 0
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            raise ab.subprocess.TimeoutExpired(cmd="controller", timeout=timeout)
+
+        def kill(self):
+            self.terminated = True
+
+    process = FakeProcess()
+
+    def fake_popen(*args, **kwargs):
+        return process
+
+    def fail_pid_write_after_child_takes_lock(self, *args, **kwargs):
+        if self.name == "controller.pid":
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            payload["pid"] = process.pid
+            lock_path.write_text(json.dumps(payload), encoding="utf-8")
+            raise OSError("pid write failed")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(Path, "write_text", fail_pid_write_after_child_takes_lock)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    lock_payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert process.terminated is True
+    assert process.wait_calls >= 1
+    assert state["status"] == "failed"
+    assert lock_payload["pid"] == process.pid
+    assert "pid write failed" in captured.err
+
+
+def test_start_detached_metadata_failure_releases_lock_after_child_exits(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    lock_path = run_dir / ".run.lock"
+    original_write_text = Path.write_text
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self):
+            self.terminated = False
+            self.wait_calls = 0
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            return 0
+
+    process = FakeProcess()
+
+    def fake_popen(*args, **kwargs):
+        return process
+
+    def fail_pid_write_after_child_takes_lock(self, *args, **kwargs):
+        if self.name == "controller.pid":
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            payload["pid"] = process.pid
+            lock_path.write_text(json.dumps(payload), encoding="utf-8")
+            raise OSError("pid write failed")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(Path, "write_text", fail_pid_write_after_child_takes_lock)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert process.terminated is True
+    assert process.wait_calls == 1
+    assert state["status"] == "failed"
+    assert "pid write failed" in captured.err
+    assert not lock_path.exists()
 
 
 def test_example_configs_are_parseable():
