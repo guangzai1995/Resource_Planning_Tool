@@ -1985,3 +1985,42 @@ def test_start_detached_pid_write_failure_terminates_child(tmp_path, monkeypatch
     assert process.terminated is True
     assert state["status"] == "failed"
     assert "pid write failed" in captured.err
+
+
+def test_example_configs_are_parseable():
+    root = Path(ab.__file__).resolve().parent
+    config_paths = [
+        root / "configs" / "auto_bench.example.json",
+        root / "configs" / "auto_bench.qwen2_5_1_5b.smoke.json",
+    ]
+
+    for path in config_paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        config = ab.load_config(path)
+
+        assert config.run.network == "vllm-bench-net"
+        assert config.run.publish_host_port is False
+        assert config.run.vllm_image == "009e4cb46541"
+        assert config.run.bench_image == "vllm-bench-runner:offline"
+        assert config.models
+        assert config.serve_profiles
+        assert config.bench_profiles
+        assert any(
+            model["model_path"] == "/models/Qwen2.5-1.5B-Instruct"
+            for model in data["models"]
+        )
+
+
+def test_bench_runner_dockerfile_contains_offline_dependencies():
+    root = Path(ab.__file__).resolve().parent
+    dockerfile = (root / "Dockerfile.bench-runner").read_text(encoding="utf-8")
+
+    for expected in [
+        "openpyxl",
+        "modelscope",
+        "run_bench_multi.py",
+        "run_bench_serve.py",
+        "vllm_bench",
+        "requirements.txt",
+    ]:
+        assert expected in dockerfile
