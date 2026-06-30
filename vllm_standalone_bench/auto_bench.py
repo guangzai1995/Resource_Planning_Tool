@@ -1079,6 +1079,12 @@ def is_process_running(pid: int) -> bool:
 
 
 RUN_LOCK_FILE = ".run.lock"
+TERMINAL_RUN_STATUSES = frozenset({
+    "completed",
+    "completed_with_failures",
+    "failed",
+    "interrupted",
+})
 
 
 @dataclass(frozen=True)
@@ -1105,6 +1111,14 @@ def _read_run_lock(run_dir: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _read_run_state(run_dir: Path) -> dict[str, Any] | None:
+    try:
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return state if isinstance(state, dict) else None
 
 
 def run_lock_token_matches(run_dir: Path, token: str | None) -> bool:
@@ -1153,6 +1167,28 @@ def release_run_lock_for_token(run_dir: Path | None, token: str | None) -> None:
     if run_dir is None or token is None:
         return
     release_run_lock(RunLock(run_dir=run_dir, token=token))
+
+
+def cleanup_stale_terminal_run_lock(run_dir: Path, lock_token: str | None = None) -> bool:
+    if run_lock_token_matches(run_dir, lock_token):
+        return False
+    state = _read_run_state(run_dir)
+    if state is None or state.get("status") not in TERMINAL_RUN_STATUSES:
+        return False
+    payload = _read_run_lock(run_dir)
+    if payload is None:
+        return False
+    pid = payload.get("pid")
+    if type(pid) is not int or pid <= 1:
+        return False
+    if is_process_running(pid):
+        return False
+    try:
+        run_lock_path(run_dir).unlink()
+    except OSError:
+        return False
+    print(f"cleaned stale run lock: {run_dir}", file=sys.stderr)
+    return True
 
 
 def active_state_blocks_start(run_dir: Path, *, allow_pid: int | None = None,
@@ -1212,6 +1248,8 @@ def reject_active_run(run_dir: Path, *, allow_pid: int | None = None,
     if active_state_blocks_start(run_dir, allow_pid=allow_pid, lock_token=lock_token):
         return True
     if run_lock_path(run_dir).exists() and not run_lock_token_matches(run_dir, lock_token):
+        if cleanup_stale_terminal_run_lock(run_dir, lock_token=lock_token):
+            return False
         print(f"run is already active: {run_dir}", file=sys.stderr)
         return True
     pid = active_run_pid(run_dir)
