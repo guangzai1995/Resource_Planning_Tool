@@ -488,6 +488,8 @@ def save_xlsx(rows: List[dict], path: str) -> None:
         ('input_throughput_tok_s', '输入 Token 系统吞吐量', 'total_input_tokens ÷ benchmark_duration'),
         ('prefill_effective_tok_s', 'Prefill 有效速率', 'avg_input_tokens ÷ mean_TTFT_s；TTFT 含排队、调度和首 token'),
         ('decode_effective_tok_s', 'Decode 有效速率', '1 ÷ mean_TPOT_s；基于 TPOT 的 next-token decode 近似速率'),
+        ('avg_cached_tokens', '平均缓存命中 tokens', 'total_cached_tokens ÷ completed（服务端 usage.cached_tokens 累计）'),
+        ('cache_hit_rate', '缓存命中率(%)', 'total_cached_tokens ÷ total_input_tokens × 100（token 加权；仅服务端开启 prefix caching 时非零）'),
         ('P50/P90/P99', '百分位数', 'P90 表示 90% 请求低于该延迟值'),
         ('', '', ''),
         ('并发控制说明', '',
@@ -864,6 +866,7 @@ def main() -> None:
     print(
         f"{'输入':>6} {'输出':>6} {'并发':>5} "
         f"{'out_sys':>10} {'in_sys':>10} {'prefill':>10} {'decode':>10} {'req/s':>8} "
+        f"{'命中%':>8} "
         f"{'TTFT均值':>10} {'TTFT_P90':>10} "
         f"{'TPOT均值':>10} {'E2EL均值':>10} {'成功':>6}"
     )
@@ -876,6 +879,7 @@ def main() -> None:
             f"{r['prefill_effective_tok_s']:>10.1f} "
             f"{r['decode_effective_tok_s']:>10.1f} "
             f"{r['throughput_req_s']:>8.3f} "
+            f"{r['cache_hit_rate']:>8.1f} "
             f"{r['ttft_mean_ms']:>10.1f} {r['ttft_p90_ms']:>10.1f} "
             f"{r['tpot_mean_ms']:>10.3f} {r['e2el_mean_ms']:>10.1f} {r['n_success']:>6}"
         )
