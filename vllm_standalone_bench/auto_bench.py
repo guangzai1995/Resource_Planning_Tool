@@ -1799,6 +1799,43 @@ def _detached_state(run_id: str, status: str, total: int,
     return state
 
 
+def _wait_for_process_exit(process: Any, timeout_sec: float) -> bool:
+    try:
+        process.wait(timeout=timeout_sec)
+        return True
+    except StopRequested:
+        raise
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
+
+
+def terminate_detached_child(process: Any, timeout_sec: float = 5.0) -> bool:
+    try:
+        process.terminate()
+    except StopRequested:
+        raise
+    except ProcessLookupError:
+        return True
+    except Exception:
+        pass
+
+    if _wait_for_process_exit(process, timeout_sec):
+        return True
+
+    try:
+        process.kill()
+    except StopRequested:
+        raise
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+
+    return _wait_for_process_exit(process, timeout_sec)
+
+
 def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> int:
     _safe_name(run_id, "run_id")
     cases = expand_cases(config, run_id=run_id)
@@ -1817,13 +1854,13 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
     run_dir.mkdir(parents=True, exist_ok=True)
     total = len(cases)
 
-    def fail_start(error: str) -> int:
+    def fail_start(error: str, *, release_lock: bool = True) -> int:
         try:
             write_state(run_dir, _detached_state(run_id, "failed", total, error=error))
             print(f"failed to start detached controller: {error}", file=sys.stderr)
             return 1
         finally:
-            if run_lock is not None:
+            if release_lock and run_lock is not None:
                 release_run_lock(run_lock)
 
     try:
@@ -1863,12 +1900,10 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
         })
         update_run_lock_owner(run_lock, process.pid)
     except OSError as exc:
+        release_lock = True
         if process is not None:
-            try:
-                process.terminate()
-            except Exception:
-                pass
-        return fail_start(str(exc))
+            release_lock = terminate_detached_child(process)
+        return fail_start(str(exc), release_lock=release_lock)
     print(f"run_id: {run_id}")
     print(f"log: {log_path}")
     return 0

@@ -2567,6 +2567,116 @@ def test_start_detached_pid_write_failure_terminates_child(tmp_path, monkeypatch
     assert "pid write failed" in captured.err
 
 
+def test_start_detached_metadata_failure_keeps_child_lock_when_exit_unconfirmed(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    lock_path = run_dir / ".run.lock"
+    original_write_text = Path.write_text
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self):
+            self.terminated = False
+            self.wait_calls = 0
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            raise ab.subprocess.TimeoutExpired(cmd="controller", timeout=timeout)
+
+        def kill(self):
+            self.terminated = True
+
+    process = FakeProcess()
+
+    def fake_popen(*args, **kwargs):
+        return process
+
+    def fail_pid_write_after_child_takes_lock(self, *args, **kwargs):
+        if self.name == "controller.pid":
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            payload["pid"] = process.pid
+            lock_path.write_text(json.dumps(payload), encoding="utf-8")
+            raise OSError("pid write failed")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(Path, "write_text", fail_pid_write_after_child_takes_lock)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    lock_payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert process.terminated is True
+    assert process.wait_calls >= 1
+    assert state["status"] == "failed"
+    assert lock_payload["pid"] == process.pid
+    assert "pid write failed" in captured.err
+
+
+def test_start_detached_metadata_failure_releases_lock_after_child_exits(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    lock_path = run_dir / ".run.lock"
+    original_write_text = Path.write_text
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self):
+            self.terminated = False
+            self.wait_calls = 0
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            return 0
+
+    process = FakeProcess()
+
+    def fake_popen(*args, **kwargs):
+        return process
+
+    def fail_pid_write_after_child_takes_lock(self, *args, **kwargs):
+        if self.name == "controller.pid":
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            payload["pid"] = process.pid
+            lock_path.write_text(json.dumps(payload), encoding="utf-8")
+            raise OSError("pid write failed")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(Path, "write_text", fail_pid_write_after_child_takes_lock)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert process.terminated is True
+    assert process.wait_calls == 1
+    assert state["status"] == "failed"
+    assert "pid write failed" in captured.err
+    assert not lock_path.exists()
+
+
 def test_example_configs_are_parseable():
     root = Path(ab.__file__).resolve().parent
     config_paths = [
