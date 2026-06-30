@@ -14,6 +14,7 @@ from scripts.estimate_deepseek_v4_flash_ascend import (
     build_workbook,
     estimate_row,
     load_p800_baseline,
+    main,
     required_memory_per_card_gb,
     summarize_910b_reference,
 )
@@ -191,3 +192,23 @@ def test_build_workbook_writes_expected_sheets(tmp_path):
     assert loaded["05_910B低利用率参考"]["J2"].value == "低利用率参考，不参与估算校准"
     assert loaded["06_联网参考数据"]["A1"].value == "source_title"
     assert "CloudMatrix384" in loaded["06_联网参考数据"]["A4"].value
+
+
+def test_main_generates_output_file(tmp_path):
+    workbook = tmp_path / "资源规划工具.xlsx"
+    output = tmp_path / "estimate.xlsx"
+    write_baseline_workbook(workbook)
+
+    exit_code = main(
+        [
+            "--source-workbook",
+            str(workbook),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == 0
+    assert output.exists()

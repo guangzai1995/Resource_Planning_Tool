@@ -469,3 +469,28 @@ def build_workbook(*, source_workbook: Path, data_dir: Path, output_path: Path) 
         ws["A1"] = "DeepSeek v4 flash 910B/910C 8卡估算"
 
     return output_path
+
+
+def parse_args(argv: list[str] | None = None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-workbook", type=Path, default=Path("资源规划工具.xlsx"))
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--output", type=Path, default=Path("outputs") / OUTPUT_FILENAME)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    build_workbook(
+        source_workbook=args.source_workbook,
+        data_dir=args.data_dir,
+        output_path=args.output,
+    )
+    print(args.output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
