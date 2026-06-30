@@ -161,8 +161,8 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
     base.num_warmups = 0
 
     # ── warmup 固定并发/输出参数 ────────────────────────────────────────────
-    base.warmup_concurrency = our_args.warmup_concurrency
-    base.warmup_output_len = our_args.warmup_output_len
+    base.warmup_concurrency = getattr(our_args, 'warmup_concurrency', None)
+    base.warmup_output_len = getattr(our_args, 'warmup_output_len', None)
 
     return base
 
@@ -629,9 +629,8 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
             if is_first_run:
                 cfg.ready_check_timeout_sec = 600
                 # 固定并发预热：warmup_concurrency 设了则凑齐一波满并发，否则沿用 warmup_requests
-                cfg.num_warmups = (our_args.warmup_concurrency
-                                   if our_args.warmup_concurrency is not None
-                                   else our_args.warmup_requests)
+                warmup_cc = getattr(our_args, 'warmup_concurrency', None)
+                cfg.num_warmups = warmup_cc if warmup_cc is not None else our_args.warmup_requests
                 is_first_run = False
             else:
                 cfg.ready_check_timeout_sec = 0

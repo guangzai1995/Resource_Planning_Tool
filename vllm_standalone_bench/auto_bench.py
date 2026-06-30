@@ -221,8 +221,8 @@ def _non_negative_int(value: Any, field_name: str) -> int:
 def _optional_positive_int(value: Any, field_name: str) -> int | None:
     if value is None:
         return None
-    if type(value) is not int or isinstance(value, bool) or value <= 0:
-        raise ConfigError(f"{field_name} must be a positive int or null, got {value!r}")
+    if type(value) is not int or value <= 0:
+        raise ConfigError(f"{field_name} must be a positive integer or None, got {value!r}")
     return value
 
 
