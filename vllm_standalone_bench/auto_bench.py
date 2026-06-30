@@ -12,9 +12,10 @@ import signal
 import subprocess
 import sys
 import time
+import types
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -33,6 +34,9 @@ class ConfigError(ValueError):
     """Raised when the auto bench configuration is invalid."""
 
 
+SUPPORTED_ENGINES = ("vllm", "sglang")
+
+
 class StopRequested(Exception):
     """Raised when the detached controller is asked to stop gracefully."""
 
@@ -41,7 +45,6 @@ class StopRequested(Exception):
 class RunConfig:
     name: str
     results_dir: Path
-    vllm_image: str
     bench_image: str
     network: str = "vllm-bench-net"
     create_network: bool = True
@@ -52,6 +55,10 @@ class RunConfig:
     api_key: str | None = None
     ready_timeout_sec: int = 1800
     cooldown_sec: float = 20.0
+    vllm_image: str | None = None
+    images: Mapping[str, str] = field(
+        default_factory=lambda: types.MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)
@@ -72,6 +79,7 @@ class ModelConfig:
 @dataclass(frozen=True)
 class ServeProfile:
     name: str
+    engine: str = "vllm"
     gpus: str = "all"
     args: tuple[str, ...] = field(default_factory=tuple)
 
@@ -282,11 +290,12 @@ def _container_path_to_host(path_value: Any, model_root: Path, field_name: str) 
 def _parse_run(data: dict[str, Any]) -> RunConfig:
     run = _require_mapping(data.get("run"), "run")
     host_port = run.get("host_port")
+    vllm_image = _optional_string(run.get("vllm_image"), "run.vllm_image")
+    images = _parse_engine_images(run, vllm_image)
     return RunConfig(
         name=_safe_name(_required(run, "name", "run.name"), "run.name"),
         results_dir=Path(_string(run.get("results_dir", "vllm_standalone_bench/results"),
                                  "run.results_dir")),
-        vllm_image=_string(_required(run, "vllm_image", "run.vllm_image"), "run.vllm_image"),
         bench_image=_string(_required(run, "bench_image", "run.bench_image"), "run.bench_image"),
         network=_network_name(run.get("network", "vllm-bench-net"), "run.network"),
         create_network=_bool(run.get("create_network", True), "run.create_network"),
@@ -301,7 +310,27 @@ def _parse_run(data: dict[str, Any]) -> RunConfig:
         ready_timeout_sec=_positive_int(run.get("ready_timeout_sec", 1800),
                                         "run.ready_timeout_sec"),
         cooldown_sec=_non_negative_float(run.get("cooldown_sec", 20.0), "run.cooldown_sec"),
+        vllm_image=vllm_image,
+        images=images,
     )
+
+
+def _parse_engine_images(
+    run: dict[str, Any], vllm_image: str | None
+) -> Mapping[str, str]:
+    raw = run.get("images")
+    images: dict[str, str] = {}
+    if raw is not None:
+        if not isinstance(raw, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+        ):
+            raise ConfigError("run.images must be an object mapping engine -> image string")
+        images = dict(raw)
+    if vllm_image is not None:
+        images.setdefault("vllm", vllm_image)
+    if not images:
+        raise ConfigError("run.images (or run.vllm_image) must define at least one engine image")
+    return types.MappingProxyType(images)
 
 
 def _parse_mounts(data: dict[str, Any], config_dir: Path) -> MountConfig:
@@ -355,9 +384,15 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
         args = profile.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ConfigError("serve_profile.args must be a string array")
+        engine = _string(profile.get("engine", "vllm"), "serve_profile.engine")
+        if engine not in SUPPORTED_ENGINES:
+            raise ConfigError(
+                f"serve_profile.engine must be one of {SUPPORTED_ENGINES}, got {engine!r}"
+            )
         parsed.append(ServeProfile(
             name=_safe_name(_required(profile, "name", "serve_profile.name"),
                             "serve_profile.name"),
+            engine=engine,
             gpus=_string(profile.get("gpus", "all"), "serve_profile.gpus"),
             args=tuple(args),
         ))
@@ -422,7 +457,18 @@ def load_config(path: str | Path) -> AutoBenchConfig:
     models = _parse_models(config_data, mounts)
     serve_profiles = _parse_serve_profiles(config_data)
     bench_profiles = _parse_bench_profiles(config_data)
-    return AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    config = AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    _validate_images_cover_engines(config)
+    return config
+
+
+def _validate_images_cover_engines(config: AutoBenchConfig) -> None:
+    engines = {profile.engine for profile in config.serve_profiles}
+    missing = sorted(engine for engine in engines if engine not in config.run.images)
+    if missing:
+        raise ConfigError(
+            f"run.images missing image for engine(s): {', '.join(missing)}"
+        )
 
 
 def make_run_id(run_name: str, now: float | None = None) -> str:
@@ -1354,6 +1400,8 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(item) for item in value]
     if isinstance(value, list):
         return [_jsonable(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if hasattr(value, "__dataclass_fields__"):

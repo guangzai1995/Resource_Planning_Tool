@@ -2832,3 +2832,45 @@ def test_bench_runner_dockerfile_contains_offline_dependencies():
         sources = parts[1:-1]
         for source in sources:
             assert (root / source).exists(), f"COPY source does not exist: {source}"
+
+
+def test_serve_profile_engine_defaults_to_vllm(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    assert config.serve_profiles[0].engine == "vllm"
+
+
+def test_invalid_engine_rejected(tmp_path):
+    data = minimal_config(tmp_path)
+    data["serve_profiles"][0]["engine"] = "trtllm"
+    with pytest.raises(ab.ConfigError, match="engine"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_images_falls_back_to_vllm_image(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    assert config.run.images == {"vllm": "009e4cb46541"}
+
+
+def test_images_missing_engine_rejected(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": data["run"]["vllm_image"]}
+    data["serve_profiles"][0]["engine"] = "sglang"
+    with pytest.raises(ab.ConfigError, match="missing image"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_images_without_vllm_image_supported(tmp_path):
+    data = minimal_config(tmp_path)
+    del data["run"]["vllm_image"]
+    data["run"]["images"] = {"sglang": "sglang:latest"}
+    data["serve_profiles"][0]["engine"] = "sglang"
+    config = ab.load_config(write_config(tmp_path, data))
+    assert config.run.images == {"sglang": "sglang:latest"}
+    assert config.run.vllm_image is None
+
+
+def test_explicit_images_vllm_not_overridden_by_vllm_image(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": "explicit-vllm:tag"}
+    config = ab.load_config(write_config(tmp_path, data))
+    assert config.run.images["vllm"] == "explicit-vllm:tag"
