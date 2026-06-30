@@ -1,0 +1,48 @@
+{
+  "run": {
+    "name": "qwen2_5_1_5b_smoke",
+    "results_dir": "vllm_standalone_bench/results",
+    "vllm_image": "009e4cb46541",
+    "bench_image": "vllm-bench-runner:offline",
+    "network": "vllm-bench-net",
+    "create_network": true,
+    "cleanup_network": true,
+    "container_port": 8000,
+    "publish_host_port": false,
+    "host_port": 18000,
+    "api_key": "local-bench-key",
+    "ready_timeout_sec": 1800,
+    "cooldown_sec": 5
+  },
+  "mounts": {
+    "models": "/Resource_Planning_Tool/model"
+  },
+  "models": [
+    {
+      "name": "qwen2_5_1_5b",
+      "model_path": "/models/Qwen2.5-1.5B-Instruct",
+      "tokenizer_path": "/models/Qwen2.5-1.5B-Instruct",
+      "served_model_name": "qwen2_5_1_5b"
+    }
+  ],
+  "serve_profiles": [
+    {
+      "name": "bf16_default",
+      "gpus": "all",
+      "args": ["--dtype", "bfloat16", "--gpu-memory-utilization", "0.90"]
+    }
+  ],
+  "bench_profiles": [
+    {
+      "name": "smoke",
+      "backend": "openai-chat",
+      "input_lens": [64],
+      "output_lens": [32],
+      "parallel_nums": [1],
+      "epochs": 1,
+      "prefix_ratio": 0.0,
+      "warmup_requests": 0,
+      "cross_product": false
+    }
+  ]
+}
