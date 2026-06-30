@@ -648,9 +648,49 @@ def test_controller_default_ready_probe_runs_inside_docker_network(tmp_path, mon
     probes = ready_probe_commands(runner.commands)
     assert result == 0
     assert len(probes) == 1
+    assert value_after(probes[0], "--name") == "bench-ready-qwen2_5_1_5b-bf16_default-run123"
     assert value_after(probes[0], "--network") == "vllm-bench-net"
+    labels = values_after(probes[0], "--label")
+    assert "vllm_auto_bench.managed=true" in labels
+    assert "vllm_auto_bench.run_id=run123" in labels
+    assert f"vllm_auto_bench.run_dir={(tmp_path / 'results' / 'run123').resolve()}" in labels
     assert "vllm-bench-runner:offline" in probes[0]
     assert "http://bench-vllm-qwen2_5_1_5b-bf16_default-run123:8000/v1/models" in probes[0]
+
+
+@pytest.mark.parametrize("exception_type", [ab.StopRequested, KeyboardInterrupt])
+def test_ready_probe_interruption_removes_owned_probe_container(tmp_path, exception_type):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    probe_name = "bench-ready-qwen2_5_1_5b-bf16_default-run123"
+
+    class InterruptedProbeRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
+            if ready_probe_commands([list(args)]):
+                self.commands.append(list(args))
+                if "--name" in args:
+                    self.container_labels[value_after(args, "--name")] = {
+                        label.split("=", 1)[0]: label.split("=", 1)[1]
+                        for label in values_after(args, "--label")
+                        if "=" in label
+                    }
+                raise exception_type("probe interrupted")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    runner = InterruptedProbeRunner()
+
+    with pytest.raises(exception_type):
+        ab.wait_for_container_ready(config, case, runner)
+
+    assert any(command[:3] == ["docker", "stop", probe_name] for command in runner.commands)
+    assert any(command[:4] == ["docker", "rm", "-f", probe_name] for command in runner.commands)
 
 
 def test_controller_published_port_ready_uses_localhost(tmp_path, monkeypatch):
