@@ -900,11 +900,25 @@ def cleanup_ready_probe_container_if_owned(runner: Runner, case: BenchmarkCase,
     stop_and_remove_container(runner, probe_name, dry_run=False)
 
 
+def remove_existing_ready_probe_container_if_owned(runner: Runner, case: BenchmarkCase,
+                                                   run_dir: Path) -> bool:
+    probe_name = make_ready_probe_container_name(case)
+    labels = inspect_container_labels(runner, probe_name)
+    if labels is None:
+        return True
+    if not vllm_container_labels_match(labels, case, run_dir):
+        return False
+    stop_and_remove_container(runner, probe_name, dry_run=False)
+    return True
+
+
 def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
                              runner: Runner) -> bool:
     run_dir = build_layout(config, case.run_id, case).run_dir
     interrupted: BaseException | None = None
     try:
+        if not remove_existing_ready_probe_container_if_owned(runner, case, run_dir):
+            return False
         result = runner.run(
             build_ready_probe_run_command(config, case, run_dir),
             check=False,
