@@ -169,6 +169,7 @@ Sheet 设计：
 | `03_910C_8卡估算` | 按 P800 基线行生成 910C 8 卡估算 |
 | `04_P800基线` | 复制使用到的 `671B-P800-8测试数据` 行，便于追溯 |
 | `05_910B低利用率参考` | 导入 `data/910B1/`、`data/910B3/` 汇总统计，只做参考 |
+| `06_联网参考数据` | 记录公开论文/报道中的 910B、910C 测试或规格数据，只做对照说明 |
 
 估算 sheet 保留原 12 列指标，并新增审计列：
 
@@ -201,6 +202,19 @@ Sheet 设计：
 ```text
 当前估算依赖硬件/模型比例，未用 vLLM 低利用率样本校准。实际部署若沿用相同 vLLM/CANN 栈，可能低于估算值。
 ```
+
+## 6.1 联网参考数据使用边界
+
+联网检索到的公开数据进入 `06_联网参考数据`，用于解释风险区间和公开对照，不参与 `02_910B_8卡估算`、`03_910C_8卡估算` 的数值计算。第一版纳入以下参考项：
+
+| 来源 | 硬件 | 模型/场景 | 可记录指标 | 使用边界 |
+| --- | --- | --- | --- | --- |
+| A-IO: Adaptive Inference Orchestration for Memory-Bound NPUs | Ascend 910B | OpenPangu 1B/7B，HuggingFace + PyTorch，非 vLLM/MindIE | 2K 场景 1B/7B TPS、32K 场景准确率、910B 64GB HBM、CANN/HDK 版本 | 单卡小模型参考，不能外推 DeepSeek 8 卡大 MoE |
+| An Empirical Study of OpenPangu Quantization on Ascend NPUs | Ascend 910B1 | OpenPangu 1B/7B，PTQ 精度研究 | 910B1 64GB HBM、PyTorch/torch-npu/Transformers 版本、量化精度结论 | 主要是精度/量化参考，不是吞吐基准 |
+| Serving Large Language Models on Huawei CloudMatrix384 | 384 个 Ascend 910C | DeepSeek-R1 + CloudMatrix-Infer | prefill 6688 tokens/s/NPU、decode 1943 tokens/s/NPU、15ms TPOT 下 538 tokens/s/NPU | 384 卡专用架构与 CloudMatrix-Infer，上限参考，不能直接当 8 卡结果 |
+| Tom's Hardware CloudMatrix384 报道 | Ascend 910C | 公开规格/系统对比 | 910C 780 BF16 TFLOPS、128GB HBM、3.2TB/s HBM 带宽；CloudMatrix384 300 BF16 PFLOPS | 非厂商官方规格，作为默认假设来源并标注可信度 |
+
+如果公开参考与内部实测、内部规格冲突，以内部数据为准。输出工作簿必须在说明中标注这些数据的可比性限制。
 
 ## 7. 置信度设计
 
@@ -265,6 +279,6 @@ confidence =
 
 1. 输出同时包含 `910B 8卡` 与 `910C 8卡` 估算数据。
 2. 每行估算都有 P800 基线行、硬件比例、模型比例、瓶颈、显存需求和置信度。
-3. 910B 历史 vLLM 数据只出现在参考 sheet，不影响估算结果。
+3. 910B 历史 vLLM 数据和联网参考数据只出现在参考 sheet，不影响估算结果。
 4. 文档和输出工作簿都保留公式说明、来源链接和假设表。
 5. 缺少关键规格时不静默硬编码，必须在假设表和说明中标注。
