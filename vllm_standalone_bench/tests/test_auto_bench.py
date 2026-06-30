@@ -2376,6 +2376,31 @@ def test_run_controller_does_not_delete_new_lock_after_stale_recheck(
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
+def test_release_run_lock_does_not_delete_replaced_lock(tmp_path, monkeypatch):
+    run_dir = tmp_path / "results" / "run123"
+    run_dir.mkdir(parents=True)
+    lock_path = run_dir / ".run.lock"
+    old_payload = {"pid": 12345, "token": "old-token", "created_at": 1.0}
+    new_payload = {"pid": 67890, "token": "new-token", "created_at": 2.0}
+    lock_path.write_text(json.dumps(old_payload), encoding="utf-8")
+    original_read_run_lock = ab._read_run_lock
+    reads = 0
+
+    def racing_read_run_lock(lock_run_dir):
+        nonlocal reads
+        reads += 1
+        payload = original_read_run_lock(lock_run_dir)
+        if reads == 1:
+            lock_path.write_text(json.dumps(new_payload), encoding="utf-8")
+        return payload
+
+    monkeypatch.setattr(ab, "_read_run_lock", racing_read_run_lock)
+
+    ab.release_run_lock(ab.RunLock(run_dir=run_dir, token="old-token"))
+
+    assert json.loads(lock_path.read_text(encoding="utf-8")) == new_payload
+
+
 def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeypatch, capsys):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"

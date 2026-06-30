@@ -1164,14 +1164,34 @@ def update_run_lock_owner(lock: RunLock, pid: int) -> None:
         write_json_atomic(run_lock_path(lock.run_dir), _run_lock_payload(lock.token, pid=pid))
 
 
-def release_run_lock(lock: RunLock) -> None:
-    lock_path = run_lock_path(lock.run_dir)
-    if not run_lock_token_matches(lock.run_dir, lock.token):
-        return
+def _remove_run_lock_matching_identity(run_dir: Path, identity: tuple[int, str, Any],
+                                       purpose: str) -> bool:
+    lock_path = run_lock_path(run_dir)
+    marker_path = run_dir / f"{RUN_LOCK_FILE}.{purpose}.{os.getpid()}.{secrets.token_hex(8)}"
     try:
-        lock_path.unlink()
-    except FileNotFoundError:
-        pass
+        lock_path.replace(marker_path)
+    except OSError:
+        return False
+    marker_payload = _read_lock_marker_payload(marker_path)
+    if _run_lock_identity(marker_payload) != identity:
+        _restore_reclaimed_lock(marker_path, lock_path)
+        return False
+    try:
+        marker_path.unlink()
+    except OSError:
+        _restore_reclaimed_lock(marker_path, lock_path)
+        return False
+    return True
+
+
+def release_run_lock(lock: RunLock) -> None:
+    payload = _read_run_lock(lock.run_dir)
+    identity = _run_lock_identity(payload)
+    if identity is None or identity[1] != lock.token:
+        return
+    if _run_lock_identity(_read_run_lock(lock.run_dir)) != identity:
+        return
+    _remove_run_lock_matching_identity(lock.run_dir, identity, "release")
 
 
 def release_run_lock_for_token(run_dir: Path | None, token: str | None) -> None:
