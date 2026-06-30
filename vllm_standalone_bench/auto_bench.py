@@ -1692,6 +1692,8 @@ def _detached_state(run_id: str, status: str, total: int,
 
 
 def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> int:
+    _safe_name(run_id, "run_id")
+    cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
     if reject_active_run(run_dir):
         return 1
@@ -1705,7 +1707,6 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
         release_run_lock(run_lock)
         return 1
     run_dir.mkdir(parents=True, exist_ok=True)
-    cases = expand_cases(config, run_id=run_id)
     total = len(cases)
 
     def fail_start(error: str) -> int:
@@ -1722,7 +1723,10 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
     except (ConfigError, OSError) as exc:
         return fail_start(str(exc))
 
-    write_state(run_dir, _detached_state(run_id, "starting", total))
+    try:
+        write_state(run_dir, _detached_state(run_id, "starting", total))
+    except OSError as exc:
+        return fail_start(str(exc))
 
     log_path = run_dir / "controller.log"
     command = build_detach_command(

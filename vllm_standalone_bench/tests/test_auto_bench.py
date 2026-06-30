@@ -2272,6 +2272,16 @@ def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, capsys)
     assert (run_dir / ".run.lock").exists()
 
 
+def test_start_detached_invalid_run_id_does_not_create_lock_path(tmp_path):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+
+    with pytest.raises(ab.ConfigError, match="run_id"):
+        ab.start_detached(config_path, config, "bad/name")
+
+    assert not (tmp_path / "results" / "bad").exists()
+
+
 def test_run_controller_releases_lock_after_success(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
@@ -2316,6 +2326,29 @@ def test_start_detached_validate_local_paths_failure_releases_lock(tmp_path, cap
     assert exit_code == 1
     assert state["status"] == "failed"
     assert "model path does not exist" in captured.err
+    assert not (run_dir / ".run.lock").exists()
+
+
+def test_start_detached_starting_state_write_failure_releases_lock(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    original_write_state = ab.write_state
+
+    def fail_starting_state(path, state):
+        if state.get("status") == "starting":
+            raise OSError("starting write failed")
+        return original_write_state(path, state)
+
+    monkeypatch.setattr(ab, "write_state", fail_starting_state)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "failed"
+    assert "starting write failed" in captured.err
     assert not (run_dir / ".run.lock").exists()
 
 
