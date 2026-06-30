@@ -357,3 +357,115 @@ def summarize_910b_reference(data_dir: Path) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows, columns=REFERENCE_COLUMNS)
+
+
+def assumptions_dataframe() -> pd.DataFrame:
+    rows = []
+    for gpu in DEFAULT_GPU_ASSUMPTIONS.values():
+        rows.append(
+            {
+                "category": "gpu",
+                "name": gpu.name,
+                "memory_gb": gpu.memory_gb,
+                "bandwidth_gbs": gpu.bandwidth_gbs,
+                "bf16_tflops_or_efficiency": gpu.bf16_tflops,
+                "source": gpu.spec_source,
+            }
+        )
+    for runtime in DEFAULT_RUNTIME_SCENARIOS.values():
+        rows.append(
+            {
+                "category": "runtime",
+                "name": runtime.name,
+                "memory_gb": None,
+                "bandwidth_gbs": None,
+                "bf16_tflops_or_efficiency": runtime.target_efficiency,
+                "source": runtime.label,
+            }
+        )
+    rows.append(
+        {
+            "category": "model",
+            "name": DEFAULT_MODEL_ASSUMPTION.name,
+            "memory_gb": DEFAULT_MODEL_ASSUMPTION.total_params_b,
+            "bandwidth_gbs": DEFAULT_MODEL_ASSUMPTION.active_params_b,
+            "bf16_tflops_or_efficiency": DEFAULT_MODEL_ASSUMPTION.weight_bytes,
+            "source": DEFAULT_MODEL_ASSUMPTION.spec_source,
+        }
+    )
+    return pd.DataFrame(rows)
+
+
+def explanation_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            ["版本", "v1"],
+            ["主基线", SOURCE_SHEET],
+            ["估算口径", "P800实测基线 + 模型差异 + 硬件Roofline比例"],
+            ["910B参考数据", "只进入参考sheet，不参与校准"],
+            ["联网参考数据", "只进入联网参考sheet，不参与校准"],
+            ["适用边界", "估算不能替代实测；实际部署需用910B/910C复测"],
+        ],
+        columns=["项目", "说明"],
+    )
+
+
+def public_reference_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "source_title": "A-IO: Adaptive Inference Orchestration for Memory-Bound NPUs",
+                "url": "https://arxiv.org/abs/2604.09752",
+                "hardware": "Ascend 910B",
+                "model_or_scenario": "OpenPangu 1B/7B, HuggingFace + PyTorch",
+                "metric_summary": "Reports OpenPangu 1B/7B TPS under 2K workloads and 32K accuracy on Ascend 910B.",
+                "comparability_note": "Single-card small-model paper data; not used to calibrate DeepSeek 8-card MoE estimates.",
+            },
+            {
+                "source_title": "An Empirical Study of OpenPangu Quantization on Ascend NPUs",
+                "url": "https://arxiv.org/abs/2606.21257",
+                "hardware": "Ascend 910B1",
+                "model_or_scenario": "OpenPangu 1B/7B post-training quantization",
+                "metric_summary": "Documents Ascend 910B1 64GB HBM environment and quantization behavior.",
+                "comparability_note": "Quantization and accuracy reference; not a throughput calibration dataset.",
+            },
+            {
+                "source_title": "Serving Large Language Models on Huawei CloudMatrix384",
+                "url": "https://arxiv.org/abs/2506.12708",
+                "hardware": "384 x Ascend 910C",
+                "model_or_scenario": "DeepSeek-R1 on CloudMatrix-Infer",
+                "metric_summary": "Reports 6688 prefill tokens/s/NPU, 1943 decode tokens/s/NPU, and 538 tokens/s/NPU at 15 ms TPOT.",
+                "comparability_note": "384-card CloudMatrix-Infer result; upper-bound reference, not directly comparable to 8-card deployment.",
+            },
+            {
+                "source_title": "Tom's Hardware CloudMatrix384 report",
+                "url": "https://www.tomshardware.com/tech-industry/artificial-intelligence/huaweis-new-ai-cloudmatrix-cluster-beats-nvidias-gb200-by-brute-force-uses-4x-the-power",
+                "hardware": "Ascend 910C",
+                "model_or_scenario": "Public hardware/spec reporting",
+                "metric_summary": "Reports 910C at 780 BF16 TFLOPS, 128GB HBM, 3.2TB/s HBM bandwidth, and CloudMatrix384 at 300 BF16 PFLOPS.",
+                "comparability_note": "Non-vendor public report; used only as a configurable default assumption/reference.",
+            },
+        ]
+    )
+
+
+def build_workbook(*, source_workbook: Path, data_dir: Path, output_path: Path) -> Path:
+    baseline_rows = load_p800_baseline(source_workbook)
+    estimates = build_estimates(baseline_rows)
+    baseline_df = pd.read_excel(source_workbook, sheet_name=SOURCE_SHEET)
+    reference_df = summarize_910b_reference(data_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        explanation_dataframe().to_excel(writer, sheet_name="00_估算说明", index=False, startrow=2)
+        assumptions_dataframe().to_excel(writer, sheet_name="01_假设表", index=False)
+        estimates[estimates["target_gpu"] == "910B"].to_excel(writer, sheet_name="02_910B_8卡估算", index=False)
+        estimates[estimates["target_gpu"] == "910C"].to_excel(writer, sheet_name="03_910C_8卡估算", index=False)
+        baseline_df.to_excel(writer, sheet_name="04_P800基线", index=False)
+        reference_df.to_excel(writer, sheet_name="05_910B低利用率参考", index=False)
+        public_reference_dataframe().to_excel(writer, sheet_name="06_联网参考数据", index=False)
+
+        ws = writer.book["00_估算说明"]
+        ws["A1"] = "DeepSeek v4 flash 910B/910C 8卡估算"
+
+    return output_path

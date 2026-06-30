@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 from scripts.estimate_deepseek_v4_flash_ascend import (
     DEFAULT_GPU_ASSUMPTIONS,
@@ -10,6 +11,7 @@ from scripts.estimate_deepseek_v4_flash_ascend import (
     SOURCE_COLUMNS,
     BaselineRow,
     build_estimates,
+    build_workbook,
     estimate_row,
     load_p800_baseline,
     required_memory_per_card_gb,
@@ -159,3 +161,33 @@ def test_910b_reference_summary_does_not_change_estimates(tmp_path):
 
     assert first_summary.loc[0, "mean_throughput_tokens_s"] != second_summary.loc[0, "mean_throughput_tokens_s"]
     pd.testing.assert_frame_equal(before, after)
+
+
+def test_build_workbook_writes_expected_sheets(tmp_path):
+    workbook = tmp_path / "资源规划工具.xlsx"
+    output = tmp_path / "estimate.xlsx"
+    write_baseline_workbook(workbook)
+    write_reference_csv(tmp_path / "data" / "910B3" / "72B-AWQ" / "8.csv", 20.0)
+
+    build_workbook(
+        source_workbook=workbook,
+        data_dir=tmp_path / "data",
+        output_path=output,
+    )
+
+    loaded = load_workbook(output, data_only=False)
+    assert loaded.sheetnames == [
+        "00_估算说明",
+        "01_假设表",
+        "02_910B_8卡估算",
+        "03_910C_8卡估算",
+        "04_P800基线",
+        "05_910B低利用率参考",
+        "06_联网参考数据",
+    ]
+    assert loaded["00_估算说明"]["A1"].value == "DeepSeek v4 flash 910B/910C 8卡估算"
+    assert loaded["02_910B_8卡估算"]["A1"].value == "输入长度"
+    assert loaded["03_910C_8卡估算"]["A1"].value == "输入长度"
+    assert loaded["05_910B低利用率参考"]["J2"].value == "低利用率参考，不参与估算校准"
+    assert loaded["06_联网参考数据"]["A1"].value == "source_title"
+    assert "CloudMatrix384" in loaded["06_联网参考数据"]["A4"].value
