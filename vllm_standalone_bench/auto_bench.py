@@ -99,6 +99,8 @@ class BenchProfile:
     epochs: int = 3
     prefix_ratio: float = 0.0
     warmup_requests: int = 1
+    warmup_concurrency: int | None = None
+    warmup_output_len: int | None = None
     cross_product: bool = False
     max_ttft_ms: float | None = None
     min_throughput_tok_s: float | None = None
@@ -213,6 +215,14 @@ def _positive_int(value: Any, field_name: str) -> int:
 def _non_negative_int(value: Any, field_name: str) -> int:
     if type(value) is not int or value < 0:
         raise ConfigError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _optional_positive_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or isinstance(value, bool) or value <= 0:
+        raise ConfigError(f"{field_name} must be a positive int or null, got {value!r}")
     return value
 
 
@@ -433,6 +443,10 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
                                 "bench_profile.prefix_ratio"),
             warmup_requests=_non_negative_int(profile.get("warmup_requests", 1),
                                               "bench_profile.warmup_requests"),
+            warmup_concurrency=_optional_positive_int(
+                profile.get("warmup_concurrency"), "bench_profile.warmup_concurrency"),
+            warmup_output_len=_optional_positive_int(
+                profile.get("warmup_output_len"), "bench_profile.warmup_output_len"),
             cross_product=cross_product,
             max_ttft_ms=_optional_non_negative_float(profile.get("max_ttft_ms"),
                                                      "bench_profile.max_ttft_ms"),
@@ -625,6 +639,10 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--output-csv", "/results/result.csv",
         "--output-xlsx", "/results/result.xlsx",
     ]
+    if bench.warmup_concurrency is not None:
+        cmd.extend(["--warmup-concurrency", str(bench.warmup_concurrency)])
+    if bench.warmup_output_len is not None:
+        cmd.extend(["--warmup-output-len", str(bench.warmup_output_len)])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
     if case.model.tokenizer_path:

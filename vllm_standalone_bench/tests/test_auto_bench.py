@@ -7,6 +7,8 @@ import pytest
 
 import auto_bench as ab
 
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
+
 
 def write_config(tmp_path, data):
     path = tmp_path / "config.json"
@@ -3033,3 +3035,53 @@ def test_controller_dry_run_prints_sglang_command(tmp_path, capsys):
     assert "sglang.launch_server" in out
     assert "sglang:latest" in out
     assert "--model-path" in out
+
+
+def test_load_config_parses_warmup_opts(tmp_path):
+    data = minimal_config(tmp_path)
+    data["bench_profiles"][0]["warmup_concurrency"] = 4
+    data["bench_profiles"][0]["warmup_output_len"] = 128
+    config = ab.load_config(write_config(tmp_path, data))
+    bp = config.bench_profiles[0]
+    assert bp.warmup_concurrency == 4
+    assert bp.warmup_output_len == 128
+
+
+def test_load_config_warmup_opts_default_none(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    bp = config.bench_profiles[0]
+    assert bp.warmup_concurrency is None
+    assert bp.warmup_output_len is None
+
+
+def test_build_bench_command_includes_warmup_opts(tmp_path):
+    data = minimal_config(tmp_path)
+    data["bench_profiles"][0]["warmup_concurrency"] = 4
+    data["bench_profiles"][0]["warmup_output_len"] = 128
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config)[0]
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+    assert value_after(cmd, "--warmup-concurrency") == "4"
+    assert value_after(cmd, "--warmup-output-len") == "128"
+
+
+def test_build_bench_command_omits_warmup_opts_when_none(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config)[0]
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+    assert "--warmup-concurrency" not in cmd
+    assert "--warmup-output-len" not in cmd
+
+
+def test_sglang_compare_config_enables_fixed_warmup():
+    cfg = json.loads((CONFIG_DIR / "auto_bench.qwen2_5_1_5b.sglang_compare.json").read_text())
+    bp = cfg["bench_profiles"][0]
+    assert bp["warmup_concurrency"] == 4
+    assert bp["warmup_output_len"] == 128
+
+
+def test_smoke_config_enables_fixed_warmup():
+    cfg = json.loads((CONFIG_DIR / "auto_bench.qwen2_5_1_5b.smoke.json").read_text())
+    bp = cfg["bench_profiles"][0]
+    assert bp["warmup_concurrency"] == 4
+    assert bp["warmup_output_len"] == 128
