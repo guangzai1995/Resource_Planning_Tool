@@ -294,6 +294,26 @@ def test_case_paths_and_state_files_are_written(tmp_path):
     assert state["status"] == "running"
 
 
+def test_write_json_atomic_uses_unique_tmp_for_interleaved_writes(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    original_replace = Path.replace
+    triggered = False
+
+    def interleaved_replace(self, target):
+        nonlocal triggered
+        if Path(target) == path and not triggered:
+            triggered = True
+            ab.write_json_atomic(path, {"writer": "nested"})
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", interleaved_replace)
+
+    ab.write_json_atomic(path, {"writer": "outer"})
+
+    assert triggered is True
+    assert json.loads(path.read_text(encoding="utf-8"))["writer"] == "outer"
+
+
 def test_manifest_records_relative_artifact_paths(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     case = ab.expand_cases(config, run_id="run123")[0]
@@ -2314,6 +2334,46 @@ def test_run_controller_reclaims_terminal_stale_lock(tmp_path, monkeypatch):
 
     assert result == 0
     assert not (run_dir / ".run.lock").exists()
+
+
+def test_run_controller_does_not_delete_new_lock_after_stale_recheck(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "completed",
+        "current": None,
+        "counts": {"passed": 1, "failed": 0, "skipped": 0, "running": 0, "total": 1},
+    })
+    stale_payload = {"pid": 12345, "token": "old-token", "created_at": 1.0}
+    new_payload = {"pid": 67890, "token": "new-token", "created_at": 2.0}
+    (run_dir / ".run.lock").write_text(json.dumps(stale_payload), encoding="utf-8")
+    original_read_run_lock = ab._read_run_lock
+    reads = 0
+
+    def racing_read_run_lock(lock_run_dir):
+        nonlocal reads
+        reads += 1
+        payload = original_read_run_lock(lock_run_dir)
+        if reads == 1:
+            (run_dir / ".run.lock").write_text(json.dumps(new_payload), encoding="utf-8")
+        return payload
+
+    monkeypatch.setattr(ab, "_read_run_lock", racing_read_run_lock)
+    monkeypatch.setattr(ab, "is_process_running", lambda pid: False)
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "active" in captured.err
+    assert json.loads((run_dir / ".run.lock").read_text(encoding="utf-8")) == new_payload
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
 def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeypatch, capsys):

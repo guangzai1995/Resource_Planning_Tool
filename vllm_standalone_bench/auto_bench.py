@@ -576,12 +576,23 @@ def build_layout(config: AutoBenchConfig, run_id: str, case: BenchmarkCase) -> C
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    tmp_path = path.with_name(
+        f"{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     )
-    tmp_path.replace(path)
+    try:
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        raise
 
 
 def write_state(run_dir: Path, state: dict[str, Any]) -> None:
@@ -1169,6 +1180,44 @@ def release_run_lock_for_token(run_dir: Path | None, token: str | None) -> None:
     release_run_lock(RunLock(run_dir=run_dir, token=token))
 
 
+def _run_lock_identity(payload: dict[str, Any] | None) -> tuple[int, str, Any] | None:
+    if payload is None:
+        return None
+    pid = payload.get("pid")
+    token = payload.get("token")
+    created_at = payload.get("created_at")
+    if type(pid) is not int or pid <= 1:
+        return None
+    if not isinstance(token, str) or not token:
+        return None
+    if type(created_at) not in (int, float) or not math.isfinite(float(created_at)):
+        return None
+    return (pid, token, float(created_at))
+
+
+def _restore_reclaimed_lock(reclaim_path: Path, lock_path: Path) -> None:
+    try:
+        os.link(reclaim_path, lock_path)
+    except FileExistsError:
+        pass
+    except OSError:
+        pass
+    try:
+        reclaim_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _read_lock_marker_payload(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def cleanup_stale_terminal_run_lock(run_dir: Path, lock_token: str | None = None) -> bool:
     if run_lock_token_matches(run_dir, lock_token):
         return False
@@ -1176,16 +1225,35 @@ def cleanup_stale_terminal_run_lock(run_dir: Path, lock_token: str | None = None
     if state is None or state.get("status") not in TERMINAL_RUN_STATUSES:
         return False
     payload = _read_run_lock(run_dir)
-    if payload is None:
+    identity = _run_lock_identity(payload)
+    if identity is None:
         return False
-    pid = payload.get("pid")
-    if type(pid) is not int or pid <= 1:
-        return False
+    pid = identity[0]
     if is_process_running(pid):
         return False
+    if _run_lock_identity(_read_run_lock(run_dir)) != identity:
+        return False
+    lock_path = run_lock_path(run_dir)
+    reclaim_path = run_dir / f"{RUN_LOCK_FILE}.reclaim.{os.getpid()}.{secrets.token_hex(8)}"
     try:
-        run_lock_path(run_dir).unlink()
+        lock_path.replace(reclaim_path)
     except OSError:
+        return False
+    claimed_payload = _read_lock_marker_payload(reclaim_path)
+    if _run_lock_identity(claimed_payload) != identity:
+        _restore_reclaimed_lock(reclaim_path, lock_path)
+        return False
+    state = _read_run_state(run_dir)
+    if state is None or state.get("status") not in TERMINAL_RUN_STATUSES:
+        _restore_reclaimed_lock(reclaim_path, lock_path)
+        return False
+    if is_process_running(pid):
+        _restore_reclaimed_lock(reclaim_path, lock_path)
+        return False
+    try:
+        reclaim_path.unlink()
+    except OSError:
+        _restore_reclaimed_lock(reclaim_path, lock_path)
         return False
     print(f"cleaned stale run lock: {run_dir}", file=sys.stderr)
     return True
