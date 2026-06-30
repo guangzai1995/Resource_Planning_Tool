@@ -1311,6 +1311,72 @@ def test_parse_args_run_dry_run():
     assert args.dry_run is True
 
 
+def test_child_startup_exception_releases_lock_when_state_write_fails(tmp_path, monkeypatch):
+    calls = []
+
+    def fail_load_config(path):
+        raise ab.ConfigError("bad config")
+
+    def fail_startup_state(*args, **kwargs):
+        raise OSError("state write failed")
+
+    def fake_release(run_dir, token):
+        calls.append((run_dir, token))
+
+    monkeypatch.setattr(ab, "load_config", fail_load_config)
+    monkeypatch.setattr(ab, "write_child_startup_state", fail_startup_state)
+    monkeypatch.setattr(ab, "release_run_lock_for_token", fake_release)
+
+    exit_code = ab.main([
+        "run",
+        "--config",
+        str(tmp_path / "config.json"),
+        "--run-id",
+        "run123",
+        "--child",
+        "--results-dir",
+        str(tmp_path / "results"),
+        "--lock-token",
+        "token123",
+    ])
+
+    assert exit_code == 1
+    assert calls == [(tmp_path / "results" / "run123", "token123")]
+
+
+def test_child_startup_stop_releases_lock_when_state_write_fails(tmp_path, monkeypatch):
+    calls = []
+
+    def stop_during_signal_install():
+        raise ab.StopRequested("stopped")
+
+    def fail_startup_state(*args, **kwargs):
+        raise OSError("state write failed")
+
+    def fake_release(run_dir, token):
+        calls.append((run_dir, token))
+
+    monkeypatch.setattr(ab, "install_signal_handlers", stop_during_signal_install)
+    monkeypatch.setattr(ab, "write_child_startup_state", fail_startup_state)
+    monkeypatch.setattr(ab, "release_run_lock_for_token", fake_release)
+
+    exit_code = ab.main([
+        "run",
+        "--config",
+        str(tmp_path / "config.json"),
+        "--run-id",
+        "run123",
+        "--child",
+        "--results-dir",
+        str(tmp_path / "results"),
+        "--lock-token",
+        "token123",
+    ])
+
+    assert exit_code == 130
+    assert calls == [(tmp_path / "results" / "run123", "token123")]
+
+
 def test_main_status_reads_state_file(tmp_path, capsys):
     ab.write_state(tmp_path / "run123", {
         "run_id": "run123",

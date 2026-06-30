@@ -2360,6 +2360,21 @@ def write_child_startup_state(results_dir: Path | None, run_id: str | None,
     write_state(results_dir / run_id, state)
 
 
+def release_child_startup_lock(results_dir: Path | None, run_id: str | None,
+                               lock_token: str | None) -> None:
+    if results_dir is None or run_id is None:
+        return
+    release_run_lock_for_token(results_dir / run_id, lock_token)
+
+
+def write_child_startup_state_best_effort(results_dir: Path | None, run_id: str | None,
+                                          status: str, error: str) -> None:
+    try:
+        write_child_startup_state(results_dir, run_id, status, error)
+    except OSError as exc:
+        print(f"failed to write child startup state: {exc}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "run":
@@ -2370,16 +2385,28 @@ def main(argv: list[str] | None = None) -> int:
                 run_id = args.run_id or make_run_id(config.run.name)
             except StopRequested as exc:
                 error = str(exc) or "stop requested"
-                write_child_startup_state(args.results_dir, args.run_id, "interrupted", error)
-                if args.results_dir is not None and args.run_id is not None:
-                    release_run_lock_for_token(args.results_dir / args.run_id, args.lock_token)
+                try:
+                    write_child_startup_state_best_effort(
+                        args.results_dir,
+                        args.run_id,
+                        "interrupted",
+                        error,
+                    )
+                finally:
+                    release_child_startup_lock(args.results_dir, args.run_id, args.lock_token)
                 print(error, file=sys.stderr)
                 return 130
             except Exception as exc:
                 error = str(exc)
-                write_child_startup_state(args.results_dir, args.run_id, "failed", error)
-                if args.results_dir is not None and args.run_id is not None:
-                    release_run_lock_for_token(args.results_dir / args.run_id, args.lock_token)
+                try:
+                    write_child_startup_state_best_effort(
+                        args.results_dir,
+                        args.run_id,
+                        "failed",
+                        error,
+                    )
+                finally:
+                    release_child_startup_lock(args.results_dir, args.run_id, args.lock_token)
                 print(error, file=sys.stderr)
                 return 1
             controller_kwargs: dict[str, Any] = {"dry_run": args.dry_run}
