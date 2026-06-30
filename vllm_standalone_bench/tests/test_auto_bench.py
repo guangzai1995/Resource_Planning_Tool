@@ -2005,10 +2005,28 @@ def test_example_configs_are_parseable():
         assert config.models
         assert config.serve_profiles
         assert config.bench_profiles
+        assert data["mounts"]["models"] == "/Resource_Planning_Tool/model"
+        assert data["run"]["results_dir"] == "vllm_standalone_bench/results"
         assert any(
             model["model_path"] == "/models/Qwen2.5-1.5B-Instruct"
             for model in data["models"]
         )
+        if path.name == "auto_bench.example.json":
+            assert len(data["serve_profiles"]) == 2
+            for profile in data["serve_profiles"]:
+                assert "--gpu-memory-utilization" in profile["args"]
+                assert "0.90" in profile["args"]
+            latency_matrix = data["bench_profiles"][0]
+            assert latency_matrix["name"] == "latency_matrix"
+            assert latency_matrix["output_lens"] == [1024]
+            assert latency_matrix["parallel_nums"] == [1, 4, 8]
+            assert latency_matrix["prefix_ratio"] == 0.8
+            assert latency_matrix["max_ttft_ms"] == 15000
+            assert latency_matrix["min_throughput_tok_s"] == 5
+        else:
+            smoke_args = data["serve_profiles"][0]["args"]
+            assert "--gpu-memory-utilization" in smoke_args
+            assert "0.90" in smoke_args
 
 
 def test_bench_runner_dockerfile_contains_offline_dependencies():

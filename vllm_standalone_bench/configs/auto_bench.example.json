@@ -1,7 +1,7 @@
 {
   "run": {
     "name": "offline_full_bench",
-    "results_dir": "../results/auto_bench",
+    "results_dir": "vllm_standalone_bench/results",
     "vllm_image": "009e4cb46541",
     "bench_image": "vllm-bench-runner:offline",
     "network": "vllm-bench-net",
@@ -14,7 +14,7 @@
     "cooldown_sec": 20
   },
   "mounts": {
-    "models": "../models"
+    "models": "/Resource_Planning_Tool/model"
   },
   "models": [
     {
@@ -28,12 +28,18 @@
     {
       "name": "bf16_default",
       "gpus": "all",
-      "args": ["--dtype", "bfloat16"]
+      "args": ["--dtype", "bfloat16", "--gpu-memory-utilization", "0.90"]
     },
     {
       "name": "bf16_prefix_on",
       "gpus": "all",
-      "args": ["--dtype", "bfloat16", "--enable-prefix-caching"]
+      "args": [
+        "--dtype",
+        "bfloat16",
+        "--gpu-memory-utilization",
+        "0.90",
+        "--enable-prefix-caching"
+      ]
     }
   ],
   "bench_profiles": [
@@ -41,13 +47,14 @@
       "name": "latency_matrix",
       "backend": "openai-chat",
       "input_lens": [128, 512, 1024],
-      "output_lens": [64, 128, 256],
-      "parallel_nums": [1, 4, 8, 16],
+      "output_lens": [1024],
+      "parallel_nums": [1, 4, 8],
       "epochs": 3,
-      "prefix_ratio": 0.0,
+      "prefix_ratio": 0.8,
       "warmup_requests": 1,
       "cross_product": false,
-      "max_ttft_ms": 5000,
+      "max_ttft_ms": 15000,
+      "min_throughput_tok_s": 5,
       "min_output_compliance": 0.95
     }
   ]

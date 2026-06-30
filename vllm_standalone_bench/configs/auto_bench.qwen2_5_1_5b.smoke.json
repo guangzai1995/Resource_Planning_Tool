@@ -1,7 +1,7 @@
 {
   "run": {
     "name": "qwen2_5_1_5b_smoke",
-    "results_dir": "../results/auto_bench",
+    "results_dir": "vllm_standalone_bench/results",
     "vllm_image": "009e4cb46541",
     "bench_image": "vllm-bench-runner:offline",
     "network": "vllm-bench-net",
@@ -14,7 +14,7 @@
     "cooldown_sec": 5
   },
   "mounts": {
-    "models": "../models"
+    "models": "/Resource_Planning_Tool/model"
   },
   "models": [
     {
@@ -28,7 +28,7 @@
     {
       "name": "bf16_default",
       "gpus": "all",
-      "args": ["--dtype", "bfloat16"]
+      "args": ["--dtype", "bfloat16", "--gpu-memory-utilization", "0.90"]
     }
   ],
   "bench_profiles": [
