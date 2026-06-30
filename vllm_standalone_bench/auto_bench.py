@@ -866,19 +866,75 @@ sys.exit(1)
 """
 
 
-def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
-                             runner: Runner) -> bool:
+def make_ready_probe_container_name(case: BenchmarkCase) -> str:
+    return f"bench-ready-{case.model.name}-{case.serve_profile.name}-{case.run_id}"
+
+
+def build_ready_probe_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                                  run_dir: Path) -> list[str]:
+    resolved_run_dir = Path(run_dir).resolve()
     url = f"http://{case.container_name}:{config.run.container_port}/v1/models"
-    result = runner.run([
+    return [
         "docker", "run", "--rm",
+        "--name", make_ready_probe_container_name(case),
+        "--label", f"{NETWORK_MANAGED_LABEL}=true",
+        "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
+        "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--network", config.run.network,
         config.run.bench_image,
         "python", "-c", READY_PROBE_SCRIPT,
         url,
         config.run.api_key or "",
         str(config.run.ready_timeout_sec),
-    ], check=False)
-    return result.returncode == 0
+    ]
+
+
+def cleanup_ready_probe_container_if_owned(runner: Runner, case: BenchmarkCase,
+                                           run_dir: Path) -> None:
+    probe_name = make_ready_probe_container_name(case)
+    labels = inspect_container_labels(runner, probe_name)
+    if labels is None:
+        return
+    if not vllm_container_labels_match(labels, case, run_dir):
+        return
+    stop_and_remove_container(runner, probe_name, dry_run=False)
+
+
+def remove_existing_ready_probe_container_if_owned(runner: Runner, case: BenchmarkCase,
+                                                   run_dir: Path) -> bool:
+    probe_name = make_ready_probe_container_name(case)
+    labels = inspect_container_labels(runner, probe_name)
+    if labels is None:
+        return True
+    if not vllm_container_labels_match(labels, case, run_dir):
+        return False
+    stop_and_remove_container(runner, probe_name, dry_run=False)
+    return True
+
+
+def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
+                             runner: Runner) -> bool:
+    run_dir = build_layout(config, case.run_id, case).run_dir
+    interrupted: BaseException | None = None
+    try:
+        if not remove_existing_ready_probe_container_if_owned(runner, case, run_dir):
+            return False
+        result = runner.run(
+            build_ready_probe_run_command(config, case, run_dir),
+            check=False,
+        )
+        return result.returncode == 0
+    except (StopRequested, KeyboardInterrupt) as exc:
+        interrupted = exc
+        raise
+    finally:
+        try:
+            cleanup_ready_probe_container_if_owned(runner, case, run_dir)
+        except (StopRequested, KeyboardInterrupt):
+            if interrupted is None:
+                raise
+        except Exception:
+            pass
 
 
 def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
