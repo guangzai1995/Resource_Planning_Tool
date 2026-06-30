@@ -1740,7 +1740,7 @@ def _backup_path_for_target(target: Path) -> Path:
 
 
 def _remove_download_tmp(tmp_dir: Path) -> None:
-    if not tmp_dir.exists():
+    if not (tmp_dir.exists() or tmp_dir.is_symlink()):
         return
     if tmp_dir.is_dir() and not tmp_dir.is_symlink():
         shutil.rmtree(tmp_dir)

@@ -1785,6 +1785,28 @@ def test_prepare_model_removes_stale_download_tmp_before_download(tmp_path):
     assert (target / "model.safetensors").read_text(encoding="utf-8") == "fresh-model"
 
 
+def test_prepare_model_removes_broken_download_tmp_symlink(tmp_path):
+    target = tmp_path / "model"
+    tmp_download = tmp_path / "model.download-tmp"
+    try:
+        tmp_download.symlink_to(tmp_path / "missing-download-target", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink is not supported: {exc}")
+    runner = ModelDownloadRunner(tmp_path, marker="fresh-model")
+
+    result = ab.prepare_model(
+        modelscope_id="Qwen/Qwen2.5-1.5B-Instruct",
+        target=target,
+        bench_image="bench:offline",
+        runner=runner,
+    )
+
+    assert result == 0
+    assert target.is_dir()
+    assert not tmp_download.is_symlink()
+    assert (target / "model.safetensors").read_text(encoding="utf-8") == "fresh-model"
+
+
 def test_prepare_model_existing_complete_skips_download(tmp_path, capsys):
     target = tmp_path / "model"
     write_model_files(target)
