@@ -2363,6 +2363,26 @@ def test_run_controller_corrupt_lock_fail_closed(tmp_path, capsys):
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
+def test_run_controller_releases_lock_when_cleanup_terminal_state_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+
+    monkeypatch.setattr(ab, "cleanup_network", lambda *args, **kwargs: True)
+
+    def fail_terminal_state(*args, **kwargs):
+        raise OSError("terminal state write failed")
+
+    monkeypatch.setattr(ab, "write_terminal_state", fail_terminal_state)
+
+    with pytest.raises(OSError, match="terminal state write failed"):
+        ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert not (run_dir / ".run.lock").exists()
+
+
 def test_start_detached_popen_failure_writes_failed_state(tmp_path, monkeypatch, capsys):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     config = ab.load_config(config_path)

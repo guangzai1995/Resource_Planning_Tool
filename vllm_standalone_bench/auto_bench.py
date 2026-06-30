@@ -1669,24 +1669,26 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         write_terminal_state(run_dir, run_id, manifest, "failed", error=str(exc))
         exit_code = 1
     finally:
-        cleanup_interrupted = cleanup_network(
-            config,
-            active_runner,
-            network_owned,
-            False,
-            run_id=run_id,
-        )
-        if cleanup_interrupted:
-            write_terminal_state(
-                run_dir,
-                run_id,
-                manifest,
-                "interrupted",
-                error="stop requested during network cleanup",
+        try:
+            cleanup_interrupted = cleanup_network(
+                config,
+                active_runner,
+                network_owned,
+                False,
+                run_id=run_id,
             )
-            exit_code = 130
-        if run_lock is not None:
-            release_run_lock(run_lock)
+            if cleanup_interrupted:
+                write_terminal_state(
+                    run_dir,
+                    run_id,
+                    manifest,
+                    "interrupted",
+                    error="stop requested during network cleanup",
+                )
+                exit_code = 130
+        finally:
+            if run_lock is not None:
+                release_run_lock(run_lock)
     return exit_code
 
 
