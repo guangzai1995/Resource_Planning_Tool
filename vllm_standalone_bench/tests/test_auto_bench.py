@@ -7,6 +7,8 @@ import pytest
 
 import auto_bench as ab
 
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
+
 
 def write_config(tmp_path, data):
     path = tmp_path / "config.json"
@@ -3069,3 +3071,17 @@ def test_build_bench_command_omits_warmup_opts_when_none(tmp_path):
     cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
     assert "--warmup-concurrency" not in cmd
     assert "--warmup-output-len" not in cmd
+
+
+def test_sglang_compare_config_enables_fixed_warmup():
+    cfg = json.loads((CONFIG_DIR / "auto_bench.qwen2_5_1_5b.sglang_compare.json").read_text())
+    bp = cfg["bench_profiles"][0]
+    assert bp["warmup_concurrency"] == 4
+    assert bp["warmup_output_len"] == 128
+
+
+def test_smoke_config_enables_fixed_warmup():
+    cfg = json.loads((CONFIG_DIR / "auto_bench.qwen2_5_1_5b.smoke.json").read_text())
+    bp = cfg["bench_profiles"][0]
+    assert bp["warmup_concurrency"] == 4
+    assert bp["warmup_output_len"] == 128
