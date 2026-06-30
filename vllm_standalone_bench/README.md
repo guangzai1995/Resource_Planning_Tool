@@ -117,7 +117,7 @@ python3 vllm_standalone_bench/auto_bench.py stop \
   --run-id <run_id>
 ```
 
-默认使用 Docker bridge network `vllm-bench-net`，不使用 `--network host`，也不暴露主机端口。控制器只会清理本次自动创建并带有本次运行标签的 Docker network。
+默认使用 Docker bridge network `vllm-bench-net`，不使用 `--network host`，也不暴露主机端口。控制器只会清理本次自动创建并带有本次运行标签或元数据的资源，包括 vLLM 容器和 Docker network；`stop` 会请求后台控制器优雅退出并执行这些清理。
 
 ### 当前主机 smoke 验证
 
