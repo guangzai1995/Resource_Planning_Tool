@@ -111,3 +111,27 @@ def test_metrics_cached_fields_default_zero():
     )
     assert metrics.total_cached_tokens == 0
     assert metrics.cached_reported_count == 0
+
+
+def test_resolve_warmup_config_defaults_to_profile_values():
+    cc, ol = serve.resolve_warmup_config(
+        max_concurrency=8, warmup_concurrency=None,
+        output_len=1024, warmup_output_len=None)
+    assert cc == 8
+    assert ol == 1024
+
+
+def test_resolve_warmup_config_overrides_when_set():
+    cc, ol = serve.resolve_warmup_config(
+        max_concurrency=8, warmup_concurrency=4,
+        output_len=1024, warmup_output_len=128)
+    assert cc == 4
+    assert ol == 128
+
+
+def test_resolve_warmup_config_concurrency_none_falls_back_even_when_output_set():
+    cc, ol = serve.resolve_warmup_config(
+        max_concurrency=16, warmup_concurrency=None,
+        output_len=1024, warmup_output_len=128)
+    assert cc == 16
+    assert ol == 128

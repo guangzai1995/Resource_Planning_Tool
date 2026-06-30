@@ -410,6 +410,23 @@ def calculate_metrics_for_embeddings(
     return metrics
 
 
+def resolve_warmup_config(
+    *,
+    max_concurrency: int | None,
+    warmup_concurrency: int | None,
+    output_len: int,
+    warmup_output_len: int | None,
+) -> tuple[int | None, int]:
+    """Resolve warmup concurrency and output length.
+
+    Falls back to max_concurrency when warmup_concurrency is None (backward compatible);
+    falls back to the profile output_len when warmup_output_len is None.
+    """
+    cc = warmup_concurrency if warmup_concurrency is not None else max_concurrency
+    ol = warmup_output_len if warmup_output_len is not None else output_len
+    return cc, ol
+
+
 def calculate_metrics(
     input_requests: list[SampleRequest],
     outputs: list[RequestFuncOutput],
@@ -664,6 +681,8 @@ async def benchmark(
     extra_headers: dict | None,
     extra_body: dict | None,
     lora_assignment: Literal["random", "round-robin"] = "random",
+    warmup_concurrency: int | None = None,
+    warmup_output_len: int | None = None,
     ramp_up_strategy: Literal["linear", "exponential"] | None = None,
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
@@ -712,13 +731,19 @@ async def benchmark(
             and all(isinstance(item, dict) for item in test_mm_content)
         )
     ), "multi_modal_data must be a dict or list[dict]"
+    warmup_cc, warmup_ol = resolve_warmup_config(
+        max_concurrency=max_concurrency,
+        warmup_concurrency=warmup_concurrency,
+        output_len=test_output_len,
+        warmup_output_len=warmup_output_len,
+    )
     test_input = RequestFuncInput(
         model=model_id,
         model_name=model_name,
         prompt=test_prompt,
         api_url=api_url,
         prompt_len=test_prompt_len,
-        output_len=test_output_len,
+        output_len=warmup_ol,
         logprobs=logprobs,
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
@@ -748,8 +773,8 @@ async def benchmark(
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
         warmup_semaphore = (
-            asyncio.Semaphore(max_concurrency)
-            if max_concurrency
+            asyncio.Semaphore(warmup_cc)
+            if warmup_cc
             else contextlib.nullcontext()
         )
         warmup_tasks = []
@@ -1918,6 +1943,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ignore_eos=args.ignore_eos,
         goodput_config_dict=goodput_config_dict,
         max_concurrency=args.max_concurrency,
+        warmup_concurrency=getattr(args, "warmup_concurrency", None),
+        warmup_output_len=getattr(args, "warmup_output_len", None),
         lora_modules=args.lora_modules,
         lora_assignment=args.lora_assignment,
         extra_headers=headers,
