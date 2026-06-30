@@ -46,6 +46,19 @@ AUDIT_COLUMNS = [
     "assumption_notes",
 ]
 
+REFERENCE_COLUMNS = [
+    "source_file",
+    "gpu_family",
+    "model",
+    "gpu_count",
+    "rows",
+    "mean_throughput_tokens_s",
+    "max_throughput_tokens_s",
+    "min_decode_latency_mean_ms",
+    "mean_ttft_ms",
+    "note",
+]
+
 
 @dataclass(frozen=True)
 class GpuAssumption:
@@ -316,3 +329,31 @@ def build_estimates(
                 )
             )
     return pd.DataFrame(output_rows, columns=SOURCE_COLUMNS + AUDIT_COLUMNS)
+
+
+def summarize_910b_reference(data_dir: Path) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for csv_path in sorted(data_dir.glob("910B*/**/*.csv")):
+        rel_parts = csv_path.relative_to(data_dir).parts
+        if len(rel_parts) < 3:
+            continue
+        gpu_family, model_name, filename = rel_parts[0], rel_parts[1], rel_parts[2]
+        gpu_count = Path(filename).stem
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            continue
+        rows.append(
+            {
+                "source_file": str(csv_path),
+                "gpu_family": gpu_family,
+                "model": model_name,
+                "gpu_count": gpu_count,
+                "rows": len(df),
+                "mean_throughput_tokens_s": round(float(df["输出tokens总吞吐"].mean()), 4),
+                "max_throughput_tokens_s": round(float(df["输出tokens总吞吐"].max()), 4),
+                "min_decode_latency_mean_ms": round(float(df["平均增量时延（ms）"].min()), 4),
+                "mean_ttft_ms": round(float(df["平均首tokens时延（ms）"].mean()), 4),
+                "note": "低利用率参考，不参与估算校准",
+            }
+        )
+    return pd.DataFrame(rows, columns=REFERENCE_COLUMNS)

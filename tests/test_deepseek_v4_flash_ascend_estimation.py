@@ -13,6 +13,7 @@ from scripts.estimate_deepseek_v4_flash_ascend import (
     estimate_row,
     load_p800_baseline,
     required_memory_per_card_gb,
+    summarize_910b_reference,
 )
 
 
@@ -127,3 +128,34 @@ def test_build_estimates_creates_910b_and_910c_rows(tmp_path):
     assert len(estimates) == 4
     assert list(estimates.columns[: len(SOURCE_COLUMNS)]) == SOURCE_COLUMNS
     assert {"base_row", "compute_scale", "bandwidth_scale", "decode_scale", "confidence"}.issubset(estimates.columns)
+
+
+def write_reference_csv(path: Path, throughput: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "输入长度,输出长度,并发数,输出tokens总吞吐,首tokens时延TP90（ms）,首tokens时延TP99（ms）,最大首tokens时延（ms）,平均首tokens时延（ms）,增量时延TP90（ms）,增量时延TP99（ms）,最大增量时延（ms）,平均增量时延（ms）",
+                f"2048,1200,1,{throughput},320,330,340,310,30,35,55,29",
+                f"2048,1200,4,{throughput * 2},1100,1110,1120,1000,32,38,58,30",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_910b_reference_summary_does_not_change_estimates(tmp_path):
+    workbook = tmp_path / "资源规划工具.xlsx"
+    write_baseline_workbook(workbook)
+    baseline_rows = load_p800_baseline(workbook)
+    before = build_estimates(baseline_rows)
+
+    write_reference_csv(tmp_path / "data" / "910B1" / "72B-AWQ" / "8.csv", 10.0)
+    first_summary = summarize_910b_reference(tmp_path / "data")
+    write_reference_csv(tmp_path / "data" / "910B1" / "72B-AWQ" / "8.csv", 9999.0)
+    second_summary = summarize_910b_reference(tmp_path / "data")
+    after = build_estimates(baseline_rows)
+
+    assert first_summary.loc[0, "mean_throughput_tokens_s"] != second_summary.loc[0, "mean_throughput_tokens_s"]
+    pd.testing.assert_frame_equal(before, after)
