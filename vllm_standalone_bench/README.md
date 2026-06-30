@@ -139,6 +139,30 @@ python3 vllm_standalone_bench/auto_bench.py run \
   --config vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json
 ```
 
+## vLLM / SGLang 同台对比
+
+通过 `serve_profiles` 的 `engine` 字段与 `run.images` 映射，可在同一次 run 内分别启动 vLLM 与 SGLang 做对比。样例：`configs/auto_bench.qwen2_5_1_5b.sglang_compare.json`。
+
+### SGLang 镜像离线搬运
+
+```bash
+# 联网机
+docker pull lmsysorg/sglang:latest
+docker save lmsysorg/sglang:latest -o sglang.offline.tar
+# 离线机
+docker load -i sglang.offline.tar
+```
+
+### 常用启动参数等价（仅文档参考，配置里 `args` 原样透传，不自动翻译）
+
+| 用途 | vLLM | SGLang |
+|---|---|---|
+| 显存占用比例 | `--gpu-memory-utilization` | `--mem-fraction-static` |
+| 张量并行 | `--tensor-parallel-size` | `--tp-size` |
+| 最大上下文 | `--max-model-len` | `--context-length` |
+
+run 结束后在 `results/<run_id>/` 产出 `compare.csv`、`compare.xlsx` 与 `plots/*.png`，各引擎原始 `result.csv` 保留在 `<model>/<serve_profile>/<bench_profile>/` 子目录。
+
 ## 使用方法
 
 ### 基本用法（Random 数据集）

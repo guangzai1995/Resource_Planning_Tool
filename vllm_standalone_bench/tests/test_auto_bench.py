@@ -2947,3 +2947,16 @@ def test_controller_dry_run_skips_aggregate(tmp_path, monkeypatch):
     ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
 
     assert calls == []
+
+
+def test_shipped_sglang_compare_config_parses():
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "auto_bench.qwen2_5_1_5b.sglang_compare.json"
+    )
+    config = ab.load_config(path)
+    engines = {profile.engine for profile in config.serve_profiles}
+    assert engines == {"vllm", "sglang"}
+    assert "vllm" in config.run.images
+    assert "sglang" in config.run.images
