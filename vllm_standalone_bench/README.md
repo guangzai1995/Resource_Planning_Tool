@@ -163,6 +163,17 @@ docker load -i sglang.offline.tar
 
 run 结束后在 `results/<run_id>/` 产出 `compare.csv`、`compare.xlsx` 与 `plots/*.png`，各引擎原始 `result.csv` 保留在 `<model>/<serve_profile>/<bench_profile>/` 子目录。
 
+### 固定并发预热（消除小并发档 TTFT 首批尖峰）
+
+`bench_profile` 可选字段：
+- `warmup_concurrency`：warmup 固定并发数（默认 `null`=跟随该档并发）
+- `warmup_output_len`：warmup 请求输出长度（默认 `null`=跟随该档输出）
+
+整个测试仅在首个配置前预热一次：用固定并发 × 首个配置输入 × 指定输出长度，
+凑齐一波满并发，热起 vLLM 多请求调度路径。`smoke` / `sglang_compare` 配置
+默认 `warmup_concurrency=4`、`warmup_output_len=128`。CLI 直跑可用
+`--warmup-concurrency 4 --warmup-output-len 128`。
+
 ## 使用方法
 
 ### 基本用法（Random 数据集）
