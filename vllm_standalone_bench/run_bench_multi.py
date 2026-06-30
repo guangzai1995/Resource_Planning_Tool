@@ -284,12 +284,17 @@ def _extract_row(
     completed = _i('completed')
     total_in = _i('total_input_tokens')
     total_out = _i('total_output_tokens')
+    total_cached = _i('total_cached_tokens')
 
     # ── 真实平均 token 数（来自服务端上报的总量）─────────────────────────────
     # 注意：completed==0（全部失败）时回退 0.0，【不】回退 requested 值——
     # 否则会把零成功伪装成"按指定长度输出"，复发 Bug①。
     avg_in = round(total_in / completed, 1) if completed > 0 else 0.0
     avg_out = round(total_out / completed, 1) if completed > 0 else 0.0
+    avg_cached_tokens = round(total_cached / completed, 1) if completed > 0 else 0.0
+    cache_hit_rate = (
+        round(total_cached / total_in * 100, 1) if total_in > 0 else 0.0
+    )
 
     # ── token 计数来源 ────────────────────────────────────────────────────────
     token_source = decide_token_usage_source(
@@ -343,6 +348,8 @@ def _extract_row(
         'output_compliance':   output_compliance,
         'finish_reason_length_pct': finish_reason_length_pct,
         'token_source':        token_source,
+        'avg_cached_tokens':   avg_cached_tokens,   # 平均命中缓存的 prompt token 数
+        'cache_hit_rate':      cache_hit_rate,       # token 加权缓存命中率 (%) = total_cached/total_in*100
         # ── 吞吐量 ──────────────────────────────────
         'throughput_req_s':   _f('request_throughput'),
         'throughput_tok_s':   _f('output_throughput'),  # 输出 Token 系统吞吐，vLLM 官方口径
@@ -379,6 +386,7 @@ CSV_HEADERS = [
     'avg_input_tokens', 'avg_output_tokens',
     'input_compliance', 'output_compliance',
     'finish_reason_length_pct', 'token_source',
+    'avg_cached_tokens', 'cache_hit_rate',
     'throughput_req_s', 'throughput_tok_s', 'input_throughput_tok_s',
     'prefill_effective_tok_s', 'decode_effective_tok_s',
     'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
@@ -394,6 +402,7 @@ CSV_HEADERS_ZH = [
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
     '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
+    '平均缓存命中tokens', '缓存命中率(%)',
     '请求吞吐(req/s)', '输出Token系统吞吐(tok/s)', '输入Token系统吞吐(tok/s)',
     'Prefill有效速率(tok/s)', 'Decode有效速率(tok/s)',
     'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
