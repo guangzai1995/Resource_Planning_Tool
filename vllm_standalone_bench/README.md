@@ -233,6 +233,12 @@ python3 vllm_standalone_bench/run_bench_serve.py \
 | **input_throughput_tok_s** | 输入 Token 系统吞吐 | `total_input_tokens / benchmark_duration` |
 | **prefill_effective_tok_s** | Prefill 有效速率 | `avg_input_tokens / mean_TTFT_s`，TTFT 包含排队、调度和首 token |
 | **decode_effective_tok_s** | Decode 有效速率 | `1 / mean_TPOT_s`，基于 TPOT 的 next-token decode 近似速率 |
+| **cache_hit_rate** | 缓存命中率 | `avg_cached_tokens / avg_input_tokens`，统计输入 tokens 中从缓存命中的比例 |
+| **avg_cached_tokens** | 平均缓存 Token 数 | 每个请求平均从 prefix cache 命中的 token 数 |
+
+> **缓存命中率（`cache_hit_rate`）**：统计结果中的 `cache_hit_rate` / `avg_cached_tokens`
+> 取自响应 `usage.cached_tokens`。该值非零需要服务端开启前缀缓存
+> （vLLM `--enable-prefix-caching`；SGLang 对应缓存开关）；未开启时命中率为 0。
 
 ## 与 benchmark_tools 的关键差异
 

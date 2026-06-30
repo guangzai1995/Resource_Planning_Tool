@@ -208,6 +208,8 @@ class BenchmarkMetrics:
     finish_reason_length: int = 0      # finish_reason == "length" 的成功请求数
     usage_reported_count: int = 0      # 服务端流式上报了 output_tokens 的成功请求数
     tokenizer_fallback_count: int = 0  # 未上报 usage 时用 tokenizer 回退统计的成功请求数
+    total_cached_tokens: int = 0       # 命中 prefix cache 的 prompt token 总数（usage.cached_tokens 累计）
+    cached_reported_count: int = 0     # 服务端上报了 cached_tokens 字段的成功请求数
 
 
 @dataclass
@@ -435,6 +437,8 @@ def calculate_metrics(
     finish_reason_length = 0
     usage_reported_count = 0
     tokenizer_fallback_count = 0
+    total_cached = 0
+    cached_reported_count = 0
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
@@ -467,6 +471,9 @@ def calculate_metrics(
                     tokenizer_fallback_count += 1
             actual_output_lens.append(output_len)
             total_input += outputs[i].prompt_len
+            total_cached += outputs[i].cached_tokens
+            if outputs[i].cached_reported:
+                cached_reported_count += 1
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
@@ -626,6 +633,8 @@ def calculate_metrics(
         finish_reason_length=finish_reason_length,
         usage_reported_count=usage_reported_count,
         tokenizer_fallback_count=tokenizer_fallback_count,
+        total_cached_tokens=total_cached,
+        cached_reported_count=cached_reported_count,
     )
 
     return metrics, actual_output_lens
@@ -1037,6 +1046,8 @@ async def benchmark(
             "finish_reason_length": metrics.finish_reason_length,
             "usage_reported_count": metrics.usage_reported_count,
             "tokenizer_fallback_count": metrics.tokenizer_fallback_count,
+            "total_cached_tokens": metrics.total_cached_tokens,
+            "cached_reported_count": metrics.cached_reported_count,
         }
     else:
         result = {

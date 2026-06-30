@@ -15,7 +15,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # 参与对比的指标（须为 result.csv 真实列名）
-COMPARE_METRICS = ("throughput_tok_s", "ttft_p50_ms", "ttft_p90_ms", "tpot_p50_ms")
+COMPARE_METRICS = ("throughput_tok_s", "ttft_p50_ms", "ttft_p90_ms", "tpot_p50_ms", "cache_hit_rate")
 PLOT_METRICS = ("throughput_tok_s", "ttft_p50_ms")
 _PLOT_YLABEL = {
     "throughput_tok_s": "输出吞吐 (tok/s)",

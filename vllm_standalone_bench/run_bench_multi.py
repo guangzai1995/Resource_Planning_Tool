@@ -284,12 +284,17 @@ def _extract_row(
     completed = _i('completed')
     total_in = _i('total_input_tokens')
     total_out = _i('total_output_tokens')
+    total_cached = _i('total_cached_tokens')
 
     # ── 真实平均 token 数（来自服务端上报的总量）─────────────────────────────
     # 注意：completed==0（全部失败）时回退 0.0，【不】回退 requested 值——
     # 否则会把零成功伪装成"按指定长度输出"，复发 Bug①。
     avg_in = round(total_in / completed, 1) if completed > 0 else 0.0
     avg_out = round(total_out / completed, 1) if completed > 0 else 0.0
+    avg_cached_tokens = round(total_cached / completed, 1) if completed > 0 else 0.0
+    cache_hit_rate = (
+        round(total_cached / total_in * 100, 1) if total_in > 0 else 0.0
+    )
 
     # ── token 计数来源 ────────────────────────────────────────────────────────
     token_source = decide_token_usage_source(
@@ -343,6 +348,8 @@ def _extract_row(
         'output_compliance':   output_compliance,
         'finish_reason_length_pct': finish_reason_length_pct,
         'token_source':        token_source,
+        'avg_cached_tokens':   avg_cached_tokens,   # 平均命中缓存的 prompt token 数
+        'cache_hit_rate':      cache_hit_rate,       # token 加权缓存命中率 (%) = total_cached/total_in*100
         # ── 吞吐量 ──────────────────────────────────
         'throughput_req_s':   _f('request_throughput'),
         'throughput_tok_s':   _f('output_throughput'),  # 输出 Token 系统吞吐，vLLM 官方口径
@@ -379,6 +386,7 @@ CSV_HEADERS = [
     'avg_input_tokens', 'avg_output_tokens',
     'input_compliance', 'output_compliance',
     'finish_reason_length_pct', 'token_source',
+    'avg_cached_tokens', 'cache_hit_rate',
     'throughput_req_s', 'throughput_tok_s', 'input_throughput_tok_s',
     'prefill_effective_tok_s', 'decode_effective_tok_s',
     'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
@@ -394,6 +402,7 @@ CSV_HEADERS_ZH = [
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
     '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
+    '平均缓存命中tokens', '缓存命中率(%)',
     '请求吞吐(req/s)', '输出Token系统吞吐(tok/s)', '输入Token系统吞吐(tok/s)',
     'Prefill有效速率(tok/s)', 'Decode有效速率(tok/s)',
     'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
@@ -479,6 +488,8 @@ def save_xlsx(rows: List[dict], path: str) -> None:
         ('input_throughput_tok_s', '输入 Token 系统吞吐量', 'total_input_tokens ÷ benchmark_duration'),
         ('prefill_effective_tok_s', 'Prefill 有效速率', 'avg_input_tokens ÷ mean_TTFT_s；TTFT 含排队、调度和首 token'),
         ('decode_effective_tok_s', 'Decode 有效速率', '1 ÷ mean_TPOT_s；基于 TPOT 的 next-token decode 近似速率'),
+        ('avg_cached_tokens', '平均缓存命中 tokens', 'total_cached_tokens ÷ completed（服务端 usage.cached_tokens 累计）'),
+        ('cache_hit_rate', '缓存命中率(%)', 'total_cached_tokens ÷ total_input_tokens × 100（token 加权；仅服务端开启 prefix caching 时非零）'),
         ('P50/P90/P99', '百分位数', 'P90 表示 90% 请求低于该延迟值'),
         ('', '', ''),
         ('并发控制说明', '',
@@ -855,6 +866,7 @@ def main() -> None:
     print(
         f"{'输入':>6} {'输出':>6} {'并发':>5} "
         f"{'out_sys':>10} {'in_sys':>10} {'prefill':>10} {'decode':>10} {'req/s':>8} "
+        f"{'命中%':>8} "
         f"{'TTFT均值':>10} {'TTFT_P90':>10} "
         f"{'TPOT均值':>10} {'E2EL均值':>10} {'成功':>6}"
     )
@@ -867,6 +879,7 @@ def main() -> None:
             f"{r['prefill_effective_tok_s']:>10.1f} "
             f"{r['decode_effective_tok_s']:>10.1f} "
             f"{r['throughput_req_s']:>8.3f} "
+            f"{r['cache_hit_rate']:>8.1f} "
             f"{r['ttft_mean_ms']:>10.1f} {r['ttft_p90_ms']:>10.1f} "
             f"{r['tpot_mean_ms']:>10.3f} {r['e2el_mean_ms']:>10.1f} {r['n_success']:>6}"
         )
