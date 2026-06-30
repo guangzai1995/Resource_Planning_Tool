@@ -55,6 +55,88 @@ pip install -r requirements.txt
 
 **不需要安装 vllm！** 仅依赖 `aiohttp`、`numpy`、`tqdm`。
 
+## 离线双镜像自动化压测
+
+`auto_bench.py` 是离线自动化压测入口。主机侧只需要 Docker CLI、可用的 GPU container runtime 和 Python 3；benchmark 运行依赖封装在 `vllm-bench-runner:offline` 镜像中，不需要在主机安装 `openpyxl`、ModelScope 或 benchmark Python 依赖。
+
+### 构建和搬运 bench-runner
+
+在联网环境构建 benchmark runner 镜像：
+
+```bash
+docker build \
+  -f vllm_standalone_bench/Dockerfile.bench-runner \
+  -t vllm-bench-runner:offline \
+  vllm_standalone_bench
+
+docker save vllm-bench-runner:offline -o vllm-bench-runner.offline.tar
+```
+
+在离线环境导入 bench-runner 和 vLLM 镜像：
+
+```bash
+docker load -i vllm-bench-runner.offline.tar
+docker load -i vllm.offline.tar
+```
+
+示例配置默认使用 vLLM 镜像 ID `009e4cb46541`，并使用 `vllm-bench-runner:offline` 发起压测。
+
+### 准备 Qwen smoke 模型
+
+联网或可访问 ModelScope 缓存的环境中，使用 bench-runner 将模型准备到计划路径：
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py prepare-model \
+  --modelscope-id Qwen/Qwen2.5-1.5B-Instruct \
+  --target /Resource_Planning_Tool/model/Qwen2.5-1.5B-Instruct \
+  --bench-image vllm-bench-runner:offline
+```
+
+配置中的容器内模型路径保持为 `/models/Qwen2.5-1.5B-Instruct`。
+
+### 前台运行
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json
+```
+
+### 后台运行和控制
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json \
+  --detach
+
+python3 vllm_standalone_bench/auto_bench.py status \
+  --results-dir vllm_standalone_bench/results \
+  --run-id <run_id>
+
+python3 vllm_standalone_bench/auto_bench.py logs \
+  --results-dir vllm_standalone_bench/results \
+  --run-id <run_id> \
+  --follow
+
+python3 vllm_standalone_bench/auto_bench.py stop \
+  --results-dir vllm_standalone_bench/results \
+  --run-id <run_id>
+```
+
+默认使用 Docker bridge network `vllm-bench-net`，不使用 `--network host`，也不暴露主机端口。控制器只会清理本次自动创建并带有本次运行标签的 Docker network。
+
+### 当前主机 smoke 验证
+
+先用 dry-run 检查将要执行的 Docker 命令，不启动容器：
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json \
+  --run-id docs_dry_run \
+  --dry-run
+```
+
+dry-run 会写入 `vllm_standalone_bench/results/docs_dry_run/config.resolved.json` 作为 resolved config preview，但不会写 manifest、state 或 benchmark 结果文件。
+
 ## 使用方法
 
 ### 基本用法（Random 数据集）
