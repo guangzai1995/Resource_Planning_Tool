@@ -2208,6 +2208,83 @@ def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, c
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
+def test_run_controller_rejects_active_state_without_pid_file(tmp_path, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert state["status"] == "running"
+    assert "active" in captured.err
+    assert not (run_dir / "config.resolved.json").exists()
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_run_controller_rejects_active_state_with_invalid_pid_file(tmp_path, capsys):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "starting",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+    (run_dir / "controller.pid").write_text("not-a-pid\n", encoding="utf-8")
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert result == 1
+    assert state["status"] == "starting"
+    assert "active" in captured.err
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, capsys):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".run.lock").write_text("locked\n", encoding="utf-8")
+
+    def fail_popen(*args, **kwargs):
+        raise AssertionError("locked run should not start another controller")
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fail_popen)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "active" in captured.err
+    assert (run_dir / ".run.lock").exists()
+
+
+def test_run_controller_releases_lock_after_success(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_dir = tmp_path / "results" / "run123"
+    first_runner = FakeRunner()
+
+    first = ab.run_controller(config, run_id="run123", runner=first_runner, dry_run=False)
+    second = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert first == 0
+    assert second == 0
+    assert not (run_dir / ".run.lock").exists()
+
+
 def test_start_detached_popen_failure_writes_failed_state(tmp_path, monkeypatch, capsys):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     config = ab.load_config(config_path)

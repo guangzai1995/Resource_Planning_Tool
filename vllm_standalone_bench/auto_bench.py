@@ -1078,6 +1078,116 @@ def is_process_running(pid: int) -> bool:
     return True
 
 
+RUN_LOCK_FILE = ".run.lock"
+
+
+@dataclass(frozen=True)
+class RunLock:
+    run_dir: Path
+    token: str
+
+
+def run_lock_path(run_dir: Path) -> Path:
+    return run_dir / RUN_LOCK_FILE
+
+
+def _run_lock_payload(token: str, pid: int | None = None) -> dict[str, Any]:
+    return {
+        "pid": os.getpid() if pid is None else pid,
+        "token": token,
+        "created_at": time.time(),
+    }
+
+
+def _read_run_lock(run_dir: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(run_lock_path(run_dir).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def run_lock_token_matches(run_dir: Path, token: str | None) -> bool:
+    if token is None:
+        return False
+    payload = _read_run_lock(run_dir)
+    return payload is not None and payload.get("token") == token
+
+
+def acquire_run_lock(run_dir: Path, token: str | None = None) -> RunLock:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if token is not None:
+        if not run_lock_token_matches(run_dir, token):
+            raise RuntimeError(f"run already active: {run_dir}")
+        write_json_atomic(run_lock_path(run_dir), _run_lock_payload(token))
+        return RunLock(run_dir=run_dir, token=token)
+
+    new_token = secrets.token_hex(16)
+    lock_path = run_lock_path(run_dir)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise RuntimeError(f"run already active: {run_dir}") from exc
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(_run_lock_payload(new_token), handle)
+    return RunLock(run_dir=run_dir, token=new_token)
+
+
+def update_run_lock_owner(lock: RunLock, pid: int) -> None:
+    if run_lock_token_matches(lock.run_dir, lock.token):
+        write_json_atomic(run_lock_path(lock.run_dir), _run_lock_payload(lock.token, pid=pid))
+
+
+def release_run_lock(lock: RunLock) -> None:
+    lock_path = run_lock_path(lock.run_dir)
+    if not run_lock_token_matches(lock.run_dir, lock.token):
+        return
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def release_run_lock_for_token(run_dir: Path | None, token: str | None) -> None:
+    if run_dir is None or token is None:
+        return
+    release_run_lock(RunLock(run_dir=run_dir, token=token))
+
+
+def active_state_blocks_start(run_dir: Path, *, allow_pid: int | None = None,
+                              lock_token: str | None = None) -> bool:
+    state_path = run_dir / "state.json"
+    if not state_path.exists():
+        return False
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(state, dict) or state.get("status") not in ("starting", "running"):
+        return False
+    if run_lock_token_matches(run_dir, lock_token):
+        return False
+    pid_path = run_dir / "controller.pid"
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeDecodeError, ValueError):
+        print(
+            f"run is already active but controller pid is unavailable: {run_dir}",
+            file=sys.stderr,
+        )
+        return True
+    if allow_pid is not None and pid == allow_pid:
+        return False
+    if pid <= 1:
+        print(f"run is already active with invalid controller pid: {run_dir}", file=sys.stderr)
+        return True
+    if is_process_running(pid):
+        print(f"run is already active: {run_dir} (pid {pid})", file=sys.stderr)
+        return True
+    return False
+
+
 def active_run_pid(run_dir: Path) -> int | None:
     state_path = run_dir / "state.json"
     pid_path = run_dir / "controller.pid"
@@ -1097,7 +1207,13 @@ def active_run_pid(run_dir: Path) -> int | None:
     return pid
 
 
-def reject_active_run(run_dir: Path, *, allow_pid: int | None = None) -> bool:
+def reject_active_run(run_dir: Path, *, allow_pid: int | None = None,
+                      lock_token: str | None = None) -> bool:
+    if active_state_blocks_start(run_dir, allow_pid=allow_pid, lock_token=lock_token):
+        return True
+    if run_lock_path(run_dir).exists() and not run_lock_token_matches(run_dir, lock_token):
+        print(f"run is already active: {run_dir}", file=sys.stderr)
+        return True
     pid = active_run_pid(run_dir)
     if pid is None or pid == allow_pid:
         return False
@@ -1281,14 +1397,24 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
 
 def run_controller(config: AutoBenchConfig, run_id: str,
                    runner: Runner | None = None,
-                   dry_run: bool = False) -> int:
+                   dry_run: bool = False,
+                   lock_token: str | None = None) -> int:
     active_runner: Runner = runner or DockerRunner()
     if dry_run:
         return _run_controller_dry_run(config, run_id)
 
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
-    if reject_active_run(run_dir, allow_pid=os.getpid()):
+    if reject_active_run(run_dir, allow_pid=os.getpid(), lock_token=lock_token):
+        return 1
+    run_lock: RunLock | None = None
+    try:
+        run_lock = acquire_run_lock(run_dir, token=lock_token)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if reject_active_run(run_dir, allow_pid=os.getpid(), lock_token=run_lock.token):
+        release_run_lock(run_lock)
         return 1
     manifest = Manifest(run_id=run_id, total=len(cases))
 
@@ -1521,12 +1647,15 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                 error="stop requested during network cleanup",
             )
             exit_code = 130
+        if run_lock is not None:
+            release_run_lock(run_lock)
     return exit_code
 
 
 def build_detach_command(config_path: Path, run_id: str,
-                         results_dir: Path) -> list[str]:
-    return [
+                         results_dir: Path,
+                         lock_token: str | None = None) -> list[str]:
+    cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
         "run",
@@ -1538,6 +1667,9 @@ def build_detach_command(config_path: Path, run_id: str,
         "--results-dir",
         str(results_dir),
     ]
+    if lock_token is not None:
+        cmd.extend(["--lock-token", lock_token])
+    return cmd
 
 
 def _detached_state(run_id: str, status: str, total: int,
@@ -1563,11 +1695,22 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
     run_dir = config.run.results_dir / run_id
     if reject_active_run(run_dir):
         return 1
+    run_lock: RunLock | None = None
+    try:
+        run_lock = acquire_run_lock(run_dir)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if reject_active_run(run_dir, lock_token=run_lock.token):
+        release_run_lock(run_lock)
+        return 1
     run_dir.mkdir(parents=True, exist_ok=True)
     cases = expand_cases(config, run_id=run_id)
     total = len(cases)
 
     def fail_start(error: str) -> int:
+        if run_lock is not None:
+            release_run_lock(run_lock)
         write_state(run_dir, _detached_state(run_id, "failed", total, error=error))
         print(f"failed to start detached controller: {error}", file=sys.stderr)
         return 1
@@ -1580,7 +1723,12 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
     write_state(run_dir, _detached_state(run_id, "starting", total))
 
     log_path = run_dir / "controller.log"
-    command = build_detach_command(config_path, run_id, config.run.results_dir)
+    command = build_detach_command(
+        config_path,
+        run_id,
+        config.run.results_dir,
+        lock_token=run_lock.token,
+    )
     process: subprocess.Popen[Any] | None = None
     try:
         with log_path.open("ab") as log_file:
@@ -1599,6 +1747,7 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
             "config_path": str(config_path),
             "started_at": time.time(),
         })
+        update_run_lock_owner(run_lock, process.pid)
     except OSError as exc:
         if process is not None:
             try:
@@ -2010,6 +2159,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_parser.add_argument("--child", action="store_true")
     run_parser.add_argument("--dry-run", action="store_true")
     run_parser.add_argument("--results-dir", type=Path, help=argparse.SUPPRESS)
+    run_parser.add_argument("--lock-token", help=argparse.SUPPRESS)
 
     status_parser = subparsers.add_parser("status", help="show run status")
     status_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
@@ -2052,14 +2202,21 @@ def main(argv: list[str] | None = None) -> int:
             except StopRequested as exc:
                 error = str(exc) or "stop requested"
                 write_child_startup_state(args.results_dir, args.run_id, "interrupted", error)
+                if args.results_dir is not None and args.run_id is not None:
+                    release_run_lock_for_token(args.results_dir / args.run_id, args.lock_token)
                 print(error, file=sys.stderr)
                 return 130
             except Exception as exc:
                 error = str(exc)
                 write_child_startup_state(args.results_dir, args.run_id, "failed", error)
+                if args.results_dir is not None and args.run_id is not None:
+                    release_run_lock_for_token(args.results_dir / args.run_id, args.lock_token)
                 print(error, file=sys.stderr)
                 return 1
-            return run_controller(config, run_id=run_id, dry_run=args.dry_run)
+            controller_kwargs: dict[str, Any] = {"dry_run": args.dry_run}
+            if args.lock_token is not None:
+                controller_kwargs["lock_token"] = args.lock_token
+            return run_controller(config, run_id=run_id, **controller_kwargs)
 
         config = load_config(args.config)
         run_id = args.run_id or make_run_id(config.run.name)
