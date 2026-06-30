@@ -137,6 +137,13 @@ python3 vllm_standalone_bench/auto_bench.py run \
 
 dry-run 会写入 `vllm_standalone_bench/results/docs_dry_run/config.resolved.json` 作为 resolved config preview，但不会写 manifest、state 或 benchmark 结果文件。
 
+准备好 vLLM 镜像、bench-runner 镜像和完整模型后，运行真实 smoke：
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json
+```
+
 ## 使用方法
 
 ### 基本用法（Random 数据集）
