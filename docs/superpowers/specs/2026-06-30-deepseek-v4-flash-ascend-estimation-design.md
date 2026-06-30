@@ -16,13 +16,14 @@
 | 来源 | 用途 | 口径 |
 | --- | --- | --- |
 | `资源规划工具.xlsx` / `671B-P800-8测试数据` | 主基线 | 使用输入长度、输出长度、并发数、吞吐、TTFT、增量时延等实测列 |
-| `backend/app/seed_data.py` 与 `data/rpt.db` | P800 默认规格 | 项目内 P800 口径为 64GB、2000 GB/s、280 BF16 TFLOPS |
+| 用户确认 + `backend/app/seed_data.py` | P800 默认规格 | 本次测试使用的 P800 显存按用户确认的 96GB；带宽/算力沿用项目内 2000 GB/s、280 BF16 TFLOPS 口径 |
 | `data/910B1/*`、`data/910B3/*` | 参考样本 | 只做 sanity check，不参与校准和比例修正 |
 | DeepSeek-V3 Technical Report | DeepSeek MoE 默认模型代理 | 报告摘要说明 DeepSeek-V3 是 671B 总参数、每 token 激活 37B 参数的 MoE 模型：https://arxiv.org/abs/2412.19437 |
+| DeepSeek V4-Flash Hugging Face 模型卡 | 目标模型参数 | 模型卡记录 V4-Flash 为 284B 总参数、每 token 激活 13B 参数：https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash |
 | Serving Large Language Models on Huawei CloudMatrix384 | 910C/CloudMatrix 推理公开参考 | 论文摘要说明 CloudMatrix384 集成 384 个 Ascend 910C NPU，并给出 DeepSeek-R1 推理吞吐结果：https://arxiv.org/abs/2506.12708 |
 | Tom's Hardware CloudMatrix384 报道 | 910C 单卡算力公开参考 | 报道引用 384 卡约 300 PFLOPS BF16 与单 910C 约 780 BF16 TFLOPS，作为公开非厂商默认值：https://www.tomshardware.com/tech-industry/artificial-intelligence/huaweis-new-ai-cloudmatrix-cluster-beats-nvidias-gb200-by-brute-force-uses-4x-the-power |
 
-外部资料只用于默认假设和上限解释。910B 与 910C 的最终规格必须在估算假设表中显式记录；如果内部资料与公开资料冲突，以内部资料为准，并在输出中标注来源。
+公开硬件规格允许进入默认公式假设；公开吞吐 benchmark 和本地低利用率 910B vLLM 数据只用于参考展示，不参与校准。如果内部资料与公开资料冲突，以内部资料为准，并在输出中标注来源。
 
 ## 3. 输入假设
 
@@ -30,7 +31,7 @@
 
 | GPU | 默认来源 | 显存 GB | 带宽 GB/s | BF16 TFLOPS | 说明 |
 | --- | --- | ---: | ---: | ---: | --- |
-| P800 | 项目内规格 | 64 | 2000 | 280 | 作为基线，不改动 |
+| P800 | 用户确认 + 项目内规格 | 96 | 2000 | 280 | 显存使用用户确认的实测卡 96GB；带宽/算力沿用项目口径 |
 | 910B | P800 等价/内部可替换 | 64 | 2000 | 280 | 默认按 P800/910B 等价保守估算 |
 | 910C | 公开资料 + 双 910B 假设 | 128 | 4000 | 780 | BF16 来自公开报道；显存/带宽按双 910B 保守假设，需可配置 |
 
@@ -46,20 +47,20 @@
 
 ### 3.2 模型假设
 
-`DeepSeek v4 flash` 如果没有官方或内部精确配置，默认使用 DeepSeek-V3/R1 同类 MoE 代理：
+本次按 `DeepSeek R1 INT8` 的 P800 实测作为基线，用 `DeepSeek V4-Flash INT8` 作为目标模型。V4-Flash 的公开模型卡口径为 284B 总参数、13B 激活参数；如果内部资料确认 283B/14B，应只替换假设表并重算。
 
-| 字段 | 默认值 | 说明 |
-| --- | ---: | --- |
-| total_params_b | 671 | 权重驻留显存按总参数估算 |
-| active_params_b | 37 | decode/prefill 主计算量按每 token 激活参数估算 |
-| layers | 61 | 沿用项目内 `671B` 模型规格 |
-| hidden_size | 7168 | 沿用项目内 `671B` 模型规格 |
-| num_kv_heads | 128 | 沿用项目内 `671B` 模型规格 |
-| head_size | 128 | 沿用项目内 `671B` 模型规格 |
-| weight_bytes | 1.0 或 2.0 | 默认输出 BF16 与 INT8 两种情景；若 flash 明确量化，按实际改写 |
-| kv_bytes | 2.0 | KV cache 默认 BF16；若启用 FP8 KV，改为 1.0 |
+| 字段 | R1/P800 基线 | V4-Flash 目标 | 说明 |
+| --- | ---: | ---: | --- |
+| total_params_b | 671 | 284 | 权重驻留显存按总参数估算 |
+| active_params_b | 37 | 13 | decode/prefill 主计算量按每 token 激活参数估算 |
+| layers | 61 | 61 | V4-Flash 未公开完整结构时沿用 R1/V3 代理结构 |
+| hidden_size | 7168 | 7168 | 同上 |
+| num_kv_heads | 128 | 128 | 同上 |
+| head_size | 128 | 128 | 同上 |
+| weight_bytes | 1.0 | 1.0 | 用户确认 R1 采用 INT8；V4-Flash 本次也按 INT8 估算 |
+| kv_bytes | 2.0 | 2.0 | KV cache 默认 BF16；若启用 FP8 KV，改为 1.0 |
 
-如果用户提供 DeepSeek v4 flash 的总参数、激活参数、量化方式或 KV 精度，必须覆盖默认代理值；输出中保留 `model_spec_source`。
+如果用户提供 DeepSeek V4-Flash 的内部总参数、激活参数、量化方式或 KV 精度，必须覆盖默认代理值；输出中保留 `model_spec_source`。
 
 ## 4. 估算公式
 
@@ -205,14 +206,14 @@ Sheet 设计：
 
 ## 6.1 联网参考数据使用边界
 
-联网检索到的公开数据进入 `06_联网参考数据`，用于解释风险区间和公开对照，不参与 `02_910B_8卡估算`、`03_910C_8卡估算` 的数值计算。第一版纳入以下参考项：
+联网检索到的公开数据进入 `06_联网参考数据`，用于解释风险区间和公开对照。公开硬件规格可进入 `01_假设表` 并参与公式；公开吞吐 benchmark 不参与 `02_910B_8卡估算`、`03_910C_8卡估算` 的校准。第一版纳入以下参考项：
 
 | 来源 | 硬件 | 模型/场景 | 可记录指标 | 使用边界 |
 | --- | --- | --- | --- | --- |
 | A-IO: Adaptive Inference Orchestration for Memory-Bound NPUs | Ascend 910B | OpenPangu 1B/7B，HuggingFace + PyTorch，非 vLLM/MindIE | 2K 场景 1B/7B TPS、32K 场景准确率、910B 64GB HBM、CANN/HDK 版本 | 单卡小模型参考，不能外推 DeepSeek 8 卡大 MoE |
 | An Empirical Study of OpenPangu Quantization on Ascend NPUs | Ascend 910B1 | OpenPangu 1B/7B，PTQ 精度研究 | 910B1 64GB HBM、PyTorch/torch-npu/Transformers 版本、量化精度结论 | 主要是精度/量化参考，不是吞吐基准 |
 | Serving Large Language Models on Huawei CloudMatrix384 | 384 个 Ascend 910C | DeepSeek-R1 + CloudMatrix-Infer | prefill 6688 tokens/s/NPU、decode 1943 tokens/s/NPU、15ms TPOT 下 538 tokens/s/NPU | 384 卡专用架构与 CloudMatrix-Infer，上限参考，不能直接当 8 卡结果 |
-| Tom's Hardware CloudMatrix384 报道 | Ascend 910C | 公开规格/系统对比 | 910C 780 BF16 TFLOPS、128GB HBM、3.2TB/s HBM 带宽；CloudMatrix384 300 BF16 PFLOPS | 非厂商官方规格，作为默认假设来源并标注可信度 |
+| Tom's Hardware CloudMatrix384 报道 | Ascend 910C | 公开规格/系统对比 | 910C 780 BF16 TFLOPS、128GB HBM、3.2TB/s HBM 带宽；CloudMatrix384 300 BF16 PFLOPS | 非厂商官方规格，作为默认硬件假设来源并标注可信度 |
 
 如果公开参考与内部实测、内部规格冲突，以内部数据为准。输出工作簿必须在说明中标注这些数据的可比性限制。
 
@@ -279,6 +280,6 @@ confidence =
 
 1. 输出同时包含 `910B 8卡` 与 `910C 8卡` 估算数据。
 2. 每行估算都有 P800 基线行、硬件比例、模型比例、瓶颈、显存需求和置信度。
-3. 910B 历史 vLLM 数据和联网参考数据只出现在参考 sheet，不影响估算结果。
+3. 910B 历史 vLLM 数据和公开吞吐 benchmark 只出现在参考 sheet，不参与校准；公开硬件规格可以在假设表中参与估算。
 4. 文档和输出工作簿都保留公式说明、来源链接和假设表。
 5. 缺少关键规格时不静默硬编码，必须在假设表和说明中标注。
