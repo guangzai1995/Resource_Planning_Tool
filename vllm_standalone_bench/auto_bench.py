@@ -1925,7 +1925,13 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
             release_lock = terminate_detached_child(process)
         return fail_start(str(exc), release_lock=release_lock)
     print(f"run_id: {run_id}")
-    print(f"log: {log_path}")
+    print(f"controller_log: {log_path.resolve()}")
+    print(
+        "logs: "
+        f"python3 {Path(__file__).resolve()} logs "
+        f"--results-dir {config.run.results_dir.resolve()} "
+        f"--run-id {run_id} --follow"
+    )
     return 0
 
 
@@ -2031,6 +2037,44 @@ def print_log(path: Path) -> int:
         print(f"failed to read log file: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def _safe_log_component(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if not SAFE_NAME_RE.fullmatch(value):
+        return None
+    if value in (".", ".."):
+        return None
+    return value
+
+
+def current_bench_log_path(run_dir: Path) -> Path | None:
+    state_path = run_dir / "state.json"
+    if not state_path.exists():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    current = state.get("current")
+    if not isinstance(current, dict):
+        return None
+    model = _safe_log_component(current.get("model"))
+    serve_profile = _safe_log_component(current.get("serve_profile"))
+    bench_profile = _safe_log_component(current.get("bench_profile"))
+    if not all([model, serve_profile, bench_profile]):
+        return None
+    log_path = run_dir / model / serve_profile / bench_profile / "bench.log"
+    return log_path if log_path.exists() else None
+
+
+def select_log_path(run_dir: Path, *, controller: bool = False) -> Path:
+    if controller:
+        return run_dir / "controller.log"
+    return current_bench_log_path(run_dir) or (run_dir / "controller.log")
 
 
 def read_process_cmdline(pid: int) -> list[str]:
@@ -2334,10 +2378,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     status_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     status_parser.add_argument("--run-id", required=True)
 
-    logs_parser = subparsers.add_parser("logs", help="show controller log")
+    logs_parser = subparsers.add_parser("logs", help="show run log")
     logs_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     logs_parser.add_argument("--run-id", required=True)
     logs_parser.add_argument("-f", "--follow", action="store_true")
+    logs_parser.add_argument("--controller", action="store_true")
 
     stop_parser = subparsers.add_parser("stop", help="stop detached controller")
     stop_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
@@ -2425,7 +2470,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         return print_status(args.results_dir / args.run_id)
     if args.command == "logs":
-        log_path = args.results_dir / args.run_id / "controller.log"
+        log_path = select_log_path(
+            args.results_dir / args.run_id,
+            controller=args.controller,
+        )
         return follow_file(log_path) if args.follow else print_log(log_path)
     if args.command == "stop":
         return stop_run(args.results_dir / args.run_id)

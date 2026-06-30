@@ -7,7 +7,7 @@
     "network": "vllm-bench-net",
     "create_network": true,
     "cleanup_network": true,
-    "container_port": 8000,
+    "container_port": 8888,
     "publish_host_port": false,
     "host_port": 18000,
     "api_key": "local-bench-key",
@@ -29,19 +29,24 @@
     {
       "name": "bf16_default",
       "gpus": "all",
-      "args": ["--dtype", "bfloat16", "--gpu-memory-utilization", "0.90"]
+      "args": ["--dtype", "bfloat16", "--gpu-memory-utilization", "0.70"]
+    },
+    {
+      "name": "bf16_no_cache",
+      "gpus": "all",
+      "args": ["--dtype", "bfloat16", "--gpu-memory-utilization", "0.70","--no-enable-prefix-caching"]
     }
   ],
   "bench_profiles": [
     {
       "name": "smoke",
       "backend": "openai-chat",
-      "input_lens": [64],
-      "output_lens": [32],
-      "parallel_nums": [1],
-      "epochs": 1,
+      "input_lens": [1024,2048,4096],
+      "output_lens": [256,256,256],
+      "parallel_nums": [1,4,8,16],
+      "epochs": 3,
       "prefix_ratio": 0.0,
-      "warmup_requests": 0,
+      "warmup_requests": 1,
       "cross_product": false
     }
   ]

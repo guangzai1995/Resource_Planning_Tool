@@ -1405,6 +1405,63 @@ def test_logs_prints_controller_log(tmp_path, capsys):
     assert "line 2" in captured.out
 
 
+def test_logs_prefers_current_bench_log(tmp_path, capsys):
+    run_dir = tmp_path / "run123"
+    bench_dir = run_dir / "model_a" / "serve_a" / "bench_a"
+    bench_dir.mkdir(parents=True)
+    (run_dir / "controller.log").write_text("controller only\n", encoding="utf-8")
+    (bench_dir / "bench.log").write_text("active bench line\n", encoding="utf-8")
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": {
+            "model": "model_a",
+            "serve_profile": "serve_a",
+            "bench_profile": "bench_a",
+        },
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+
+    exit_code = ab.main(["logs", "--results-dir", str(tmp_path), "--run-id", "run123"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "active bench line" in captured.out
+    assert "controller only" not in captured.out
+
+
+def test_logs_controller_flag_prints_controller_log(tmp_path, capsys):
+    run_dir = tmp_path / "run123"
+    bench_dir = run_dir / "model_a" / "serve_a" / "bench_a"
+    bench_dir.mkdir(parents=True)
+    (run_dir / "controller.log").write_text("controller line\n", encoding="utf-8")
+    (bench_dir / "bench.log").write_text("bench line\n", encoding="utf-8")
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": {
+            "model": "model_a",
+            "serve_profile": "serve_a",
+            "bench_profile": "bench_a",
+        },
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+
+    exit_code = ab.main([
+        "logs",
+        "--results-dir",
+        str(tmp_path),
+        "--run-id",
+        "run123",
+        "--controller",
+    ])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "controller line" in captured.out
+    assert "bench line" not in captured.out
+
+
 def test_logs_replace_invalid_utf8(tmp_path, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()
@@ -2797,7 +2854,8 @@ def test_example_configs_are_parseable():
             assert len(data["serve_profiles"]) == 2
             for profile in data["serve_profiles"]:
                 assert "--gpu-memory-utilization" in profile["args"]
-                assert "0.90" in profile["args"]
+                gpu_util = float(value_after(profile["args"], "--gpu-memory-utilization"))
+                assert 0 < gpu_util <= 1
             latency_matrix = data["bench_profiles"][0]
             assert latency_matrix["name"] == "latency_matrix"
             assert latency_matrix["output_lens"] == [1024]
@@ -2808,7 +2866,8 @@ def test_example_configs_are_parseable():
         else:
             smoke_args = data["serve_profiles"][0]["args"]
             assert "--gpu-memory-utilization" in smoke_args
-            assert "0.90" in smoke_args
+            gpu_util = float(value_after(smoke_args, "--gpu-memory-utilization"))
+            assert 0 < gpu_util <= 1
 
 
 def test_bench_runner_dockerfile_contains_offline_dependencies():

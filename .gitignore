@@ -91,12 +91,16 @@ vllm-0.23.0/
 vllm-main/
 sglang-main/
 
+# ── Mirror source dirs for vllm / sglang ──────────────────
+.magic/
+
 # ── Local agent/tooling config ─────────────────────────────
 .superpowers/
 .codex/
 .claude/
 .agents/
 .worktrees/
+.omc/
 
 # ── SQLite WAL files ──────────────────────────────────────
 *.db-shm
