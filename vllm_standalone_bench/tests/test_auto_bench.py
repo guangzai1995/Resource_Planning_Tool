@@ -2915,3 +2915,35 @@ def test_build_serve_command_dispatches_vllm(tmp_path):
 
     assert value_after(cmd, "--entrypoint") == "vllm"
     assert "serve" in cmd
+
+
+def test_controller_invokes_aggregate_after_groups(tmp_path, monkeypatch):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
+    sglang_profile = {
+        "name": "sglang_bf16",
+        "engine": "sglang",
+        "gpus": "all",
+        "args": ["--dtype", "bfloat16"],
+    }
+    data["serve_profiles"].append(sglang_profile)
+    config = ab.load_config(write_config(tmp_path, data))
+    calls = []
+    monkeypatch.setattr(ab, "aggregate_compare", lambda c, rd: calls.append(Path(rd)) or None)
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *a, **k: True)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0].name == "run123"
+
+
+def test_controller_dry_run_skips_aggregate(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    calls = []
+    monkeypatch.setattr(ab, "aggregate_compare", lambda c, rd: calls.append(rd))
+
+    ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+    assert calls == []

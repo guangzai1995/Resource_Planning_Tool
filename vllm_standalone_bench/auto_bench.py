@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import re
@@ -16,6 +17,10 @@ import types
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol
+
+from bench_compare import aggregate_compare
+
+logger = logging.getLogger("auto_bench")
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -1823,6 +1828,12 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         raise stop_requested
             if interrupted:
                 break
+
+        if not dry_run and not interrupted:
+            try:
+                aggregate_compare(config, run_dir)
+            except Exception as exc:
+                logger.warning("结果对比聚合失败：%s", exc)
 
         write_state(run_dir, finished_state(run_id, manifest))
     except StopRequested as exc:
