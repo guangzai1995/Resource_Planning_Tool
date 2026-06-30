@@ -1700,6 +1700,8 @@ def validate_prepared_model_dir(target: Path) -> None:
                 shard_path = Path(shard_name)
                 if shard_path.is_absolute() or ".." in shard_path.parts:
                     raise ConfigError(f"safetensors shard path invalid: {shard_name}")
+                if shard_path.suffix != ".safetensors":
+                    raise ConfigError(f"safetensors shard filename invalid: {shard_name}")
                 shard_names.add(shard_name)
         if not shard_names:
             raise ConfigError(f"model directory missing complete safetensors weights: {model_dir}")

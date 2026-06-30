@@ -1734,6 +1734,18 @@ def test_model_dir_accepts_complete_indexed_safetensors_shards(tmp_path):
     ab.validate_prepared_model_dir(target)
 
 
+def test_model_dir_rejects_index_shard_without_safetensors_suffix(tmp_path):
+    target = tmp_path / "model"
+    write_model_files(target, safetensors=False)
+    (target / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"layer.0": "config.json"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ab.ConfigError, match="safetensors|shard"):
+        ab.validate_prepared_model_dir(target)
+
+
 def test_prepare_model_uses_bench_image_and_temp_dir(tmp_path):
     target = tmp_path / "Qwen2.5-1.5B-Instruct"
     runner = ModelDownloadRunner(tmp_path)
