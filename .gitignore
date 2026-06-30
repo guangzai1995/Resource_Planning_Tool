@@ -96,6 +96,7 @@ sglang-main/
 .codex/
 .claude/
 .agents/
+.worktrees/
 
 # ── SQLite WAL files ──────────────────────────────────────
 *.db-shm
