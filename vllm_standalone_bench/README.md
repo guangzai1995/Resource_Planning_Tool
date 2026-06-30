@@ -5,26 +5,21 @@
 ## 🚀 快速开始
 
 ```bash
-# 查看帮助
-./vllm_bench.sh help
+# 单次 serve benchmark 帮助
+python3 vllm_standalone_bench/run_bench_serve.py --help
 
-# 列出可用的配置文件
-./vllm_bench.sh list
+# 批量矩阵 benchmark 帮助
+python3 vllm_standalone_bench/run_bench_multi.py --help
 
-# 运行 A40 测试 (AWQ + FP8KV)
-./vllm_bench.sh run test_configs_a40.conf
+# 离线自动压测控制器帮助
+python3 vllm_standalone_bench/auto_bench.py --help
 
-# 运行 H20 测试 (FP8 + FP8KV)
-./vllm_bench.sh run test_configs_h20.conf
-
-# 连接已运行的 vLLM 服务测试
-./vllm_bench.sh test --model qwen-7 --host localhost --port 8000
-
-# 快速启动向导
-./vllm_bench.sh quick
+# 检查 smoke 自动压测将执行的 Docker 命令
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json \
+  --run-id docs_dry_run \
+  --dry-run
 ```
-
-> 📖 详细文档: [SCRIPT_STRUCTURE.md](SCRIPT_STRUCTURE.md)
 
 ## 与 vllm bench serve 的对齐程度
 
@@ -149,7 +144,7 @@ python3 vllm_standalone_bench/auto_bench.py run \
 ### 基本用法（Random 数据集）
 
 ```bash
-python standalone_serve_bench.py \
+python3 vllm_standalone_bench/run_bench_serve.py \
     --backend openai \
     --host 127.0.0.1 \
     --port 8000 \
@@ -164,7 +159,7 @@ python standalone_serve_bench.py \
 ### Chat Completions 端点
 
 ```bash
-python standalone_serve_bench.py \
+python3 vllm_standalone_bench/run_bench_serve.py \
     --backend openai-chat \
     --endpoint /v1/chat/completions \
     --host 127.0.0.1 \
@@ -178,7 +173,7 @@ python standalone_serve_bench.py \
 ### 带 Goodput SLO 约束
 
 ```bash
-python standalone_serve_bench.py \
+python3 vllm_standalone_bench/run_bench_serve.py \
     --backend openai \
     --host 127.0.0.1 --port 8000 \
     --model your-model \
@@ -190,7 +185,7 @@ python standalone_serve_bench.py \
 ### 保存结果
 
 ```bash
-python standalone_serve_bench.py \
+python3 vllm_standalone_bench/run_bench_serve.py \
     --backend openai \
     --host 127.0.0.1 --port 8000 \
     --model your-model \
