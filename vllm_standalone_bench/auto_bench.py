@@ -1709,11 +1709,13 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
     total = len(cases)
 
     def fail_start(error: str) -> int:
-        if run_lock is not None:
-            release_run_lock(run_lock)
-        write_state(run_dir, _detached_state(run_id, "failed", total, error=error))
-        print(f"failed to start detached controller: {error}", file=sys.stderr)
-        return 1
+        try:
+            write_state(run_dir, _detached_state(run_id, "failed", total, error=error))
+            print(f"failed to start detached controller: {error}", file=sys.stderr)
+            return 1
+        finally:
+            if run_lock is not None:
+                release_run_lock(run_lock)
 
     try:
         validate_local_paths(config)
