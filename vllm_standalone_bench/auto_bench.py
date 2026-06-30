@@ -533,11 +533,53 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
             f"127.0.0.1:{config.run.host_port}:{config.run.container_port}",
         ])
     cmd.extend([
-        config.run.vllm_image,
+        config.run.images["vllm"],
         "serve", case.model.model_path,
         "--served-model-name", case.api_model_name,
         "--host", "0.0.0.0",
         "--port", str(config.run.container_port),
+    ])
+    if config.run.api_key:
+        cmd.extend(["--api-key", config.run.api_key])
+    cmd.extend(case.serve_profile.args)
+    return cmd
+
+
+def build_serve_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                            run_dir: Path) -> list[str]:
+    """按 serve_profile.engine 分派服务启动命令。args 原样透传，不做参数翻译。"""
+    if case.serve_profile.engine == "sglang":
+        return _build_sglang_run_command(config, case, run_dir)
+    return build_vllm_run_command(config, case, run_dir)
+
+
+def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                              run_dir: Path) -> list[str]:
+    resolved_run_dir = Path(run_dir).resolve()
+    cmd = [
+        "docker", "run", "-d",
+        "--name", case.container_name,
+        "--label", f"{NETWORK_MANAGED_LABEL}=true",
+        "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
+        "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
+        "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
+        "--gpus", case.serve_profile.gpus,
+        "--network", config.run.network,
+        "-v", f"{config.mounts.models}:/models:ro",
+        "--entrypoint", "python3",
+    ]
+    if config.run.publish_host_port:
+        if config.run.host_port is None:
+            raise ConfigError("host_port is required when publish_host_port=true")
+        cmd.extend(["-p", f"127.0.0.1:{config.run.host_port}:{config.run.container_port}"])
+    cmd.extend([
+        config.run.images["sglang"],
+        "-m", "sglang.launch_server",
+        "--model-path", case.model.model_path,
+        "--host", "0.0.0.0",
+        "--port", str(config.run.container_port),
+        "--served-model-name", case.api_model_name,
     ])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
@@ -1079,7 +1121,7 @@ def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
     inspect = runner.run(["docker", "inspect", case.container_name], check=False)
     (layout.serve_dir / "docker.inspect.json").write_text(inspect.stdout, encoding="utf-8")
     (layout.serve_dir / "serve_command.txt").write_text(
-        " ".join(build_vllm_run_command(config, case, layout.run_dir)),
+        " ".join(build_serve_run_command(config, case, layout.run_dir)),
         encoding="utf-8",
     )
 
@@ -1555,7 +1597,7 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
         for group_cases in _group_cases_by_serve(cases).values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
-            print_cmd(build_vllm_run_command(config, serve_case, serve_layout.run_dir))
+            print_cmd(build_serve_run_command(config, serve_case, serve_layout.run_dir))
             for case in group_cases:
                 layout = build_layout(config, run_id, case)
                 print_cmd(build_bench_run_command(config, case, layout.bench_dir))
@@ -1616,12 +1658,12 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         for group_cases in grouped.values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
-            vllm_cmd = build_vllm_run_command(config, serve_case, serve_layout.run_dir)
+            serve_cmd = build_serve_run_command(config, serve_case, serve_layout.run_dir)
             started = False
             cleanup_container = False
             try:
                 if dry_run:
-                    print_cmd(vllm_cmd)
+                    print_cmd(serve_cmd)
                     ready = True
                 else:
                     cleanup_container = True
@@ -1630,7 +1672,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         serve_case,
                         serve_layout.run_dir,
                     )
-                    start_result = active_runner.run(vllm_cmd, check=False)
+                    start_result = active_runner.run(serve_cmd, check=False)
                     started = start_result.returncode == 0
                     if not started:
                         ready = False

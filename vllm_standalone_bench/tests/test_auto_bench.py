@@ -2874,3 +2874,44 @@ def test_explicit_images_vllm_not_overridden_by_vllm_image(tmp_path):
     data["run"]["images"] = {"vllm": "explicit-vllm:tag"}
     config = ab.load_config(write_config(tmp_path, data))
     assert config.run.images["vllm"] == "explicit-vllm:tag"
+
+
+def sglang_config(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
+    profile = {
+        "name": "sglang_bf16",
+        "engine": "sglang",
+        "gpus": "all",
+        "args": ["--dtype", "bfloat16", "--mem-fraction-static", "0.70"],
+    }
+    data["serve_profiles"] = [profile]
+    return data
+
+
+def test_build_sglang_command_uses_launch_server(tmp_path):
+    config = ab.load_config(write_config(tmp_path, sglang_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_serve_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert value_after(cmd, "--entrypoint") == "python3"
+    assert "sglang:latest" in cmd
+    assert value_after(cmd, "-m") == "sglang.launch_server"
+    assert value_after(cmd, "--model-path") == "/models/Qwen2.5-1.5B-Instruct"
+    assert value_after(cmd, "--host") == "0.0.0.0"
+    assert value_after(cmd, "--port") == "8000"
+    assert value_after(cmd, "--served-model-name") == "qwen2_5_1_5b"
+    assert value_after(cmd, "--api-key") == "local-bench-key"
+    assert value_after(cmd, "--mem-fraction-static") == "0.70"
+    assert value_after(cmd, "--gpus") == "all"
+
+
+def test_build_serve_command_dispatches_vllm(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_serve_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert value_after(cmd, "--entrypoint") == "vllm"
+    assert "serve" in cmd
