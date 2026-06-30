@@ -160,6 +160,10 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
     base.ready_check_timeout_sec = 0
     base.num_warmups = 0
 
+    # ── warmup 固定并发/输出参数 ────────────────────────────────────────────
+    base.warmup_concurrency = our_args.warmup_concurrency
+    base.warmup_output_len = our_args.warmup_output_len
+
     return base
 
 
@@ -624,7 +628,10 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
             # 第一次运行：做 ready check（超时 600s）；后续跳过（设为 0）
             if is_first_run:
                 cfg.ready_check_timeout_sec = 600
-                cfg.num_warmups = our_args.warmup_requests
+                # 固定并发预热：warmup_concurrency 设了则凑齐一波满并发，否则沿用 warmup_requests
+                cfg.num_warmups = (our_args.warmup_concurrency
+                                   if our_args.warmup_concurrency is not None
+                                   else our_args.warmup_requests)
                 is_first_run = False
             else:
                 cfg.ready_check_timeout_sec = 0
@@ -720,7 +727,7 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
 
 # ─── CLI 参数解析 ──────────────────────────────────────────────────────────────
 
-def _parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             '多配置 vLLM OpenAI 接口批量基准测试\n'
@@ -789,6 +796,10 @@ def _parse_args() -> argparse.Namespace:
                        help='每组配置测试后的等待时间（秒，让服务 KV cache 释放，默认: 2.0）')
     bench.add_argument('--warmup-requests', type=int, default=1,
                        help='首次测试前的预热请求数（仅第一组配置执行，默认: 1）')
+    bench.add_argument('--warmup-concurrency', type=int, default=None,
+                       help='warmup 固定并发数（仅首次预热生效；默认 None=跟随该档并发）')
+    bench.add_argument('--warmup-output-len', type=int, default=None,
+                       help='warmup 请求输出长度（默认 None=跟随该档输出；设短值省 decode 时间）')
     bench.add_argument('--prefix-ratio', type=float, default=0.0,
                        help='前缀缓存比例 [0.0~1.0]（默认: 0.0 = 不使用共享前缀）。'
                             '取值 0.5 表示每个请求中有 50%% 的 input_len 作为共享前缀。'
@@ -832,6 +843,11 @@ def _parse_args() -> argparse.Namespace:
     out.add_argument('--result-dir', default=None,
                      help='统一指定输出目录，CSV/XLSX 文件名自动放入此目录')
 
+    return p
+
+
+def _parse_args() -> argparse.Namespace:
+    p = build_arg_parser()
     return p.parse_args()
 
 
