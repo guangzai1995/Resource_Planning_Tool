@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -47,6 +48,14 @@ class StopRequested(Exception):
 
 
 @dataclass(frozen=True)
+class VllmCacheConfig:
+    enabled: bool = False
+    root: Path | None = None
+    container_path: str = "/vllm-cache"
+    set_default_env: bool = True
+
+
+@dataclass(frozen=True)
 class RunConfig:
     name: str
     results_dir: Path
@@ -64,6 +73,7 @@ class RunConfig:
     images: Mapping[str, str] = field(
         default_factory=lambda: types.MappingProxyType({})
     )
+    vllm_cache: VllmCacheConfig = field(default_factory=VllmCacheConfig)
 
 
 @dataclass(frozen=True)
@@ -87,6 +97,7 @@ class ServeProfile:
     engine: str = "vllm"
     gpus: str = "all"
     args: tuple[str, ...] = field(default_factory=tuple)
+    cache_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -302,7 +313,60 @@ def _container_path_to_host(path_value: Any, model_root: Path, field_name: str) 
     return model_root / relative
 
 
-def _parse_run(data: dict[str, Any]) -> RunConfig:
+def _container_abs_path(value: Any, field_name: str) -> str:
+    path_text = _string(value, field_name)
+    container_path = PurePosixPath(path_text)
+    if not container_path.is_absolute():
+        raise ConfigError(f"{field_name} must be absolute inside the container: {path_text}")
+    if ".." in container_path.parts:
+        raise ConfigError(f"{field_name} must not contain '..': {path_text}")
+    if container_path == PurePosixPath("/"):
+        raise ConfigError(f"{field_name} must not be the container root: {path_text}")
+    try:
+        container_path.relative_to(MODEL_CONTAINER_ROOT)
+    except ValueError:
+        pass
+    else:
+        raise ConfigError(f"{field_name} must not overlap the /models mount: {path_text}")
+    return str(container_path)
+
+
+def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
+    if "vllm_cache" not in run:
+        return VllmCacheConfig()
+    raw = run["vllm_cache"]
+    cache = _require_mapping(raw, "run.vllm_cache")
+    enabled = _bool(cache.get("enabled", False), "run.vllm_cache.enabled")
+    container_path = _container_abs_path(
+        cache.get("container_path", "/vllm-cache"),
+        "run.vllm_cache.container_path",
+    )
+    set_default_env = _bool(
+        cache.get("set_default_env", True),
+        "run.vllm_cache.set_default_env",
+    )
+    if not enabled:
+        return VllmCacheConfig(
+            enabled=False,
+            root=None,
+            container_path=container_path,
+            set_default_env=set_default_env,
+        )
+    if "root" in cache:
+        root = Path(_string(cache["root"], "run.vllm_cache.root"))
+    else:
+        root = config_dir / ".cache" / "vllm_auto_bench"
+    if not root.is_absolute():
+        root = config_dir / root
+    return VllmCacheConfig(
+        enabled=True,
+        root=root.resolve(),
+        container_path=container_path,
+        set_default_env=set_default_env,
+    )
+
+
+def _parse_run(data: dict[str, Any], config_dir: Path) -> RunConfig:
     run = _require_mapping(data.get("run"), "run")
     host_port = run.get("host_port")
     vllm_image = _optional_string(run.get("vllm_image"), "run.vllm_image")
@@ -327,6 +391,7 @@ def _parse_run(data: dict[str, Any]) -> RunConfig:
         cooldown_sec=_non_negative_float(run.get("cooldown_sec", 20.0), "run.cooldown_sec"),
         vllm_image=vllm_image,
         images=images,
+        vllm_cache=_parse_vllm_cache(run, config_dir),
     )
 
 
@@ -404,12 +469,17 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
             raise ConfigError(
                 f"serve_profile.engine must be one of {SUPPORTED_ENGINES}, got {engine!r}"
             )
+        cache_key = profile.get("cache_key")
         parsed.append(ServeProfile(
             name=_safe_name(_required(profile, "name", "serve_profile.name"),
                             "serve_profile.name"),
             engine=engine,
             gpus=_string(profile.get("gpus", "all"), "serve_profile.gpus"),
             args=tuple(args),
+            cache_key=(
+                _safe_name(cache_key, "serve_profile.cache_key")
+                if cache_key is not None else None
+            ),
         ))
     return tuple(parsed)
 
@@ -471,7 +541,7 @@ def load_config(path: str | Path) -> AutoBenchConfig:
         raise ConfigError(f"invalid JSON config: {exc}") from exc
 
     config_data = _require_mapping(raw, "config")
-    run = _parse_run(config_data)
+    run = _parse_run(config_data, config_path.parent)
     mounts = _parse_mounts(config_data, config_path.parent)
     models = _parse_models(config_data, mounts)
     serve_profiles = _parse_serve_profiles(config_data)
@@ -509,6 +579,109 @@ def make_bench_container_name(case: BenchmarkCase) -> str:
     )
 
 
+def _short_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def vllm_cache_key_inputs(config: AutoBenchConfig,
+                          case: BenchmarkCase) -> dict[str, Any]:
+    return {
+        "vllm_image_ref": config.run.images["vllm"],
+        "model": {
+            "name": case.model.name,
+            "model_path": case.model.model_path,
+            "tokenizer_path": case.model.tokenizer_path,
+            "served_model_name": case.model.served_model_name,
+        },
+        "serve_profile": {
+            "name": case.serve_profile.name,
+            "gpus": case.serve_profile.gpus,
+            "args": list(case.serve_profile.args),
+        },
+    }
+
+
+def _short_json_fingerprint(data: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return _short_hash(canonical)
+
+
+def default_vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str:
+    fingerprint = _short_json_fingerprint(vllm_cache_key_inputs(config, case))
+    return f"{case.model.name}__{case.serve_profile.name}__{fingerprint}"
+
+
+def vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
+    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+        return None
+    return case.serve_profile.cache_key or default_vllm_cache_key(config, case)
+
+
+def vllm_cache_key_source(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
+    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+        return None
+    return "explicit" if case.serve_profile.cache_key else "default"
+
+
+def resolve_vllm_cache_dir(config: AutoBenchConfig, case: BenchmarkCase) -> Path | None:
+    cache_key = vllm_cache_key(config, case)
+    if cache_key is None:
+        return None
+    if config.run.vllm_cache.root is None:
+        raise ConfigError("run.vllm_cache.root is required when enabled=true")
+    return config.run.vllm_cache.root / cache_key
+
+
+def build_vllm_cache_env(config: AutoBenchConfig) -> dict[str, str]:
+    cache = config.run.vllm_cache
+    if not cache.enabled or not cache.set_default_env:
+        return {}
+    root = cache.container_path
+    root_path = PurePosixPath(root)
+    return {
+        "VLLM_CACHE_ROOT": root,
+        "DG_JIT_CACHE_DIR": str(root_path / "deep_gemm"),
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": str(root_path / "flashinfer_autotune"),
+    }
+
+
+def vllm_cache_metadata(config: AutoBenchConfig,
+                        case: BenchmarkCase) -> dict[str, Any] | None:
+    cache_dir = resolve_vllm_cache_dir(config, case)
+    key = vllm_cache_key(config, case)
+    if cache_dir is None or key is None:
+        return None
+    return {
+        "enabled": True,
+        "cache_key": key,
+        "cache_key_source": vllm_cache_key_source(config, case),
+        "cache_key_inputs": vllm_cache_key_inputs(config, case),
+        "host_dir": str(cache_dir),
+        "container_path": config.run.vllm_cache.container_path,
+        "env": build_vllm_cache_env(config),
+    }
+
+
+def ensure_vllm_cache_dirs(config: AutoBenchConfig) -> None:
+    if not config.run.vllm_cache.enabled:
+        return
+    seen: set[Path] = set()
+    for case in expand_cases(config, run_id="cache-validation"):
+        cache_dir = resolve_vllm_cache_dir(config, case)
+        if cache_dir is None or cache_dir in seen:
+            continue
+        seen.add(cache_dir)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ConfigError(f"cannot create vllm cache dir: {cache_dir}") from exc
+
+
 def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[BenchmarkCase, ...]:
     resolved_run_id = run_id or make_run_id(config.run.name)
     _safe_name(resolved_run_id, "run_id")
@@ -542,8 +715,15 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--gpus", case.serve_profile.gpus,
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
-        "--entrypoint", "vllm",
     ]
+    cache_dir = resolve_vllm_cache_dir(config, case)
+    if cache_dir is not None:
+        cmd.extend(["-v", f"{cache_dir}:{config.run.vllm_cache.container_path}:rw"])
+        for name, value in build_vllm_cache_env(config).items():
+            cmd.extend(["-e", f"{name}={value}"])
+    cmd.extend([
+        "--entrypoint", "vllm",
+    ])
     if config.run.publish_host_port:
         if config.run.host_port is None:
             raise ConfigError("host_port is required when publish_host_port=true")
@@ -676,6 +856,7 @@ def validate_local_paths(config: AutoBenchConfig) -> None:
             raise ConfigError(f"model path does not exist: {model.host_model_path}")
         if model.host_tokenizer_path is not None and not model.host_tokenizer_path.exists():
             raise ConfigError(f"tokenizer path does not exist: {model.host_tokenizer_path}")
+    ensure_vllm_cache_dirs(config)
 
 
 def build_layout(config: AutoBenchConfig, run_id: str, case: BenchmarkCase) -> CaseLayout:
@@ -704,6 +885,14 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def write_vllm_cache_metadata(config: AutoBenchConfig, case: BenchmarkCase,
+                              layout: CaseLayout) -> None:
+    payload = vllm_cache_metadata(config, case)
+    if payload is None:
+        return
+    write_json_atomic(layout.serve_dir / "vllm_cache.json", payload)
 
 
 def write_state(run_dir: Path, state: dict[str, Any]) -> None:
@@ -1681,6 +1870,8 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         for group_cases in grouped.values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
+            if not dry_run:
+                write_vllm_cache_metadata(config, serve_case, serve_layout)
             serve_cmd = build_serve_run_command(config, serve_case, serve_layout.run_dir)
             started = False
             cleanup_container = False
