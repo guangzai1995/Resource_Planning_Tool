@@ -109,6 +109,32 @@ def test_openai_audio_request_preserves_audio_tuple_path(fake_soundfile):
     assert output.input_audio_duration == 2.5
 
 
+def test_openai_audio_request_reads_usage_in_same_chunk_as_choices(fake_soundfile):
+    session = CapturingSession(
+        sse(
+            {
+                "choices": [{"delta": {"content": "hello"}}],
+                "usage": {"completion_tokens": 21},
+            },
+            "[DONE]",
+        )
+    )
+    request = RequestFuncInput(
+        prompt="transcribe",
+        api_url="http://localhost:8000/v1/audio/transcriptions",
+        prompt_len=4,
+        output_len=32,
+        model="qwen3-asr",
+        multi_modal_content={"audio": ([0.0], 16000)},
+    )
+
+    output = _run_audio_request(request, session)
+
+    assert output.success is True
+    assert output.generated_text == "hello"
+    assert output.output_tokens == 21
+
+
 def test_openai_audio_request_requires_audio_path_or_audio(fake_soundfile):
     request = RequestFuncInput(
         prompt="transcribe",

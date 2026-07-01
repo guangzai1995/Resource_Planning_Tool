@@ -531,14 +531,19 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
                 _string(profile["dataset_name"], "bench_profile.dataset_name")
                 if "dataset_name" in profile else "custom_audio"
             )
-            raw_dataset_path = (
-                _string(profile["dataset_path"], "bench_profile.dataset_path")
-                if "dataset_path" in profile else BUILTIN_ASR_DATASET_PATH
-            )
-            dataset_path = _dataset_container_path(
-                raw_dataset_path,
-                "bench_profile.dataset_path",
-            )
+            if "dataset_path" in profile:
+                dataset_path = _dataset_container_path(
+                    profile["dataset_path"],
+                    "bench_profile.dataset_path",
+                )
+                if not _is_under_container_path(dataset_path, DATASET_CONTAINER_ROOT):
+                    raise ConfigError(
+                        "bench_profile.dataset_path for openai-audio must be under "
+                        "/datasets so mounts.datasets can expose it to the bench "
+                        "container"
+                    )
+            else:
+                dataset_path = BUILTIN_ASR_DATASET_PATH
             language = (
                 _string(profile["language"], "bench_profile.language")
                 if "language" in profile else "en"

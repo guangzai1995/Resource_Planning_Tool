@@ -602,10 +602,9 @@ async def async_request_openai_audio(
                                         )
 
                                     generated_text += content or ""
-                                elif usage := data.get("usage"):
-                                    output.output_tokens = usage.get(
-                                        "completion_tokens"
-                                    )
+                                if usage := data.get("usage"):
+                                    if (ct := usage.get("completion_tokens")) is not None:
+                                        output.output_tokens = ct
 
                                 most_recent_timestamp = timestamp
 

@@ -306,6 +306,14 @@ def test_external_asr_dataset_requires_datasets_mount(tmp_path):
         ab.load_config(write_config(tmp_path, data))
 
 
+def test_external_asr_dataset_must_be_under_datasets_mount(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = "/tmp/asr.jsonl"
+
+    with pytest.raises(ab.ConfigError, match="/datasets|dataset_path"):
+        ab.load_config(write_config(tmp_path, data))
+
+
 def test_external_asr_dataset_mount_is_added(tmp_path):
     data = asr_config(tmp_path)
     host_datasets = tmp_path / "datasets"
