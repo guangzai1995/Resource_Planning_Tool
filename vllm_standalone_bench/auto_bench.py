@@ -609,6 +609,21 @@ def build_vllm_cache_env(config: AutoBenchConfig) -> dict[str, str]:
     }
 
 
+def vllm_cache_metadata(config: AutoBenchConfig,
+                        case: BenchmarkCase) -> dict[str, Any] | None:
+    cache_dir = resolve_vllm_cache_dir(config, case)
+    key = vllm_cache_key(config, case)
+    if cache_dir is None or key is None:
+        return None
+    return {
+        "enabled": True,
+        "cache_key": key,
+        "host_dir": str(cache_dir),
+        "container_path": config.run.vllm_cache.container_path,
+        "env": build_vllm_cache_env(config),
+    }
+
+
 def ensure_vllm_cache_dirs(config: AutoBenchConfig) -> None:
     if not config.run.vllm_cache.enabled:
         return
@@ -827,6 +842,14 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def write_vllm_cache_metadata(config: AutoBenchConfig, case: BenchmarkCase,
+                              layout: CaseLayout) -> None:
+    payload = vllm_cache_metadata(config, case)
+    if payload is None:
+        return
+    write_json_atomic(layout.serve_dir / "vllm_cache.json", payload)
 
 
 def write_state(run_dir: Path, state: dict[str, Any]) -> None:
@@ -1804,6 +1827,8 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         for group_cases in grouped.values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
+            if not dry_run:
+                write_vllm_cache_metadata(config, serve_case, serve_layout)
             serve_cmd = build_serve_run_command(config, serve_case, serve_layout.run_dir)
             started = False
             cleanup_container = False

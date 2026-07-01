@@ -3246,6 +3246,45 @@ def test_build_vllm_command_includes_cache_mount_and_env(tmp_path):
     assert "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/vllm-cache/flashinfer_autotune" in envs
 
 
+def test_vllm_cache_metadata_payload(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    payload = ab.vllm_cache_metadata(config, case)
+
+    assert payload == {
+        "enabled": True,
+        "cache_key": "glm52-fp8-tp8-h20-o2",
+        "host_dir": str((tmp_path / "cache" / "glm52-fp8-tp8-h20-o2").resolve()),
+        "container_path": "/vllm-cache",
+        "env": {
+            "VLLM_CACHE_ROOT": "/vllm-cache",
+            "DG_JIT_CACHE_DIR": "/vllm-cache/deep_gemm",
+            "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/vllm-cache/flashinfer_autotune",
+        },
+    }
+
+
+def test_run_controller_writes_vllm_cache_metadata(tmp_path, monkeypatch):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *a, **k: True)
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner)
+
+    metadata_path = (
+        tmp_path / "results" / "run123" / "qwen2_5_1_5b" / "bf16_default" / "vllm_cache.json"
+    )
+    assert result == 0
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["cache_key"] == (
+        "glm52-fp8-tp8-h20-o2"
+    )
+
+
 def test_build_sglang_command_omits_vllm_cache_mount_and_env(tmp_path):
     data = enable_vllm_cache(sglang_config(tmp_path), tmp_path / "cache")
     config = ab.load_config(write_config(tmp_path, data))
