@@ -1,5 +1,9 @@
+import io
 import json
+import tarfile
 from pathlib import Path
+
+import pytest
 
 from vllm_standalone_bench.tools import build_librispeech_asr_smoke as builder
 
@@ -14,6 +18,16 @@ def _sample(idx: int, duration_s: float, size_bytes: int = 10) -> builder.LibriS
         duration_s=duration_s,
         size_bytes=size_bytes,
     )
+
+
+def _write_tar(tar_path: Path, member: tarfile.TarInfo, data: bytes = b"") -> None:
+    if data:
+        member.size = len(data)
+        fileobj = io.BytesIO(data)
+    else:
+        fileobj = None
+    with tarfile.open(tar_path, "w:gz") as tar:
+        tar.addfile(member, fileobj=fileobj)
 
 
 def test_duration_bucket_uses_medium_long_xlong_ranges():
@@ -131,6 +145,42 @@ def test_write_dataset_copies_audio_and_writes_relative_jsonl(tmp_path):
     ).read_text(encoding="utf-8")
 
 
+def test_write_dataset_rejects_path_escape_utterance_id(tmp_path):
+    source = tmp_path / "source.flac"
+    source.write_bytes(b"fake-audio")
+    sample = builder.LibriSpeechSample(
+        speaker_id="1089",
+        chapter_id="134686",
+        utterance_id="../evil",
+        audio_path=source,
+        text="A LONG ENOUGH TRANSCRIPT",
+        duration_s=12.5,
+        size_bytes=source.stat().st_size,
+    )
+
+    with pytest.raises(ValueError, match="Invalid LibriSpeech utterance id"):
+        builder.write_dataset([sample], tmp_path / "out", seed=20260701)
+
+    assert not (tmp_path / "out" / "evil.flac").exists()
+
+
+def test_write_dataset_rejects_unsupported_audio_suffix(tmp_path):
+    source = tmp_path / "source.mp3"
+    source.write_bytes(b"fake-audio")
+    sample = builder.LibriSpeechSample(
+        speaker_id="1089",
+        chapter_id="134686",
+        utterance_id="1089-134686-0001",
+        audio_path=source,
+        text="A LONG ENOUGH TRANSCRIPT",
+        duration_s=12.5,
+        size_bytes=source.stat().st_size,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported audio suffix"):
+        builder.write_dataset([sample], tmp_path / "out", seed=20260701)
+
+
 def test_apply_size_budget_removes_longest_samples_first():
     samples = [
         _sample(1, 8.0, size_bytes=30),
@@ -178,3 +228,40 @@ def test_build_dataset_passes_requested_sample_count_to_writer(monkeypatch, tmp_
     assert captured["requested_sample_count"] == 10
     assert captured["samples"] == [sample]
     assert captured["output_dir"] == tmp_path / "out"
+
+
+def test_extract_archive_rejects_path_traversal_member(tmp_path):
+    archive = tmp_path / "bad.tar.gz"
+    work_dir = tmp_path / "work"
+    outside = tmp_path / "evil.txt"
+    _write_tar(archive, tarfile.TarInfo("../evil.txt"), b"evil")
+
+    with pytest.raises(ValueError, match="Unsafe archive member"):
+        builder._extract_archive(archive, work_dir)
+
+    assert not outside.exists()
+
+
+@pytest.mark.parametrize("member_type", [tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE])
+def test_extract_archive_rejects_links_and_special_members(tmp_path, member_type):
+    archive = tmp_path / "bad.tar.gz"
+    work_dir = tmp_path / "work"
+    member = tarfile.TarInfo("LibriSpeech/test-clean/bad")
+    member.type = member_type
+    member.linkname = "../evil.txt"
+    _write_tar(archive, member)
+
+    with pytest.raises(ValueError, match="Unsafe archive member"):
+        builder._extract_archive(archive, work_dir)
+
+
+def test_scan_librispeech_rejects_invalid_transcript_id(tmp_path):
+    transcript_dir = tmp_path / "1089" / "134686"
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "1089-134686.trans.txt").write_text(
+        "../evil A LONG ENOUGH TRANSCRIPT\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Invalid LibriSpeech utterance id"):
+        builder.scan_librispeech(tmp_path)

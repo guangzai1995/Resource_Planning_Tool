@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import shutil
 import tarfile
 import tempfile
@@ -24,6 +25,8 @@ DEFAULT_MAX_BYTES = 100 * 1024 * 1024
 BUCKET_RATIOS = {"medium": 0.35, "long": 0.45, "xlong": 0.20}
 PROMPT = "Transcribe the audio in English."
 DEFAULT_OUTPUT_TOKENS = 128
+LIBRISPEECH_UTTERANCE_RE = re.compile(r"^\d+-\d+-\d+$")
+SUPPORTED_AUDIO_SUFFIXES = {".flac", ".wav"}
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,20 @@ class LibriSpeechSample:
     text: str
     duration_s: float
     size_bytes: int
+
+
+def _parse_utterance_id(utterance_id: str) -> tuple[str, str]:
+    if not LIBRISPEECH_UTTERANCE_RE.fullmatch(utterance_id):
+        raise ValueError(f"Invalid LibriSpeech utterance id: {utterance_id!r}")
+    speaker_id, chapter_id, _ = utterance_id.split("-", 2)
+    return speaker_id, chapter_id
+
+
+def _audio_suffix(audio_path: Path) -> str:
+    suffix = audio_path.suffix
+    if suffix not in SUPPORTED_AUDIO_SUFFIXES:
+        raise ValueError(f"Unsupported audio suffix: {suffix!r}")
+    return suffix
 
 
 def duration_bucket(duration_s: float) -> str | None:
@@ -156,7 +173,8 @@ def write_dataset(
     jsonl_path = output_dir / "asr_smoke.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as jsonl:
         for sample in samples:
-            dest_name = f"{sample.utterance_id}{sample.audio_path.suffix}"
+            _parse_utterance_id(sample.utterance_id)
+            dest_name = f"{sample.utterance_id}{_audio_suffix(sample.audio_path)}"
             dest = audio_dir / dest_name
             shutil.copy2(sample.audio_path, dest)
             row = {
@@ -186,9 +204,31 @@ def write_dataset(
     return manifest
 
 
+def _validate_archive_member(
+    member: tarfile.TarInfo,
+    *,
+    work_dir: Path,
+    work_root: Path,
+) -> None:
+    if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
+        raise ValueError(f"Unsafe archive member: {member.name!r}")
+
+    target = (work_dir / member.name).resolve()
+    try:
+        target.relative_to(work_root)
+    except ValueError as exc:
+        raise ValueError(f"Unsafe archive member: {member.name!r}") from exc
+
+
 def _extract_archive(source_archive: Path, work_dir: Path) -> Path:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    work_root = work_dir.resolve()
     with tarfile.open(source_archive, "r:gz") as tar:
-        tar.extractall(work_dir)
+        members = tar.getmembers()
+        for member in members:
+            _validate_archive_member(member, work_dir=work_dir, work_root=work_root)
+        for member in members:
+            tar.extract(member, work_dir)
     return work_dir / "LibriSpeech" / "test-clean"
 
 
@@ -198,14 +238,14 @@ def _download_source(source_url: str, output_path: Path) -> Path:
 
 
 def scan_librispeech(root: Path) -> list[LibriSpeechSample]:
-    import soundfile
-
     samples: list[LibriSpeechSample] = []
     for transcript_path in sorted(root.glob("*/*/*.trans.txt")):
         for line in transcript_path.read_text(encoding="utf-8").splitlines():
             utterance_id, text = line.split(" ", 1)
-            speaker_id, chapter_id, _ = utterance_id.split("-", 2)
+            speaker_id, chapter_id = _parse_utterance_id(utterance_id)
             audio_path = transcript_path.parent / f"{utterance_id}.flac"
+            import soundfile
+
             info = soundfile.info(audio_path)
             samples.append(
                 LibriSpeechSample(
