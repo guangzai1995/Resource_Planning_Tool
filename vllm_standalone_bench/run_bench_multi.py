@@ -571,16 +571,25 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
 
     # 构建基础 Namespace（含全部 serve.py 默认值）
     base = _build_base_args(our_args)
-    _derive_prefix_suffix_tokens(1, our_args.prefix_ratio)
+    if is_asr_backend:
+        if list(our_args.input_lens) != [0] or our_args.prefix_ratio != 0.0:
+            logger.warning(
+                "ASR backend openai-audio ignores --input-lens and "
+                "--prefix-ratio; using input_lens=[0], prefix_ratio=0.0"
+            )
+    else:
+        _derive_prefix_suffix_tokens(1, our_args.prefix_ratio)
     model = our_args.served_model_name or our_args.model
 
     # 构建 (in_len, out_len) 测试对
-    in_lens: List[int] = our_args.input_lens
+    in_lens: List[int] = [0] if is_asr_backend else our_args.input_lens
     out_lens: List[int] = our_args.output_lens
 
     if our_args.cross_product:
         io_pairs = list(itertools.product(in_lens, out_lens))
         logger.info("笛卡尔积模式: %d × %d = %d 组", len(in_lens), len(out_lens), len(io_pairs))
+    elif is_asr_backend:
+        io_pairs = [(0, out_len) for out_len in out_lens]
     else:
         if len(out_lens) == 1:
             out_lens = out_lens * len(in_lens)
@@ -630,7 +639,7 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                 )
                 continue
 
-            prefix_ratio = our_args.prefix_ratio
+            prefix_ratio = 0.0 if is_asr_backend else our_args.prefix_ratio
             cfg_input_len = 0 if is_asr_backend else in_len
             if is_asr_backend:
                 prefix_tokens = 0
@@ -844,7 +853,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # ── 测试配置 ────────────────────────────────────────────────────────────
     bench = p.add_argument_group('测试配置')
     bench.add_argument('--input-lens', type=int, nargs='+', default=[512],
-                       help='输入 token 长度列表，支持多个值（空格分隔）')
+                       help='输入 token 长度列表，支持多个值（空格分隔）。'
+                            'ASR/openai-audio 会忽略该参数并使用 0')
     bench.add_argument('--output-lens', type=int, nargs='+', default=[128],
                        help='输出 token 长度列表；数量需与 --input-lens 一致，'
                             '或只给 1 个值（广播到所有输入长度）')
@@ -875,7 +885,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             '所有请求共享同一段前缀文本（固定生成一次），'
                             '后缀包含 request-index token 加随机 tail，用于保证非 full-prefix 请求差异。'
                             '实际 prompt_len ≈ input_len；共享前缀 token 数约为 input_len × prefix_ratio。'
-                            '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。')
+                            '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。'
+                            'ASR/openai-audio 会忽略该参数并使用 0.0。')
     bench.add_argument('--seed', type=int, default=0,
                        help='随机种子基值。默认每个配置会基于该值派生独立 seed（默认: 0）')
     bench.add_argument('--no-vary-seed-by-config', action='store_true', default=False,

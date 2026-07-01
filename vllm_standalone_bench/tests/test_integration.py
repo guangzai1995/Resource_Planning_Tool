@@ -138,7 +138,7 @@ def test_run_all_rejects_invalid_prefix_ratio_before_serving(monkeypatch):
         m._run_all(args)
 
 
-def test_run_all_maps_openai_audio_to_custom_audio_dataset(monkeypatch):
+def test_run_all_maps_openai_audio_to_custom_audio_dataset(monkeypatch, caplog):
     seen_cfgs = []
 
     async def fake_main_async(cfg):
@@ -150,6 +150,7 @@ def test_run_all_maps_openai_audio_to_custom_audio_dataset(monkeypatch):
         }
 
     monkeypatch.setattr(serve, "main_async", fake_main_async)
+    caplog.set_level(logging.WARNING, logger=m.logger.name)
     args = argparse.Namespace(
         model="Qwen/Qwen3-ASR-1.7B",
         served_model_name="qwen3-asr",
@@ -163,7 +164,7 @@ def test_run_all_maps_openai_audio_to_custom_audio_dataset(monkeypatch):
         dataset_name="custom_audio",
         dataset_path="/opt/vllm_standalone_bench/assets/librispeech_test_clean_256/asr_smoke.jsonl",
         language="en",
-        input_lens=[0],
+        input_lens=[128, 256],
         output_lens=[128],
         cross_product=False,
         parallel_nums=[2],
@@ -172,7 +173,7 @@ def test_run_all_maps_openai_audio_to_custom_audio_dataset(monkeypatch):
         warmup_requests=0,
         warmup_concurrency=None,
         warmup_output_len=None,
-        prefix_ratio=0.0,
+        prefix_ratio=0.5,
         seed=0,
         no_vary_seed_by_config=False,
         output_csv=None,
@@ -185,6 +186,8 @@ def test_run_all_maps_openai_audio_to_custom_audio_dataset(monkeypatch):
 
     rows = m._run_all(args)
 
+    assert len(seen_cfgs) == 1
+    assert len(rows) == 1
     cfg = seen_cfgs[0]
     assert cfg.backend == "openai-audio"
     assert cfg.endpoint == "/audio/transcriptions"
@@ -195,11 +198,22 @@ def test_run_all_maps_openai_audio_to_custom_audio_dataset(monkeypatch):
     assert cfg.skip_tokenizer_init is True
     assert cfg.input_len == 0
     assert cfg.random_prefix_len == 0
+    assert cfg.seed == m.derive_config_seed(
+        base_seed=0,
+        input_len=0,
+        output_len=128,
+        parallel_num=2,
+        prefix_ratio=0.0,
+        config_index=1,
+    )
     assert rows[0]["dataset_name"] == "custom_audio"
     assert rows[0]["language"] == "en"
+    assert rows[0]["prefix_ratio"] == 0.0
     assert rows[0]["audio_duration_s_total"] == 14.0
     assert rows[0]["audio_duration_s_avg"] == 7.0
     assert rows[0]["rtfx"] == 3.5
+    assert "--input-lens" in caplog.text
+    assert "--prefix-ratio" in caplog.text
 
 
 def test_run_all_rejects_openai_audio_without_dataset_path(monkeypatch):
