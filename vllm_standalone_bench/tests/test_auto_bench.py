@@ -3597,3 +3597,27 @@ def test_smoke_config_enables_fixed_warmup():
     bp = cfg["bench_profiles"][0]
     assert bp["warmup_concurrency"] == 4
     assert bp["warmup_output_len"] == 128
+
+
+def test_qwen3_asr_sample_config_loads():
+    path = CONFIG_DIR / "auto_bench.qwen3_asr_1_7b.smoke.json"
+
+    config = ab.load_config(path)
+
+    assert config.bench_profiles[0].backend == "openai-audio"
+    assert config.bench_profiles[0].dataset_path == ab.BUILTIN_ASR_DATASET_PATH
+    assert config.bench_profiles[0].parallel_nums == (1, 4, 8)
+
+
+def test_builtin_asr_dataset_manifest_is_valid():
+    root = Path(__file__).resolve().parents[1] / "assets" / "librispeech_test_clean_256"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    jsonl = root / "asr_smoke.jsonl"
+
+    assert 192 <= manifest["sample_count"] <= 256
+    assert manifest["requested_sample_count"] == 256
+    assert 5.0 <= manifest["min_duration_s"] <= manifest["max_duration_s"] <= 30.0
+    assert manifest["total_audio_bytes"] <= 104857600
+    assert sum(1 for _ in jsonl.open(encoding="utf-8")) == manifest["sample_count"]
+    assert (root / "ATTRIBUTION.md").is_file()
+    assert (root / "LICENSE.LibriSpeech.txt").is_file()
