@@ -137,8 +137,14 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
         # 无 tokenizer 时跳过 tokenizer 初始化，使用近似字符串模式
         base.skip_tokenizer_init = True
 
-    # ── 数据集固定为 random ──────────────────────────────────────────────────
-    base.dataset_name = 'random'
+    # ── 数据集 ────────────────────────────────────────────────────────────────
+    if our_args.dataset == 'builtin_mtp_chat' and not our_args.tokenizer:
+        raise ValueError('builtin_mtp_chat requires --tokenizer')
+    base.dataset_name = our_args.dataset
+    base.dataset_length_policy = our_args.dataset_length_policy
+    base.dataset_input_len_tolerance = our_args.dataset_input_len_tolerance
+    base.dataset_on_bucket_shortage = our_args.dataset_on_bucket_shortage
+    base.dataset_sampling = our_args.dataset_sampling
 
     # ── 流量控制：不限速，仅用 max_concurrency 控制并发 ───────────────────────
     base.request_rate = float('inf')
@@ -832,6 +838,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             '后缀包含 request-index token 加随机 tail，用于保证非 full-prefix 请求差异。'
                             '实际 prompt_len ≈ input_len；共享前缀 token 数约为 input_len × prefix_ratio。'
                             '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。')
+    bench.add_argument('--dataset', default='random',
+                       choices=['random', 'builtin_mtp_chat'],
+                       help='请求数据集（默认 random；builtin_mtp_chat 使用内置真实风格 MTP chat prompt）')
+    bench.add_argument('--dataset-length-policy', default='exact',
+                       choices=['exact', 'bucket'],
+                       help='dataset 输入长度策略：exact 精确匹配，bucket 按容忍度筛选')
+    bench.add_argument('--dataset-input-len-tolerance', type=float, default=0.2,
+                       help='dataset-length-policy=bucket 时的 input_len 容忍度')
+    bench.add_argument('--dataset-on-bucket-shortage', default='error',
+                       choices=['error'],
+                       help='bucket 无候选样本时的处理策略')
+    bench.add_argument('--dataset-sampling', default='shuffle',
+                       choices=['shuffle', 'round_robin'],
+                       help='内置数据集采样顺序')
     bench.add_argument('--seed', type=int, default=0,
                        help='随机种子基值。默认每个配置会基于该值派生独立 seed（默认: 0）')
     bench.add_argument('--no-vary-seed-by-config', action='store_true', default=False,
