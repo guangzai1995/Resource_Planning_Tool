@@ -3130,6 +3130,50 @@ def test_serve_profile_cache_key_must_be_safe(tmp_path, cache_key):
         ab.load_config(write_config(tmp_path, data))
 
 
+def test_resolve_vllm_cache_dir_uses_explicit_cache_key(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    assert ab.resolve_vllm_cache_dir(config, case) == (
+        tmp_path / "cache" / "glm52-fp8-tp8-h20-o2"
+    ).resolve()
+
+
+def test_resolve_vllm_cache_dir_uses_stable_default_key(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cache_dir = ab.resolve_vllm_cache_dir(config, case)
+
+    assert cache_dir is not None
+    assert cache_dir.parent == (tmp_path / "cache").resolve()
+    assert case.model.name in cache_dir.name
+    assert case.serve_profile.name in cache_dir.name
+    assert ab.resolve_vllm_cache_dir(config, case) == cache_dir
+
+
+def test_build_vllm_cache_env_defaults(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert ab.build_vllm_cache_env(config) == {
+        "VLLM_CACHE_ROOT": "/vllm-cache",
+        "DG_JIT_CACHE_DIR": "/vllm-cache/deep_gemm",
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/vllm-cache/flashinfer_autotune",
+    }
+
+
+def test_build_vllm_cache_env_can_be_disabled(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["run"]["vllm_cache"]["set_default_env"] = False
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert ab.build_vllm_cache_env(config) == {}
+
+
 def test_build_bench_command_includes_warmup_opts(tmp_path):
     data = minimal_config(tmp_path)
     data["bench_profiles"][0]["warmup_concurrency"] = 4

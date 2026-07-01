@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -568,6 +569,42 @@ def make_bench_container_name(case: BenchmarkCase) -> str:
         f"bench-runner-{case.model.name}-{case.serve_profile.name}-"
         f"{case.bench_profile.name}-{_safe_name(case.run_id, 'run_id')}"
     )
+
+
+def _short_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def default_vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str:
+    image = config.run.images["vllm"]
+    return f"{case.model.name}__{case.serve_profile.name}__{_short_hash(image)}"
+
+
+def vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
+    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+        return None
+    return case.serve_profile.cache_key or default_vllm_cache_key(config, case)
+
+
+def resolve_vllm_cache_dir(config: AutoBenchConfig, case: BenchmarkCase) -> Path | None:
+    cache_key = vllm_cache_key(config, case)
+    if cache_key is None:
+        return None
+    if config.run.vllm_cache.root is None:
+        raise ConfigError("run.vllm_cache.root is required when enabled=true")
+    return config.run.vllm_cache.root / cache_key
+
+
+def build_vllm_cache_env(config: AutoBenchConfig) -> dict[str, str]:
+    cache = config.run.vllm_cache
+    if not cache.enabled or not cache.set_default_env:
+        return {}
+    root = cache.container_path.rstrip("/")
+    return {
+        "VLLM_CACHE_ROOT": root,
+        "DG_JIT_CACHE_DIR": f"{root}/deep_gemm",
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": f"{root}/flashinfer_autotune",
+    }
 
 
 def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[BenchmarkCase, ...]:
