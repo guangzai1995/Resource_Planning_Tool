@@ -1,3 +1,5 @@
+import asyncio
+
 import run_bench_serve
 
 serve = run_bench_serve._serve
@@ -135,3 +137,45 @@ def test_resolve_warmup_config_concurrency_none_falls_back_even_when_output_set(
         output_len=1024, warmup_output_len=128)
     assert cc == 16
     assert ol == 128
+
+
+def test_fetch_spec_decode_metrics_passes_headers_and_normalizes_url():
+    class FakeResponse:
+        status = 200
+
+        async def text(self):
+            return "\n".join(
+                [
+                    "vllm:spec_decode_num_drafts_total 4",
+                    "vllm:spec_decode_num_accepted_tokens_total 3",
+                    "vllm:spec_decode_num_draft_tokens_total 4",
+                ]
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, headers=None):
+            self.calls.append((url, headers))
+            return FakeResponse()
+
+    session = FakeSession()
+    headers = {"Authorization": "Bearer local-bench-key"}
+
+    metrics = asyncio.run(
+        serve.fetch_spec_decode_metrics("http://127.0.0.1:8000/v1", session, headers)
+    )
+
+    assert session.calls == [
+        ("http://127.0.0.1:8000/metrics", headers),
+    ]
+    assert metrics.num_drafts == 4
+    assert metrics.num_accepted_tokens == 3
+    assert metrics.num_draft_tokens == 4
