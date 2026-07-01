@@ -54,7 +54,6 @@ import os
 import types
 import gc
 import re
-import ssl
 import argparse
 import logging
 import json
@@ -62,7 +61,8 @@ import random
 import uuid
 import warnings
 import importlib.util as _ilu
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from vllm_bench.datasets import builtin_mtp_chat
@@ -219,7 +219,7 @@ _make_mod('vllm.tokenizers',
           get_tokenizer=_get_tokenizer,
           TokenizerLike=_TokenizerLike)
 
-# ─── Step 3: 轻量 datasets shim（支持 random / sharegpt / builtin_mtp_chat）───
+# ─── Step 3: 轻量 datasets shim（支持 random / sharegpt / builtin_mtp_chat / custom_audio）
 
 @dataclass
 class SampleRequest:
@@ -228,10 +228,10 @@ class SampleRequest:
     serve.py 访问的字段: prompt / prompt_len / expected_output_len /
                          multi_modal_data / request_id / timestamp
     """
-    prompt: Any                           # str（纯文本场景）
+    prompt: Any                           # str（文本 / custom_audio 提示）
     prompt_len: int
     expected_output_len: int
-    multi_modal_data: Any = None          # 纯文本场景始终为 None
+    multi_modal_data: Any = None          # custom_audio 使用 {"audio_path": ...}
     request_id: str | None = None
     timestamp: float = 0.0               # timed_trace 专用
 
@@ -246,12 +246,12 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
     # ── 通用 ──────────────────────────────────────────────────────────────────
     g.add_argument(
         '--dataset-name', type=str, default=None,
-        help='数据集类型（shim 支持: random / sharegpt / builtin_mtp_chat；'
+        help='数据集类型（shim 支持: random / sharegpt / builtin_mtp_chat / custom_audio；'
              '其他类型请安装完整 vllm 包）',
     )
     g.add_argument(
         '--dataset-path', type=str, default=None,
-        help='数据集文件路径（sharegpt/sonnet 时需要）',
+        help='数据集文件路径（sharegpt/custom_audio 时需要；sonnet 参数占位）',
     )
     g.add_argument('--num-prompts', type=int, default=1000,
                    help='基准测试请求总数')
@@ -535,10 +535,64 @@ def _load_sharegpt_requests(args: argparse.Namespace,
     return requests
 
 
+def _load_custom_audio_requests(args: argparse.Namespace,
+                                tokenizer) -> list[SampleRequest]:
+    if not args.dataset_path:
+        raise ValueError('custom_audio 数据集需要指定 --dataset-path')
+
+    dataset_path = Path(args.dataset_path)
+    base_dir = dataset_path.parent
+    rows: list[dict[str, Any]] = []
+    with dataset_path.open('r', encoding='utf-8') as f:
+        for line_no, line in enumerate(f, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f'{dataset_path}:{line_no} JSON 格式错误: {exc.msg}'
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(f'{dataset_path}:{line_no} 必须是 JSON 对象')
+            if 'audio' not in row:
+                raise ValueError(f'{dataset_path}:{line_no} 缺少 audio 字段')
+            rows.append(row)
+
+    if not rows:
+        raise ValueError(f'custom_audio 数据集为空: {dataset_path}')
+
+    out_len = (
+        getattr(args, 'custom_output_len', None)
+        or getattr(args, 'random_output_len', 128)
+        or 128
+    )
+    requests: list[SampleRequest] = []
+    for i in range(args.num_prompts):
+        row = rows[i % len(rows)]
+        audio_path = Path(row['audio'])
+        if not audio_path.is_absolute():
+            audio_path = base_dir / audio_path
+        expected_output_len = int(
+            getattr(args, 'custom_output_len', None)
+            or row.get('output_tokens')
+            or out_len
+        )
+        requests.append(SampleRequest(
+            prompt=row.get('prompt') or 'Transcribe the audio in English.',
+            prompt_len=int(row.get('prompt_len') or 0),
+            expected_output_len=expected_output_len,
+            multi_modal_data={'audio_path': str(audio_path)},
+            request_id=f'bench-audio-{uuid.uuid4().hex[:8]}-{i}',
+        ))
+    return requests
+
+
 def get_samples(args: argparse.Namespace, tokenizer) -> list[SampleRequest]:
     """
     数据集入口函数，与原版 vllm.benchmarks.datasets.get_samples 接口兼容。
-    当前 shim 支持: random / sharegpt / builtin_mtp_chat。
+    当前 shim 支持: random / sharegpt / builtin_mtp_chat / custom_audio。
     """
     name = getattr(args, 'dataset_name', 'random') or 'random'
 
@@ -548,10 +602,12 @@ def get_samples(args: argparse.Namespace, tokenizer) -> list[SampleRequest]:
         return _load_sharegpt_requests(args, tokenizer)
     elif name == 'builtin_mtp_chat':
         return builtin_mtp_chat.build_requests(args, tokenizer, SampleRequest)
+    elif name == 'custom_audio':
+        return _load_custom_audio_requests(args, tokenizer)
     else:
         raise NotImplementedError(
             f"dataset '{name}' 不在 shim 支持范围。\n"
-            f"shim 支持的数据集: random / sharegpt / builtin_mtp_chat\n"
+            f"shim 支持的数据集: random / sharegpt / builtin_mtp_chat / custom_audio\n"
             f"如需 sonnet/burstgpt/huggingface 等，请安装完整 vllm 包后使用 "
             f"`vllm bench serve`。"
         )

@@ -26,7 +26,11 @@ logger = logging.getLogger("auto_bench")
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 MODEL_CONTAINER_ROOT = PurePosixPath("/models")
-SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat"})
+DATASET_CONTAINER_ROOT = PurePosixPath("/datasets")
+BUILTIN_ASR_DATASET_PATH = (
+    "/opt/vllm_standalone_bench/assets/librispeech_test_clean_256/asr_smoke.jsonl"
+)
+SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat", "openai-audio"})
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 NETWORK_MANAGED_LABEL = "vllm_auto_bench.managed"
 NETWORK_RUN_ID_LABEL = "vllm_auto_bench.run_id"
@@ -79,6 +83,7 @@ class RunConfig:
 @dataclass(frozen=True)
 class MountConfig:
     models: Path
+    datasets: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,9 @@ class BenchProfile:
     min_throughput_tok_s: float | None = None
     min_output_compliance: float | None = None
     dataset: DatasetConfig | None = None
+    dataset_name: str = "random"
+    dataset_path: str | None = None
+    language: str = "en"
 
 
 @dataclass(frozen=True)
@@ -341,6 +349,18 @@ def _container_abs_path(value: Any, field_name: str) -> str:
     return str(container_path)
 
 
+def _dataset_container_path(value: Any, field_name: str) -> str:
+    path_text = _string(value, field_name)
+    if path_text.startswith("//"):
+        raise ConfigError(f"{field_name} must not start with '//': {path_text}")
+    container_path = PurePosixPath(path_text)
+    if not container_path.is_absolute():
+        raise ConfigError(f"{field_name} must be absolute inside the container: {path_text}")
+    if ".." in container_path.parts:
+        raise ConfigError(f"{field_name} must not contain '..': {path_text}")
+    return str(container_path)
+
+
 def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
     if "vllm_cache" not in run:
         return VllmCacheConfig()
@@ -428,8 +448,15 @@ def _parse_mounts(data: dict[str, Any], config_dir: Path) -> MountConfig:
     models = Path(_string(_required(mounts, "models", "mounts.models"), "mounts.models"))
     if not models.is_absolute():
         models = config_dir / models
+    raw_datasets = mounts.get("datasets")
+    datasets = None
+    if raw_datasets is not None:
+        datasets = Path(_string(raw_datasets, "mounts.datasets"))
+        if not datasets.is_absolute():
+            datasets = config_dir / datasets
     return MountConfig(
-        models=models.resolve()
+        models=models.resolve(),
+        datasets=datasets.resolve() if datasets is not None else None,
     )
 
 
@@ -547,25 +574,64 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
     parsed: list[BenchProfile] = []
     for item in raw_profiles:
         profile = _require_mapping(item, "bench_profiles[]")
-        input_lens = _positive_int_list(profile.get("input_lens", [512]), "input_lens")
+        backend = _backend(profile.get("backend", "openai-chat"), "bench_profile.backend")
         output_lens = _positive_int_list(profile.get("output_lens", [128]), "output_lens")
         parallel_nums = _positive_int_list(profile.get("parallel_nums", [1, 4, 8]),
                                            "parallel_nums")
         cross_product = _bool(profile.get("cross_product", False), "cross_product")
-        if not cross_product and len(output_lens) not in (1, len(input_lens)):
+        if backend == "openai-audio":
+            input_lens = (0,)
+            prefix_ratio = 0.0
+            dataset = None
+            dataset_name = (
+                _string(profile["dataset_name"], "bench_profile.dataset_name")
+                if "dataset_name" in profile else "custom_audio"
+            )
+            if "dataset_path" in profile:
+                dataset_path = _dataset_container_path(
+                    profile["dataset_path"],
+                    "bench_profile.dataset_path",
+                )
+                if not _is_under_container_path(dataset_path, DATASET_CONTAINER_ROOT):
+                    raise ConfigError(
+                        "bench_profile.dataset_path for openai-audio must be under "
+                        "/datasets so mounts.datasets can expose it to the bench "
+                        "container"
+                    )
+            else:
+                dataset_path = BUILTIN_ASR_DATASET_PATH
+            language = (
+                _string(profile["language"], "bench_profile.language")
+                if "language" in profile else "en"
+            )
+        else:
+            input_lens = _positive_int_list(profile.get("input_lens", [512]), "input_lens")
+            prefix_ratio = _ratio(profile.get("prefix_ratio", 0.0),
+                                  "bench_profile.prefix_ratio")
+            dataset_name = "random"
+            dataset_path = None
+            language = ""
+            dataset = _parse_dataset_config(
+                profile.get("dataset"),
+                "bench_profile.dataset",
+            )
+        if (
+            backend != "openai-audio"
+            and not cross_product
+            and len(output_lens) not in (1, len(input_lens))
+        ):
             raise ConfigError(
                 "output_lens length must be 1 or match input_lens unless cross_product=true"
             )
         parsed.append(BenchProfile(
             name=_safe_name(_required(profile, "name", "bench_profile.name"),
                             "bench_profile.name"),
-            backend=_backend(profile.get("backend", "openai-chat"), "bench_profile.backend"),
+            backend=backend,
             input_lens=input_lens,
             output_lens=output_lens,
             parallel_nums=parallel_nums,
             epochs=_positive_int(profile.get("epochs", 3), "bench_profile.epochs"),
-            prefix_ratio=_ratio(profile.get("prefix_ratio", 0.0),
-                                "bench_profile.prefix_ratio"),
+            prefix_ratio=prefix_ratio,
             warmup_requests=_non_negative_int(profile.get("warmup_requests", 1),
                                               "bench_profile.warmup_requests"),
             warmup_concurrency=_optional_positive_int(
@@ -583,8 +649,10 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
                 profile.get("min_output_compliance"),
                 "bench_profile.min_output_compliance",
             ),
-            dataset=_parse_dataset_config(profile.get("dataset"),
-                                          "bench_profile.dataset"),
+            dataset=dataset,
+            dataset_name=dataset_name,
+            dataset_path=dataset_path,
+            language=language,
         ))
     return tuple(parsed)
 
@@ -604,8 +672,30 @@ def load_config(path: str | Path) -> AutoBenchConfig:
     serve_profiles = _parse_serve_profiles(config_data)
     bench_profiles = _parse_bench_profiles(config_data)
     config = AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    _validate_asr_dataset_mounts(config)
     _validate_images_cover_engines(config)
     return config
+
+
+def _is_under_container_path(path: str, root: PurePosixPath) -> bool:
+    try:
+        PurePosixPath(path).relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_asr_dataset_mounts(config: AutoBenchConfig) -> None:
+    for bench in config.bench_profiles:
+        if (
+            bench.backend == "openai-audio"
+            and bench.dataset_path is not None
+            and _is_under_container_path(bench.dataset_path, DATASET_CONTAINER_ROOT)
+            and config.mounts.datasets is None
+        ):
+            raise ConfigError(
+                "bench_profile.dataset_path under /datasets requires mounts.datasets"
+            )
 
 
 def _validate_images_cover_engines(config: AutoBenchConfig) -> None:
@@ -864,6 +954,10 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{CONTAINER_BENCH_PROFILE_LABEL}={case.bench_profile.name}",
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
+    ]
+    if config.mounts.datasets is not None:
+        cmd.extend(["-v", f"{config.mounts.datasets}:/datasets:ro"])
+    cmd.extend([
         "-v", f"{resolved_bench_dir}:/results",
         config.run.bench_image,
         "python", "/opt/vllm_standalone_bench/run_bench_multi.py",
@@ -875,28 +969,36 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--warmup-requests", str(bench.warmup_requests),
         "--output-csv", "/results/result.csv",
         "--output-xlsx", "/results/result.xlsx",
-    ]
+    ])
     if bench.warmup_concurrency is not None:
         cmd.extend(["--warmup-concurrency", str(bench.warmup_concurrency)])
     if bench.warmup_output_len is not None:
         cmd.extend(["--warmup-output-len", str(bench.warmup_output_len)])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
-    if case.model.tokenizer_path:
-        cmd.extend(["--tokenizer", case.model.tokenizer_path])
-    if bench.dataset is not None:
-        cmd.extend(["--dataset", bench.dataset.name])
-        cmd.extend(["--dataset-length-policy", bench.dataset.length_policy])
-        cmd.extend(["--dataset-input-len-tolerance",
-                    str(bench.dataset.input_len_tolerance)])
-        cmd.extend(["--dataset-on-bucket-shortage", bench.dataset.on_bucket_shortage])
-        cmd.extend(["--dataset-sampling", bench.dataset.sampling])
-    _append_many(cmd, "--input-lens", bench.input_lens)
+    if bench.backend == "openai-audio":
+        cmd.extend([
+            "--dataset-name", bench.dataset_name,
+            "--dataset-path", bench.dataset_path or BUILTIN_ASR_DATASET_PATH,
+            "--language", bench.language,
+        ])
+    else:
+        if case.model.tokenizer_path:
+            cmd.extend(["--tokenizer", case.model.tokenizer_path])
+        if bench.dataset is not None:
+            cmd.extend(["--dataset", bench.dataset.name])
+            cmd.extend(["--dataset-length-policy", bench.dataset.length_policy])
+            cmd.extend(["--dataset-input-len-tolerance",
+                        str(bench.dataset.input_len_tolerance)])
+            cmd.extend(["--dataset-on-bucket-shortage",
+                        bench.dataset.on_bucket_shortage])
+            cmd.extend(["--dataset-sampling", bench.dataset.sampling])
+        _append_many(cmd, "--input-lens", bench.input_lens)
     _append_many(cmd, "--output-lens", bench.output_lens)
     _append_many(cmd, "--parallel-nums", bench.parallel_nums)
-    if bench.cross_product:
+    if bench.cross_product and bench.backend != "openai-audio":
         cmd.append("--cross-product")
-    if bench.prefix_ratio:
+    if bench.backend != "openai-audio" and bench.prefix_ratio:
         cmd.extend(["--prefix-ratio", str(bench.prefix_ratio)])
     if bench.max_ttft_ms is not None:
         cmd.extend(["--max-ttft-ms", str(bench.max_ttft_ms)])
@@ -915,6 +1017,24 @@ def should_cleanup_network(*, owned: bool, cleanup_enabled: bool,
 def validate_local_paths(config: AutoBenchConfig) -> None:
     if not config.mounts.models.is_dir():
         raise ConfigError(f"model root does not exist: {config.mounts.models}")
+    if config.mounts.datasets is not None and not config.mounts.datasets.is_dir():
+        raise ConfigError(f"datasets root does not exist: {config.mounts.datasets}")
+    for bench in config.bench_profiles:
+        if (
+            bench.backend == "openai-audio"
+            and bench.dataset_path is not None
+            and _is_under_container_path(bench.dataset_path, DATASET_CONTAINER_ROOT)
+        ):
+            if config.mounts.datasets is None:
+                raise ConfigError(
+                    "bench_profile.dataset_path under /datasets requires mounts.datasets"
+                )
+            relative_dataset = PurePosixPath(bench.dataset_path).relative_to(
+                DATASET_CONTAINER_ROOT
+            )
+            host_dataset = config.mounts.datasets.joinpath(*relative_dataset.parts)
+            if not host_dataset.is_file():
+                raise ConfigError(f"dataset file does not exist: {host_dataset}")
     for model in config.models:
         if not model.host_model_path.is_dir():
             raise ConfigError(f"model path does not exist: {model.host_model_path}")

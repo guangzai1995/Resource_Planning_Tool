@@ -140,6 +140,61 @@ python3 vllm_standalone_bench/auto_bench.py run \
   --config vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json
 ```
 
+## Qwen3-ASR-1.7B 自动压测
+
+Qwen3-ASR 走 OpenAI Audio transcription endpoint。auto bench 配置里将
+`bench_profiles[].backend` 设为 `"openai-audio"` 后，bench-runner 会调用
+`/v1/audio/transcriptions`，并把 `language` 作为 transcription 请求参数传给服务端。
+
+仓库内置了 Qwen3-ASR smoke 配置：
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.qwen3_asr_1_7b.smoke.json
+```
+
+当 `backend` 为 `"openai-audio"` 且 `dataset_path` 未设置时，auto bench 会使用
+bench-runner 镜像内的内置 ASR 数据集：
+
+```text
+/opt/vllm_standalone_bench/assets/librispeech_test_clean_256/asr_smoke.jsonl
+```
+
+该数据集是确定性的 LibriSpeech `test-clean` 子集：采样 seed 为 `20260701`，只保留
+5-30 秒音频，并按 5-10s、10-20s、20-30s 三个时长桶做均衡采样。资产目录同时包含
+`manifest.json`、`ATTRIBUTION.md` 和 `LICENSE.LibriSpeech.txt`，用于审计采样信息、
+来源归属和 LibriSpeech 许可证说明。
+
+如需使用外部 ASR 数据集，把宿主机数据目录挂到容器内 `/datasets`，并在 bench profile
+里显式设置 `dataset_name: "custom_audio"` 与 `dataset_path`：
+
+```json
+{
+  "mounts": {
+    "models": "/Resource_Planning_Tool/model",
+    "datasets": "/Resource_Planning_Tool/datasets"
+  },
+  "bench_profiles": [
+    {
+      "name": "asr_external_128",
+      "backend": "openai-audio",
+      "dataset_name": "custom_audio",
+      "dataset_path": "/datasets/custom/asr.jsonl",
+      "output_lens": [128],
+      "parallel_nums": [1, 4, 8],
+      "epochs": 16,
+      "language": "en"
+    }
+  ]
+}
+```
+
+ASR benchmark 的并发语义和离线静态 batch 不同：`parallel_nums` 中的每个
+`parallel_num` 控制同一配置下最多同时在途的 HTTP transcription 请求数，
+`parallel_num * epochs` 是该配置的总请求数。vLLM server 会在服务端内部做
+continuous batching；选择 128 个样本只是让请求从数据集中循环取样，不会把 128 段音频
+组成一个静态 batch 一次性提交。
+
 ## vLLM / SGLang 同台对比
 
 通过 `serve_profiles` 的 `engine` 字段与 `run.images` 映射，可在同一次 run 内分别启动 vLLM 与 SGLang 做对比。样例：`configs/auto_bench.qwen2_5_1_5b.sglang_compare.json`。

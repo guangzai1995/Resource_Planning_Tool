@@ -1,0 +1,51 @@
+{
+  "run": {
+    "name": "qwen3_asr_smoke",
+    "results_dir": "results",
+    "vllm_image": "vllm/vllm-openai:latest",
+    "bench_image": "vllm-bench-runner:offline",
+    "network": "vllm-bench-net",
+    "create_network": true,
+    "cleanup_network": true,
+    "container_port": 8000,
+    "publish_host_port": false,
+    "api_key": "local-bench-key",
+    "ready_timeout_sec": 600,
+    "cooldown_sec": 5
+  },
+  "mounts": {
+    "models": "/models"
+  },
+  "models": [
+    {
+      "name": "qwen3_asr_1_7b",
+      "model_path": "/models/Qwen3-ASR-1.7B",
+      "tokenizer_path": "/models/Qwen3-ASR-1.7B",
+      "served_model_name": "qwen3-asr"
+    }
+  ],
+  "serve_profiles": [
+    {
+      "name": "bf16_default",
+      "gpus": "all",
+      "args": [
+        "--dtype", "bfloat16",
+        "--trust-remote-code"
+      ]
+    }
+  ],
+  "bench_profiles": [
+    {
+      "name": "asr_builtin_128",
+      "backend": "openai-audio",
+      "dataset_name": "custom_audio",
+      "output_lens": [128],
+      "parallel_nums": [1, 4, 8],
+      "epochs": 16,
+      "language": "en",
+      "warmup_requests": 1,
+      "warmup_output_len": 32,
+      "max_ttft_ms": 10000
+    }
+  ]
+}

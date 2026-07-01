@@ -833,6 +833,7 @@ async def benchmark(
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
     self_timed: bool = False,
+    language: str | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -891,6 +892,7 @@ async def benchmark(
         logprobs=logprobs,
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
+        language=language,
         extra_headers=extra_headers,
         extra_body=extra_body,
     )
@@ -968,6 +970,7 @@ async def benchmark(
             logprobs=logprobs,
             multi_modal_content=test_mm_content,
             ignore_eos=ignore_eos,
+            language=language,
             extra_headers=extra_headers,
             extra_body=extra_body,
         )
@@ -1069,6 +1072,7 @@ async def benchmark(
             logprobs=logprobs,
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
+            language=language,
             extra_headers=extra_headers,
             extra_body=extra_body,
             request_id=request_id,
@@ -1344,6 +1348,7 @@ async def benchmark(
             prompt_len=test_prompt_len,
             output_len=test_output_len,
             logprobs=logprobs,
+            language=language,
         )
         profile_output = await request_func(
             request_func_input=profile_input, session=session
@@ -1501,6 +1506,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         type=str,
         default="/v1/completions",
         help="API endpoint.",
+    )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Language hint for audio transcription backends.",
     )
     parser.add_argument(
         "--header",
@@ -2114,6 +2125,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
         self_timed=args.self_timed,
+        language=getattr(args, "language", None),
     )
 
     # Save config and results to json

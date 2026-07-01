@@ -77,6 +77,23 @@ def minimal_config(tmp_path):
     }
 
 
+def asr_config(tmp_path):
+    data = minimal_config(tmp_path)
+    data["models"][0]["name"] = "qwen3_asr_1_7b"
+    data["models"][0]["served_model_name"] = "qwen3-asr"
+    data["bench_profiles"][0] = {
+        "name": "asr_smoke",
+        "backend": "openai-audio",
+        "output_lens": [128],
+        "parallel_nums": [1, 4],
+        "epochs": 1,
+        "warmup_requests": 0,
+        "dataset_name": "custom_audio",
+        "language": "en",
+    }
+    return data
+
+
 def test_load_config_applies_defaults_and_expands_cases(tmp_path):
     data = minimal_config(tmp_path)
     del data["run"]["container_port"]
@@ -240,6 +257,9 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert "--model" in cmd
     assert "qwen2_5_1_5b" in cmd
     assert value_after(cmd, "--model") == "qwen2_5_1_5b"
+    assert value_after(cmd, "--tokenizer") == "/models/Qwen2.5-1.5B-Instruct"
+    assert value_after(cmd, "--input-lens") == "64"
+    assert "--prefix-ratio" not in cmd
     assert "--output-csv" in cmd
     assert "/results/result.csv" in cmd
     assert value_after(cmd, "--served-model-name") == "qwen2_5_1_5b"
@@ -287,6 +307,128 @@ def test_serve_profile_rejects_speculative_config_without_dashes(tmp_path):
 
     with pytest.raises(ab.ConfigError, match="--speculative-config"):
         ab.load_config(write_config(tmp_path, data))
+
+
+def test_asr_profile_defaults_to_builtin_dataset_path(tmp_path):
+    config = ab.load_config(write_config(tmp_path, asr_config(tmp_path)))
+    bench = config.bench_profiles[0]
+    assert bench.backend == "openai-audio"
+    assert bench.input_lens == (0,)
+    assert bench.prefix_ratio == 0.0
+    assert bench.dataset_name == "custom_audio"
+    assert bench.dataset_path == ab.BUILTIN_ASR_DATASET_PATH
+    assert bench.language == "en"
+
+
+def test_build_bench_command_passes_asr_dataset_args(tmp_path):
+    config = ab.load_config(write_config(tmp_path, asr_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = (
+        tmp_path
+        / "results"
+        / "run123"
+        / "qwen3_asr_1_7b"
+        / "bf16_default"
+        / "asr_smoke"
+    )
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+    assert value_after(cmd, "--backend") == "openai-audio"
+    assert value_after(cmd, "--dataset-name") == "custom_audio"
+    assert value_after(cmd, "--dataset-path") == ab.BUILTIN_ASR_DATASET_PATH
+    assert value_after(cmd, "--language") == "en"
+    assert "--input-lens" not in cmd
+    assert "--prefix-ratio" not in cmd
+    assert "--tokenizer" not in cmd
+    assert value_after(cmd, "--output-lens") == "128"
+
+
+def test_external_asr_dataset_requires_datasets_mount(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/custom.jsonl"
+    with pytest.raises(ab.ConfigError, match="mounts.datasets"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_external_asr_dataset_must_be_under_datasets_mount(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = "/tmp/asr.jsonl"
+
+    with pytest.raises(ab.ConfigError, match="/datasets|dataset_path"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_external_asr_dataset_mount_is_added(tmp_path):
+    data = asr_config(tmp_path)
+    host_datasets = tmp_path / "datasets"
+    host_dataset_file = host_datasets / "asr" / "custom.jsonl"
+    host_dataset_file.parent.mkdir(parents=True)
+    host_dataset_file.write_text("{}", encoding="utf-8")
+    data["mounts"]["datasets"] = str(host_datasets)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/custom.jsonl"
+    config = ab.load_config(write_config(tmp_path, data))
+    ab.validate_local_paths(config)
+    case = ab.expand_cases(config, run_id="run123")[0]
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+    mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
+    assert f"{host_datasets.resolve()}:/datasets:ro" in mounts
+
+
+def test_validate_local_paths_rejects_missing_external_asr_dataset_file(tmp_path):
+    data = asr_config(tmp_path)
+    host_datasets = tmp_path / "datasets"
+    host_datasets.mkdir()
+    data["mounts"]["datasets"] = str(host_datasets)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/missing.jsonl"
+    config = ab.load_config(write_config(tmp_path, data))
+
+    with pytest.raises(ab.ConfigError, match="dataset"):
+        ab.validate_local_paths(config)
+
+
+@pytest.mark.parametrize(
+    "dataset_path",
+    [
+        "datasets/asr/custom.jsonl",
+        "/datasets/../custom.jsonl",
+        "//datasets/asr/custom.jsonl",
+    ],
+)
+def test_asr_dataset_path_must_be_absolute_and_not_escape(tmp_path, dataset_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = dataset_path
+
+    with pytest.raises(ab.ConfigError, match="dataset_path"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("dataset_name", 123, "dataset_name"),
+        ("language", "", "language"),
+        ("dataset_path", 123, "dataset_path"),
+        ("dataset_path", "", "dataset_path"),
+    ],
+)
+def test_asr_dataset_fields_must_be_non_empty_strings(tmp_path, field, value, match):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0][field] = value
+
+    with pytest.raises(ab.ConfigError, match=match):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_asr_output_lens_can_have_multiple_values_without_cross_product(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["output_lens"] = [64, 128]
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+
+    output_index = cmd.index("--output-lens")
+    assert cmd[output_index + 1:output_index + 3] == ["64", "128"]
+    assert "--cross-product" not in cmd
 
 
 def test_build_bench_command_includes_name_and_ownership_labels(tmp_path):
@@ -3506,3 +3648,71 @@ def test_smoke_config_enables_fixed_warmup():
     bp = cfg["bench_profiles"][0]
     assert bp["warmup_concurrency"] == 4
     assert bp["warmup_output_len"] == 128
+
+
+def test_qwen3_asr_sample_config_loads():
+    path = CONFIG_DIR / "auto_bench.qwen3_asr_1_7b.smoke.json"
+
+    config = ab.load_config(path)
+
+    assert config.bench_profiles[0].backend == "openai-audio"
+    assert config.bench_profiles[0].dataset_path == ab.BUILTIN_ASR_DATASET_PATH
+    assert config.bench_profiles[0].parallel_nums == (1, 4, 8)
+
+
+def test_builtin_asr_dataset_manifest_is_valid():
+    root = Path(__file__).resolve().parents[1] / "assets" / "librispeech_test_clean_256"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    jsonl = root / "asr_smoke.jsonl"
+    audio_dir = root / "audio"
+
+    import soundfile
+
+    rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()]
+    audio_refs = [row["audio"] for row in rows]
+    audio_paths = [root / audio_ref for audio_ref in audio_refs]
+    root_resolved = root.resolve()
+    referenced_files = {path.resolve() for path in audio_paths}
+    actual_flacs = {path.resolve() for path in audio_dir.glob("*.flac")}
+    missing_flacs = sorted(
+        path.relative_to(root_resolved).as_posix() for path in referenced_files - actual_flacs
+    )
+    extra_flacs = sorted(
+        path.relative_to(root_resolved).as_posix() for path in actual_flacs - referenced_files
+    )
+
+    def duration_bucket(duration_s):
+        if 5.0 <= duration_s < 10.0:
+            return "medium"
+        if 10.0 <= duration_s < 20.0:
+            return "long"
+        if 20.0 <= duration_s <= 30.0:
+            return "xlong"
+        return None
+
+    assert len(rows) == 256
+    assert manifest["sample_count"] == 256
+    assert manifest["requested_sample_count"] == 256
+    assert 5.0 <= manifest["min_duration_s"] <= manifest["max_duration_s"] <= 30.0
+    assert manifest["total_audio_bytes"] <= 104857600
+    assert len(audio_refs) == len(set(audio_refs))
+    assert all(audio_ref.startswith("audio/") for audio_ref in audio_refs)
+    assert all(Path(audio_ref).name == audio_ref.removeprefix("audio/") for audio_ref in audio_refs)
+    assert all(Path(audio_ref).suffix == ".flac" for audio_ref in audio_refs)
+    assert missing_flacs == []
+    assert extra_flacs == []
+
+    durations = [soundfile.info(path).duration for path in audio_paths]
+    duration_buckets = {"medium": 0, "long": 0, "xlong": 0}
+    for duration in durations:
+        bucket = duration_bucket(duration)
+        assert bucket is not None
+        duration_buckets[bucket] += 1
+
+    assert duration_buckets == manifest["duration_buckets"]
+    assert min(durations) == pytest.approx(manifest["min_duration_s"])
+    assert max(durations) == pytest.approx(manifest["max_duration_s"])
+    assert round(sum(durations), 3) == manifest["total_duration_s"]
+    assert sum(path.stat().st_size for path in audio_paths) == manifest["total_audio_bytes"]
+    assert (root / "ATTRIBUTION.md").is_file()
+    assert (root / "LICENSE.LibriSpeech.txt").is_file()

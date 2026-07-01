@@ -6,9 +6,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /opt/vllm_standalone_bench
 
 COPY requirements.txt ./requirements.txt
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsndfile1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt openpyxl modelscope
+
 COPY run_bench_multi.py run_bench_serve.py ./
 COPY vllm_bench ./vllm_bench
-
-RUN pip install --no-cache-dir -r requirements.txt openpyxl modelscope
+COPY tools ./tools
+COPY assets ./assets
 
 CMD ["python", "/opt/vllm_standalone_bench/run_bench_multi.py", "--help"]

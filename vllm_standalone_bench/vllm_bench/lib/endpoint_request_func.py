@@ -11,6 +11,7 @@ import time
 import traceback
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import aiohttp
@@ -506,14 +507,13 @@ async def async_request_openai_audio(
     api_url = request_func_input.api_url
     _validate_api_url(api_url, "OpenAI Audio API", {"transcriptions", "translations"})
 
-    content = [{"type": "text", "text": request_func_input.prompt}]
     payload = {
         "model": request_func_input.model_name
         if request_func_input.model_name
         else request_func_input.model,
         "max_completion_tokens": request_func_input.output_len,
         "stream": True,
-        "language": "en",
+        "language": request_func_input.language or "en",
         # Flattened due to multipart/form-data
         "stream_include_usage": True,
         "stream_continuous_usage_stats": True,
@@ -531,18 +531,36 @@ async def async_request_openai_audio(
         return buffer
 
     mm_audio = request_func_input.multi_modal_content
-    if not isinstance(mm_audio, dict) or "audio" not in mm_audio:
-        raise TypeError("multi_modal_content must be a dict containing 'audio'")
-    with to_bytes(*mm_audio["audio"]) as f:
+    if not isinstance(mm_audio, dict):
+        raise TypeError("multi_modal_content must be a dict for openai-audio")
+    if "audio_path" in mm_audio:
+        audio_path = Path(str(mm_audio["audio_path"]))
+        audio_file = audio_path.open("rb")
+        filename = audio_path.name
+        content_type = (
+            "audio/wav"
+            if audio_path.suffix.lower() == ".wav"
+            else "application/octet-stream"
+        )
+    elif "audio" in mm_audio:
+        audio_file = to_bytes(*mm_audio["audio"])
+        filename = "audio.wav"
+        content_type = "audio/wav"
+    else:
+        raise TypeError("multi_modal_content must contain 'audio_path' or 'audio'")
+
+    try:
         form = aiohttp.FormData()
-        form.add_field("file", f, content_type="audio/wav")
+        form.add_field(
+            "file", audio_file, filename=filename, content_type=content_type
+        )
         for key, value in payload.items():
             form.add_field(key, str(value))
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
-        output.input_audio_duration = soundfile.info(f).duration
-        f.seek(0)
+        output.input_audio_duration = soundfile.info(audio_file).duration
+        audio_file.seek(0)
 
         generated_text = ""
         ttft = 0.0
@@ -584,10 +602,9 @@ async def async_request_openai_audio(
                                         )
 
                                     generated_text += content or ""
-                                elif usage := data.get("usage"):
-                                    output.output_tokens = usage.get(
-                                        "completion_tokens"
-                                    )
+                                if usage := data.get("usage"):
+                                    if (ct := usage.get("completion_tokens")) is not None:
+                                        output.output_tokens = ct
 
                                 most_recent_timestamp = timestamp
 
@@ -601,6 +618,8 @@ async def async_request_openai_audio(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+    finally:
+        audio_file.close()
 
     if pbar:
         pbar.update(1)
