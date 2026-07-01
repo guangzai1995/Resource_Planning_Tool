@@ -1500,6 +1500,23 @@ def test_follow_file_tails_from_end(tmp_path, monkeypatch, capsys):
     assert "new" in captured.out
 
 
+def test_readme_documents_vllm_cache_persistence():
+    readme = (Path(ab.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+
+    assert "vllm_cache" in readme
+    assert "VLLM_CACHE_ROOT" in readme
+    assert "DG_JIT_CACHE_DIR" in readme
+    assert "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR" in readme
+
+
+def test_gitignore_ignores_local_cache_dir():
+    gitignore = (Path(ab.__file__).resolve().parents[1] / ".gitignore").read_text(
+        encoding="utf-8"
+    )
+
+    assert ".cache/" in gitignore.splitlines()
+
+
 def test_follow_file_handles_open_error(tmp_path, monkeypatch, capsys):
     path = tmp_path / "controller.log"
     path.write_text("data", encoding="utf-8")

@@ -174,6 +174,46 @@ run 结束后在 `results/<run_id>/` 产出 `compare.csv`、`compare.xlsx` 与 `
 默认 `warmup_concurrency=4`、`warmup_output_len=128`。CLI 直跑可用
 `--warmup-concurrency 4 --warmup-output-len 128`。
 
+### vLLM 编译/JIT cache 持久化
+
+GLM5.2 这类 DSA/MoE 模型首次启动会触发 torch.compile、AOT、Triton/Inductor、
+DeepGEMM JIT 和 FlashInfer autotune。默认情况下这些缓存位于 vLLM 容器内，
+auto_bench 停止并删除容器后会丢失。需要反复运行同一套 benchmark 时，可以启用
+`run.vllm_cache`：
+
+```json
+"run": {
+  "vllm_cache": {
+    "enabled": true,
+    "root": "/Resource_Planning_Tool/.cache/vllm_auto_bench",
+    "container_path": "/vllm-cache",
+    "set_default_env": true
+  }
+}
+```
+
+启用后，vLLM serving 容器会挂载 `<root>/<cache_key>:/vllm-cache:rw`，并自动设置：
+
+- `VLLM_CACHE_ROOT=/vllm-cache`
+- `DG_JIT_CACHE_DIR=/vllm-cache/deep_gemm`
+- `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/vllm-cache/flashinfer_autotune`
+
+建议为 GLM5.2 正式 profile 显式配置稳定 `cache_key`：
+
+```json
+"serve_profiles": [{
+  "name": "glm52_fp8_tp8_o2",
+  "engine": "vllm",
+  "cache_key": "glm52-fp8-tp8-h20-o2",
+  "gpus": "all",
+  "args": ["--tensor-parallel-size", "8", "--kv-cache-dtype", "fp8"]
+}]
+```
+
+第一次运行仍会完整编译和 JIT；后续相同镜像、模型、GPU 架构、TP、dtype 和 serve args
+应复用 cache。不要让不同硬件或不同 serve 参数共享同一个 `cache_key`。cache 目录不会随
+run 清理，可手动删除 `.cache/vllm_auto_bench/<cache_key>` 释放磁盘空间。
+
 ## 使用方法
 
 ### 基本用法（Random 数据集）
