@@ -217,7 +217,7 @@ _make_mod('vllm.tokenizers',
           get_tokenizer=_get_tokenizer,
           TokenizerLike=_TokenizerLike)
 
-# ─── Step 3: 轻量 datasets shim（仅支持 random / sharegpt）────────────────────
+# ─── Step 3: 轻量 datasets shim（支持 random / sharegpt / custom_audio）────────
 
 @dataclass
 class SampleRequest:
@@ -226,10 +226,10 @@ class SampleRequest:
     serve.py 访问的字段: prompt / prompt_len / expected_output_len /
                          multi_modal_data / request_id / timestamp
     """
-    prompt: Any                           # str（纯文本场景）
+    prompt: Any                           # str（文本 / custom_audio 提示）
     prompt_len: int
     expected_output_len: int
-    multi_modal_data: Any = None          # 纯文本场景始终为 None
+    multi_modal_data: Any = None          # custom_audio 使用 {"audio_path": ...}
     request_id: str | None = None
     timestamp: float = 0.0               # timed_trace 专用
 
@@ -249,7 +249,7 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
     )
     g.add_argument(
         '--dataset-path', type=str, default=None,
-        help='数据集文件路径（sharegpt/sonnet 时需要）',
+        help='数据集文件路径（sharegpt/custom_audio 时需要；sonnet 参数占位）',
     )
     g.add_argument('--num-prompts', type=int, default=1000,
                    help='基准测试请求总数')
@@ -537,7 +537,14 @@ def _load_custom_audio_requests(args: argparse.Namespace,
             stripped = line.strip()
             if not stripped:
                 continue
-            row = json.loads(stripped)
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f'{dataset_path}:{line_no} JSON 格式错误: {exc.msg}'
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(f'{dataset_path}:{line_no} 必须是 JSON 对象')
             if 'audio' not in row:
                 raise ValueError(f'{dataset_path}:{line_no} 缺少 audio 字段')
             rows.append(row)
