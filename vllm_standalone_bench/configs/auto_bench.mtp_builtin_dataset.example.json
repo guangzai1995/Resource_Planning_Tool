@@ -1,0 +1,74 @@
+{
+  "run": {
+    "name": "mtp_builtin_dataset_example",
+    "results_dir": "vllm_standalone_bench/results",
+    "vllm_image": "vllm/vllm-openai:latest-0616",
+    "bench_image": "vllm-bench-runner:offline",
+    "network": "vllm-bench-net",
+    "create_network": true,
+    "cleanup_network": true,
+    "container_port": 8004,
+    "publish_host_port": false,
+    "host_port": 18000,
+    "api_key": "local-bench-key",
+    "ready_timeout_sec": 3600,
+    "cooldown_sec": 20
+  },
+  "mounts": {
+    "models": "/NVME4/models"
+  },
+  "models": [
+    {
+      "name": "GLM-5.2",
+      "model_path": "/models/GLM-5.2-FP8",
+      "tokenizer_path": "/models/GLM-5.2-FP8",
+      "served_model_name": "GLM-5.2"
+    }
+  ],
+  "serve_profiles": [
+    {
+      "name": "mtp1_fp8",
+      "engine": "vllm",
+      "gpus": "all",
+      "args": [
+        "--tensor-parallel-size",
+        "8",
+        "--max-model-len",
+        "149999",
+        "--max-num-seqs",
+        "48",
+        "--enable-prefix-caching",
+        "--trust-remote-code",
+        "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
+        "--speculative-config.method",
+        "mtp",
+        "--speculative-config.num_speculative_tokens",
+        "1"
+      ]
+    }
+  ],
+  "bench_profiles": [
+    {
+      "name": "mtp_real_bucket",
+      "backend": "openai-chat",
+      "dataset": {
+        "name": "builtin_mtp_chat",
+        "length_policy": "bucket",
+        "input_len_tolerance": 0.2,
+        "on_bucket_shortage": "error",
+        "sampling": "shuffle"
+      },
+      "input_lens": [1024, 2048, 4096],
+      "output_lens": [512],
+      "parallel_nums": [1, 4, 8],
+      "epochs": 2,
+      "prefix_ratio": 0.0,
+      "warmup_requests": 4,
+      "warmup_concurrency": 4,
+      "warmup_output_len": 128,
+      "cross_product": true,
+      "min_output_compliance": 0.95
+    }
+  ]
+}
