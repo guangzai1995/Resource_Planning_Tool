@@ -77,6 +77,23 @@ def minimal_config(tmp_path):
     }
 
 
+def asr_config(tmp_path):
+    data = minimal_config(tmp_path)
+    data["models"][0]["name"] = "qwen3_asr_1_7b"
+    data["models"][0]["served_model_name"] = "qwen3-asr"
+    data["bench_profiles"][0] = {
+        "name": "asr_smoke",
+        "backend": "openai-audio",
+        "output_lens": [128],
+        "parallel_nums": [1, 4],
+        "epochs": 1,
+        "warmup_requests": 0,
+        "dataset_name": "custom_audio",
+        "language": "en",
+    }
+    return data
+
+
 def test_load_config_applies_defaults_and_expands_cases(tmp_path):
     data = minimal_config(tmp_path)
     del data["run"]["container_port"]
@@ -240,10 +257,78 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert "--model" in cmd
     assert "qwen2_5_1_5b" in cmd
     assert value_after(cmd, "--model") == "qwen2_5_1_5b"
+    assert value_after(cmd, "--tokenizer") == "/models/Qwen2.5-1.5B-Instruct"
+    assert value_after(cmd, "--input-lens") == "64"
+    assert "--prefix-ratio" not in cmd
     assert "--output-csv" in cmd
     assert "/results/result.csv" in cmd
     assert value_after(cmd, "--served-model-name") == "qwen2_5_1_5b"
     assert value_after(cmd, "--output-xlsx") == "/results/result.xlsx"
+
+
+def test_asr_profile_defaults_to_builtin_dataset_path(tmp_path):
+    config = ab.load_config(write_config(tmp_path, asr_config(tmp_path)))
+    bench = config.bench_profiles[0]
+    assert bench.backend == "openai-audio"
+    assert bench.input_lens == (0,)
+    assert bench.prefix_ratio == 0.0
+    assert bench.dataset_name == "custom_audio"
+    assert bench.dataset_path == ab.BUILTIN_ASR_DATASET_PATH
+    assert bench.language == "en"
+
+
+def test_build_bench_command_passes_asr_dataset_args(tmp_path):
+    config = ab.load_config(write_config(tmp_path, asr_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = (
+        tmp_path
+        / "results"
+        / "run123"
+        / "qwen3_asr_1_7b"
+        / "bf16_default"
+        / "asr_smoke"
+    )
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+    assert value_after(cmd, "--backend") == "openai-audio"
+    assert value_after(cmd, "--dataset-name") == "custom_audio"
+    assert value_after(cmd, "--dataset-path") == ab.BUILTIN_ASR_DATASET_PATH
+    assert value_after(cmd, "--language") == "en"
+    assert "--input-lens" not in cmd
+    assert "--prefix-ratio" not in cmd
+    assert "--tokenizer" not in cmd
+    assert value_after(cmd, "--output-lens") == "128"
+
+
+def test_external_asr_dataset_requires_datasets_mount(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/custom.jsonl"
+    with pytest.raises(ab.ConfigError, match="mounts.datasets"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_external_asr_dataset_mount_is_added(tmp_path):
+    data = asr_config(tmp_path)
+    host_datasets = tmp_path / "datasets"
+    host_datasets.mkdir()
+    data["mounts"]["datasets"] = str(host_datasets)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/custom.jsonl"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+    mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
+    assert f"{host_datasets.resolve()}:/datasets:ro" in mounts
+
+
+@pytest.mark.parametrize(
+    "dataset_path",
+    ["datasets/asr/custom.jsonl", "/datasets/../custom.jsonl"],
+)
+def test_asr_dataset_path_must_be_absolute_and_not_escape(tmp_path, dataset_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = dataset_path
+
+    with pytest.raises(ab.ConfigError, match="dataset_path"):
+        ab.load_config(write_config(tmp_path, data))
 
 
 def test_build_bench_command_includes_name_and_ownership_labels(tmp_path):
