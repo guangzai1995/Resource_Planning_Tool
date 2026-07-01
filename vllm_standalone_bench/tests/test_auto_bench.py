@@ -321,7 +321,11 @@ def test_external_asr_dataset_mount_is_added(tmp_path):
 
 @pytest.mark.parametrize(
     "dataset_path",
-    ["datasets/asr/custom.jsonl", "/datasets/../custom.jsonl"],
+    [
+        "datasets/asr/custom.jsonl",
+        "/datasets/../custom.jsonl",
+        "//datasets/asr/custom.jsonl",
+    ],
 )
 def test_asr_dataset_path_must_be_absolute_and_not_escape(tmp_path, dataset_path):
     data = asr_config(tmp_path)

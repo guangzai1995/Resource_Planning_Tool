@@ -341,6 +341,8 @@ def _container_abs_path(value: Any, field_name: str) -> str:
 
 def _dataset_container_path(value: Any, field_name: str) -> str:
     path_text = _string(value, field_name)
+    if path_text.startswith("//"):
+        raise ConfigError(f"{field_name} must not start with '//': {path_text}")
     container_path = PurePosixPath(path_text)
     if not container_path.is_absolute():
         raise ConfigError(f"{field_name} must be absolute inside the container: {path_text}")
