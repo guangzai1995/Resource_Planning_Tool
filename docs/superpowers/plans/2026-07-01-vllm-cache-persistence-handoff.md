@@ -43,8 +43,10 @@ The final read-only review found four required hardening items, all handled in t
   - `git check-ignore -q .cache` -> exit 0.
   - Dry-run with `run.vllm_cache={"enabled": true}` and omitted `root` -> exit 0; vLLM command included `/tmp/.cache/vllm_auto_bench/qwen15b-bf16-default-cache-dry-run:/vllm-cache:rw` plus `VLLM_CACHE_ROOT`, `DG_JIT_CACHE_DIR`, and `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`.
   - Full `pytest -q` -> `11 failed, 306 passed, 1 skipped, 6 warnings`; all failures were in `tests/test_inference_token_factory_report.py` due missing `outputs/context_analysis_20260609_034248/01_overview.json`.
+- Merge-prep data fix: added `outputs/context_analysis_20260609_034248/01_overview.json` and `02_input_buckets.csv`; `PYTHONPATH=. pytest -q tests/test_inference_token_factory_report.py` -> `18 passed`.
+- Final pre-merge verification after the fixture fix: `pytest -q` -> `317 passed, 1 skipped, 6 warnings`; `PYTHONPATH=vllm_standalone_bench pytest -q vllm_standalone_bench/tests/test_auto_bench.py` -> `183 passed`; `git diff --check` -> exit 0.
 - Final read-only review of `ea9480e58ba6..2c80bfdbb355` found no Critical, Important, or Minor issues and assessed the branch as mergeable.
-- The full-suite failure is the known unrelated baseline issue, not introduced by this branch.
+- The prior full-suite failure was an unrelated missing fixture and has been addressed before merging back to `main`.
 
 ## Notes For Future Work
 

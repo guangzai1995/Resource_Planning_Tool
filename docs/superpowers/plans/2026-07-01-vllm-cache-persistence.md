@@ -21,7 +21,7 @@
   - `container_path` 已拒绝 `/`、`/models` 和 `/models/...`，避免遮蔽容器根或模型挂载。
   - `vllm_cache.json` 已增加 `cache_key_source` 和 `cache_key_inputs` 便于审计。
 - 当前 targeted 测试状态：本修复提交前红灯为 `11 failed, 172 passed`；实现后 `PYTHONPATH=vllm_standalone_bench pytest -q vllm_standalone_bench/tests/test_auto_bench.py` 为 `183 passed`。
-- 已知完整基线问题：`pytest -q` 仍有与本任务无关的既有失败，`tests/test_inference_token_factory_report.py` 依赖缺失的 `outputs/context_analysis_20260609_034248/01_overview.json`。
+- 合并前完整测试状态：已补齐 `outputs/context_analysis_20260609_034248/` 历史分析 fixture，`pytest -q` 应作为合并门禁。
 - 详细 handoff：`docs/superpowers/plans/2026-07-01-vllm-cache-persistence-handoff.md`
 
 ---
@@ -44,9 +44,9 @@
 - 修改：`.gitignore`
   - 增加 `.cache/`，防止 vLLM 编译/JIT 产物进入 git。
 
-## 约束与已知基线
+## 约束与验证
 
-- 当前 worktree 完整 `pytest -q` 已知存在与本任务无关的既有失败：`tests/test_inference_token_factory_report.py` 依赖缺失的 `outputs/context_analysis_20260609_034248/01_overview.json`。
+- 先前完整 `pytest -q` 的既有失败来自缺失 `outputs/context_analysis_20260609_034248/` 历史分析 fixture；该数据已补齐，合并前必须重新运行完整测试。
 - 本计划的主要验证命令使用 targeted test：
 
 ```bash
@@ -952,7 +952,7 @@ git diff --check
 pytest -q
 ```
 
-预期：允许仍出现既有失败 `tests/test_inference_token_factory_report.py` 缺少 `outputs/context_analysis_20260609_034248/01_overview.json`。最终汇报必须明确区分该既有失败和本次 targeted tests。
+预期：完整测试应通过；若失败，最终汇报必须明确区分本次 vLLM cache 变更、历史分析 fixture 和其他模块失败。
 
 - [x] **步骤 6：最终 Commit**
 

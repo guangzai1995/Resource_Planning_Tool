@@ -264,7 +264,7 @@ docker run -d ... -v <models>:/models:ro --entrypoint vllm <image> serve ...
   - `PYTHONPATH=vllm_standalone_bench pytest -q vllm_standalone_bench/tests/test_auto_bench.py`
 
 - Baseline note
-  - 当前 worktree 完整 `pytest -q` 已知存在与本任务无关的既有失败：`tests/test_inference_token_factory_report.py` 依赖缺失的 `outputs/context_analysis_20260609_034248/01_overview.json`。
+  - 先前完整 `pytest -q` 的既有失败来自缺失 `outputs/context_analysis_20260609_034248/` 历史分析 fixture；合并前已补齐该 fixture，并以完整测试作为门禁。
 
 ## Implementation Scope
 
