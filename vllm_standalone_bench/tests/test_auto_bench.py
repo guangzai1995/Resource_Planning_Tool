@@ -3054,6 +3054,48 @@ def test_load_config_warmup_opts_default_none(tmp_path):
     assert bp.warmup_output_len is None
 
 
+def enable_vllm_cache(data, root):
+    data["run"]["vllm_cache"] = {
+        "enabled": True,
+        "root": str(root),
+        "container_path": "/vllm-cache",
+        "set_default_env": True,
+    }
+    return data
+
+
+def test_load_config_vllm_cache_defaults_disabled(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+
+    assert config.run.vllm_cache.enabled is False
+    assert config.run.vllm_cache.root is None
+    assert config.run.vllm_cache.container_path == "/vllm-cache"
+    assert config.run.vllm_cache.set_default_env is True
+    assert config.serve_profiles[0].cache_key is None
+
+
+def test_load_config_parses_enabled_vllm_cache(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert config.run.vllm_cache.enabled is True
+    assert config.run.vllm_cache.root == (tmp_path / "cache").resolve()
+    assert config.run.vllm_cache.container_path == "/vllm-cache"
+    assert config.run.vllm_cache.set_default_env is True
+    assert config.serve_profiles[0].cache_key == "glm52-fp8-tp8-h20-o2"
+
+
+def test_load_config_resolves_relative_vllm_cache_root_from_config_dir(tmp_path):
+    config_dir = tmp_path / "configs"
+    data = enable_vllm_cache(minimal_config(tmp_path), "relative-cache")
+
+    config = ab.load_config(write_config_at(config_dir / "config.json", data))
+
+    assert config.run.vllm_cache.root == (config_dir / "relative-cache").resolve()
+
+
 def test_build_bench_command_includes_warmup_opts(tmp_path):
     data = minimal_config(tmp_path)
     data["bench_profiles"][0]["warmup_concurrency"] = 4

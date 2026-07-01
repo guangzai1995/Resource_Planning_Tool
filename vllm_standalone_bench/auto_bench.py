@@ -47,6 +47,14 @@ class StopRequested(Exception):
 
 
 @dataclass(frozen=True)
+class VllmCacheConfig:
+    enabled: bool = False
+    root: Path | None = None
+    container_path: str = "/vllm-cache"
+    set_default_env: bool = True
+
+
+@dataclass(frozen=True)
 class RunConfig:
     name: str
     results_dir: Path
@@ -64,6 +72,7 @@ class RunConfig:
     images: Mapping[str, str] = field(
         default_factory=lambda: types.MappingProxyType({})
     )
+    vllm_cache: VllmCacheConfig = field(default_factory=VllmCacheConfig)
 
 
 @dataclass(frozen=True)
@@ -87,6 +96,7 @@ class ServeProfile:
     engine: str = "vllm"
     gpus: str = "all"
     args: tuple[str, ...] = field(default_factory=tuple)
+    cache_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -302,7 +312,52 @@ def _container_path_to_host(path_value: Any, model_root: Path, field_name: str) 
     return model_root / relative
 
 
-def _parse_run(data: dict[str, Any]) -> RunConfig:
+def _container_abs_path(value: Any, field_name: str) -> str:
+    path_text = _string(value, field_name)
+    container_path = PurePosixPath(path_text)
+    if not container_path.is_absolute():
+        raise ConfigError(f"{field_name} must be absolute inside the container: {path_text}")
+    if ".." in container_path.parts:
+        raise ConfigError(f"{field_name} must not contain '..': {path_text}")
+    return str(container_path)
+
+
+def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
+    raw = run.get("vllm_cache")
+    if raw is None:
+        return VllmCacheConfig()
+    cache = _require_mapping(raw, "run.vllm_cache")
+    enabled = _bool(cache.get("enabled", False), "run.vllm_cache.enabled")
+    container_path = _container_abs_path(
+        cache.get("container_path", "/vllm-cache"),
+        "run.vllm_cache.container_path",
+    )
+    set_default_env = _bool(
+        cache.get("set_default_env", True),
+        "run.vllm_cache.set_default_env",
+    )
+    root_raw = cache.get("root")
+    if not enabled:
+        return VllmCacheConfig(
+            enabled=False,
+            root=None,
+            container_path=container_path,
+            set_default_env=set_default_env,
+        )
+    if root_raw is None:
+        raise ConfigError("run.vllm_cache.root is required when enabled=true")
+    root = Path(_string(root_raw, "run.vllm_cache.root"))
+    if not root.is_absolute():
+        root = config_dir / root
+    return VllmCacheConfig(
+        enabled=True,
+        root=root.resolve(),
+        container_path=container_path,
+        set_default_env=set_default_env,
+    )
+
+
+def _parse_run(data: dict[str, Any], config_dir: Path) -> RunConfig:
     run = _require_mapping(data.get("run"), "run")
     host_port = run.get("host_port")
     vllm_image = _optional_string(run.get("vllm_image"), "run.vllm_image")
@@ -327,6 +382,7 @@ def _parse_run(data: dict[str, Any]) -> RunConfig:
         cooldown_sec=_non_negative_float(run.get("cooldown_sec", 20.0), "run.cooldown_sec"),
         vllm_image=vllm_image,
         images=images,
+        vllm_cache=_parse_vllm_cache(run, config_dir),
     )
 
 
@@ -404,12 +460,17 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
             raise ConfigError(
                 f"serve_profile.engine must be one of {SUPPORTED_ENGINES}, got {engine!r}"
             )
+        cache_key = profile.get("cache_key")
         parsed.append(ServeProfile(
             name=_safe_name(_required(profile, "name", "serve_profile.name"),
                             "serve_profile.name"),
             engine=engine,
             gpus=_string(profile.get("gpus", "all"), "serve_profile.gpus"),
             args=tuple(args),
+            cache_key=(
+                _safe_name(cache_key, "serve_profile.cache_key")
+                if cache_key is not None else None
+            ),
         ))
     return tuple(parsed)
 
@@ -471,7 +532,7 @@ def load_config(path: str | Path) -> AutoBenchConfig:
         raise ConfigError(f"invalid JSON config: {exc}") from exc
 
     config_data = _require_mapping(raw, "config")
-    run = _parse_run(config_data)
+    run = _parse_run(config_data, config_path.parent)
     mounts = _parse_mounts(config_data, config_path.parent)
     models = _parse_models(config_data, mounts)
     serve_profiles = _parse_serve_profiles(config_data)
