@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from vllm_standalone_bench.tools import build_librispeech_asr_smoke as builder
@@ -63,3 +64,60 @@ def test_select_samples_falls_back_when_a_bucket_is_short():
 
     assert len(selected) == 12
     assert builder.bucket_counts(selected)["medium"] == 2
+
+
+def test_write_dataset_copies_audio_and_writes_relative_jsonl(tmp_path):
+    source = tmp_path / "source.flac"
+    source.write_bytes(b"fake-audio")
+    sample = builder.LibriSpeechSample(
+        speaker_id="1089",
+        chapter_id="134686",
+        utterance_id="1089-134686-0001",
+        audio_path=source,
+        text="A LONG ENOUGH TRANSCRIPT",
+        duration_s=12.5,
+        size_bytes=source.stat().st_size,
+    )
+
+    manifest = builder.write_dataset([sample], tmp_path / "out", seed=20260701)
+
+    jsonl_path = tmp_path / "out" / "asr_smoke.jsonl"
+    rows = [
+        json.loads(line)
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows == [
+        {
+            "prompt": "Transcribe the audio in English.",
+            "audio": "audio/1089-134686-0001.flac",
+            "output_tokens": 128,
+            "reference": "A LONG ENOUGH TRANSCRIPT",
+        }
+    ]
+    assert (tmp_path / "out" / "audio" / "1089-134686-0001.flac").read_bytes() == (
+        b"fake-audio"
+    )
+    assert manifest["sample_count"] == 1
+    assert manifest["duration_buckets"] == {"medium": 0, "long": 1, "xlong": 0}
+    assert manifest["seed"] == 20260701
+    assert "OpenSLR" in (tmp_path / "out" / "ATTRIBUTION.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Creative Commons Attribution 4.0" in (
+        tmp_path / "out" / "LICENSE.LibriSpeech.txt"
+    ).read_text(encoding="utf-8")
+
+
+def test_apply_size_budget_removes_longest_samples_first():
+    samples = [
+        _sample(1, 8.0, size_bytes=30),
+        _sample(2, 25.0, size_bytes=40),
+        _sample(3, 12.0, size_bytes=35),
+    ]
+
+    trimmed = builder.apply_size_budget(samples, max_bytes=65)
+
+    assert [s.utterance_id for s in trimmed] == [
+        "1089-134686-0001",
+        "1089-134686-0003",
+    ]
