@@ -748,9 +748,12 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
             # 第一次运行：做 ready check（超时 600s）；后续跳过（设为 0）
             if is_first_run:
                 cfg.ready_check_timeout_sec = 600
-                # 固定并发预热：warmup_concurrency 设了则凑齐一波满并发，否则沿用 warmup_requests
+                # 固定并发预热：warmup_requests 表示轮数；
+                # warmup_concurrency 设了则每轮发满该并发。
                 warmup_cc = getattr(our_args, 'warmup_concurrency', None)
-                cfg.num_warmups = warmup_cc if warmup_cc is not None else our_args.warmup_requests
+                cfg.num_warmups = our_args.warmup_requests * (
+                    warmup_cc if warmup_cc is not None else 1
+                )
                 is_first_run = False
             else:
                 cfg.ready_check_timeout_sec = 0
@@ -923,9 +926,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     bench.add_argument('--sleep-between', type=float, default=2.0,
                        help='每组配置测试后的等待时间（秒，让服务 KV cache 释放，默认: 2.0）')
     bench.add_argument('--warmup-requests', type=int, default=1,
-                       help='首次测试前的预热请求数（仅第一组配置执行，默认: 1）')
+                       help='首次测试前的预热轮数；设 warmup-concurrency 后总预热请求数'
+                            '= warmup_requests × warmup_concurrency（默认: 1）')
     bench.add_argument('--warmup-concurrency', type=int, default=None,
-                       help='warmup 固定并发数（仅首次预热生效；默认 None=跟随该档并发）')
+                       help='warmup 每轮固定并发数（仅首次预热生效；默认 None=跟随该档并发）')
     bench.add_argument('--warmup-output-len', type=int, default=None,
                        help='warmup 请求输出长度（默认 None=跟随该档输出；设短值省 decode 时间）')
     bench.add_argument('--dataset-name', default=None,
