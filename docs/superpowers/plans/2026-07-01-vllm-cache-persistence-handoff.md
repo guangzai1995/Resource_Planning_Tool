@@ -42,8 +42,9 @@ The final read-only review found four required hardening items, all handled in t
   - `git diff --check` -> exit 0.
   - `git check-ignore -q .cache` -> exit 0.
   - Dry-run with `run.vllm_cache={"enabled": true}` and omitted `root` -> exit 0; vLLM command included `/tmp/.cache/vllm_auto_bench/qwen15b-bf16-default-cache-dry-run:/vllm-cache:rw` plus `VLLM_CACHE_ROOT`, `DG_JIT_CACHE_DIR`, and `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`.
+  - Full `pytest -q` -> `11 failed, 306 passed, 1 skipped, 6 warnings`; all failures were in `tests/test_inference_token_factory_report.py` due missing `outputs/context_analysis_20260609_034248/01_overview.json`.
 - Final read-only review of `ea9480e58ba6..2c80bfdbb355` found no Critical, Important, or Minor issues and assessed the branch as mergeable.
-- Full `pytest -q` has a known unrelated baseline failure in `tests/test_inference_token_factory_report.py` because `outputs/context_analysis_20260609_034248/01_overview.json` is missing.
+- The full-suite failure is the known unrelated baseline issue, not introduced by this branch.
 
 ## Notes For Future Work
 
