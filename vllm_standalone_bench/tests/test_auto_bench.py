@@ -3104,6 +3104,32 @@ def test_vllm_cache_null_is_rejected(tmp_path):
         ab.load_config(write_config(tmp_path, data))
 
 
+def test_vllm_cache_enabled_requires_root(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["vllm_cache"] = {"enabled": True}
+
+    with pytest.raises(ab.ConfigError, match="vllm_cache.root"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("container_path", ["relative/cache", "/cache/../bad"])
+def test_vllm_cache_container_path_must_be_absolute_and_safe(tmp_path, container_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["run"]["vllm_cache"]["container_path"] = container_path
+
+    with pytest.raises(ab.ConfigError, match="container_path|absolute|contain"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("cache_key", ["bad/name", ".", ".."])
+def test_serve_profile_cache_key_must_be_safe(tmp_path, cache_key):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = cache_key
+
+    with pytest.raises(ab.ConfigError, match="cache_key|safe filename"):
+        ab.load_config(write_config(tmp_path, data))
+
+
 def test_build_bench_command_includes_warmup_opts(tmp_path):
     data = minimal_config(tmp_path)
     data["bench_profiles"][0]["warmup_concurrency"] = 4
