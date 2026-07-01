@@ -200,6 +200,51 @@ def test_extract_row_spec_decode_defaults_when_metrics_missing():
     assert row["spec_decode_per_position_acceptance_rates"] == "[]"
 
 
+def test_extract_row_includes_gpu_kv_cache_usage():
+    result = {
+        **_result(),
+        "avg_gpu_kv_cache_usage": 9.12345,
+        "peak_gpu_kv_cache_usage": 12.67891,
+    }
+
+    row = m._extract_row(
+        result,
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True,
+    )
+
+    assert row["avg_gpu_kv_cache_usage"] == 9.1235
+    assert row["peak_gpu_kv_cache_usage"] == 12.6789
+
+
+def test_extract_row_gpu_kv_cache_usage_defaults_when_missing():
+    row = m._extract_row(
+        _result(),
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True,
+    )
+
+    assert row["avg_gpu_kv_cache_usage"] == 0.0
+    assert row["peak_gpu_kv_cache_usage"] == 0.0
+
+
+def test_extract_row_spec_decode_token_aliases_from_serve_result():
+    result = {
+        **_result(),
+        "spec_decode_accepted_tokens": 61,
+        "spec_decode_draft_tokens": 280,
+    }
+
+    row = m._extract_row(
+        result,
+        in_len=1024, out_len=512, parallel_num=4, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True,
+    )
+
+    assert row["spec_decode_num_accepted_tokens"] == 61
+    assert row["spec_decode_num_draft_tokens"] == 280
+
+
 def test_token_source_tokenizer_fallback_when_no_usage():
     row = m._extract_row(
         _result(total_out=24, completed=3, usage_reported=0,
@@ -264,6 +309,7 @@ def test_csv_headers_match_row_keys():
                      "input_throughput_tok_s", "prefill_effective_tok_s",
                      "decode_effective_tok_s",
                      "avg_cached_tokens", "cache_hit_rate",
+                     "avg_gpu_kv_cache_usage", "peak_gpu_kv_cache_usage",
                      "spec_decode_acceptance_rate",
                      "spec_decode_system_efficiency",
                      "spec_decode_num_drafts",
