@@ -37,6 +37,7 @@ import argparse
 import asyncio
 import copy
 import csv
+import hashlib
 import importlib.util
 import itertools
 import logging
@@ -164,6 +165,53 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
 
 # ─── 从 serve.py 返回的 result_json 提取 CSV 行 ───────────────────────────────
 
+MAX_SEED_VALUE = 2**32
+
+
+def validate_seed(seed: int) -> None:
+    if not 0 <= seed < MAX_SEED_VALUE:
+        raise ValueError(f"--seed 必须满足 0 <= seed < {MAX_SEED_VALUE}，当前值: {seed}")
+
+
+def derive_config_seed(
+    *,
+    base_seed: int,
+    input_len: int,
+    output_len: int,
+    parallel_num: int,
+    prefix_ratio: float,
+    config_index: int,
+) -> int:
+    key = (
+        f"{base_seed}:{input_len}:{output_len}:{parallel_num}:"
+        f"{prefix_ratio:.12g}:{config_index}"
+    )
+    return int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def effective_config_seed(
+    *,
+    base_seed: int,
+    input_len: int,
+    output_len: int,
+    parallel_num: int,
+    prefix_ratio: float,
+    config_index: int,
+    vary_seed_by_config: bool,
+) -> int:
+    validate_seed(base_seed)
+    if not vary_seed_by_config:
+        return base_seed
+    return derive_config_seed(
+        base_seed=base_seed,
+        input_len=input_len,
+        output_len=output_len,
+        parallel_num=parallel_num,
+        prefix_ratio=prefix_ratio,
+        config_index=config_index,
+    )
+
+
 def decide_token_usage_source(*, usage_reported_count: int,
                               tokenizer_fallback_count: int,
                               completed: int,
@@ -187,6 +235,20 @@ def decide_token_usage_source(*, usage_reported_count: int,
     return "client_estimate"
 
 
+def _derive_prefix_suffix_tokens(input_len: int, prefix_ratio: float) -> Tuple[int, int]:
+    """Return shared-prefix and unique-suffix lengths within total input_len."""
+    if not (0.0 <= prefix_ratio <= 1.0):
+        raise ValueError("--prefix-ratio must be between 0.0 and 1.0")
+    prefix_tokens = int(input_len * prefix_ratio)
+    suffix_tokens = input_len - prefix_tokens
+    return prefix_tokens, suffix_tokens
+
+
+def _is_random_prompt_generation_error(exc: ValueError) -> bool:
+    message = str(exc)
+    return "unique suffix" in message or "unique prompt collision" in message
+
+
 def _extract_row(
     result: dict,
     in_len: int,
@@ -198,6 +260,7 @@ def _extract_row(
     prefix_tokens: int = 0,
     prefix_ratio: float = 0.0,
     has_tokenizer: bool = False,
+    seed: int = 0,
 ) -> dict:
     """从 _serve.main_async() 返回的字典中提取并重命名需要的指标字段。
 
@@ -212,6 +275,11 @@ def _extract_row(
 
     def _i(key: str, default=0) -> int:
         return int(result.get(key, default) or default)
+
+    def _rate(numerator: float, denominator_s: float) -> float:
+        if denominator_s <= 0:
+            return 0.0
+        return round(float(numerator) / float(denominator_s), 4)
 
     completed = _i('completed')
     total_in = _i('total_input_tokens')
@@ -232,8 +300,8 @@ def _extract_row(
     )
 
     # ── 长度合规：实测 / 请求 ────────────────────────────────────────────────
-    # 基于未取整的真实均值算合规，避免 round(avg_out) 在阈值边界引入误差。
-    total_input_len = in_len + prefix_tokens
+    # 基于未取整的真实均值算合规，避免 round(avg_in/out) 在阈值边界引入误差。
+    total_input_len = in_len
     raw_avg_in = total_in / completed if completed > 0 else 0.0
     raw_avg_out = total_out / completed if completed > 0 else 0.0
     input_compliance = (
@@ -246,18 +314,26 @@ def _extract_row(
         if completed > 0 else 0.0
     )
 
+    duration_s = float(result.get('duration', 0.0) or 0.0)
+    mean_ttft_ms = float(result.get('mean_ttft_ms', 0.0) or 0.0)
+    mean_tpot_ms = float(result.get('mean_tpot_ms', 0.0) or 0.0)
+    input_throughput_tok_s = _rate(total_in, duration_s)
+    prefill_effective_tok_s = _rate(raw_avg_in, mean_ttft_ms / 1000.0)
+    decode_effective_tok_s = _rate(1.0, mean_tpot_ms / 1000.0)
+
     return {
         # ── 测试配置 ────────────────────────────────
         'model':           model,
         'backend':         backend,
-        'input_len':       in_len,            # requested 后缀长度
+        'input_len':       in_len,           # requested 总输入长度
         'output_len':      out_len,           # requested 输出长度
-        'total_input_len': total_input_len,  # 含共享前缀的总输入（requested 口径）
+        'total_input_len': total_input_len,  # 新语义下等于 input_len
         'prefix_ratio':    round(prefix_ratio, 3),
         'prefix_tokens':   prefix_tokens,
         'parallel_num':    parallel_num,
         'epochs':          epochs,
         'num_prompts':     _i('num_prompts', parallel_num * epochs),
+        'seed':            seed,
         # ── 请求统计 ────────────────────────────────
         'n_success':           completed,
         'n_failed':            _i('failed'),
@@ -269,7 +345,10 @@ def _extract_row(
         'token_source':        token_source,
         # ── 吞吐量 ──────────────────────────────────
         'throughput_req_s':   _f('request_throughput'),
-        'throughput_tok_s':   _f('output_throughput'),
+        'throughput_tok_s':   _f('output_throughput'),  # 输出 Token 系统吞吐，vLLM 官方口径
+        'input_throughput_tok_s': input_throughput_tok_s,
+        'prefill_effective_tok_s': prefill_effective_tok_s,
+        'decode_effective_tok_s': decode_effective_tok_s,
         # ── TTFT：首 token 时延 (ms) ─────────────────
         'ttft_mean_ms':  _f('mean_ttft_ms'),
         'ttft_p50_ms':   _f('p50_ttft_ms'),
@@ -295,12 +374,13 @@ def _extract_row(
 CSV_HEADERS = [
     'model', 'backend',
     'input_len', 'output_len', 'total_input_len', 'prefix_ratio', 'prefix_tokens',
-    'parallel_num', 'epochs', 'num_prompts',
+    'parallel_num', 'epochs', 'num_prompts', 'seed',
     'n_success', 'n_failed',
     'avg_input_tokens', 'avg_output_tokens',
     'input_compliance', 'output_compliance',
     'finish_reason_length_pct', 'token_source',
-    'throughput_req_s', 'throughput_tok_s',
+    'throughput_req_s', 'throughput_tok_s', 'input_throughput_tok_s',
+    'prefill_effective_tok_s', 'decode_effective_tok_s',
     'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
     'tpot_mean_ms', 'tpot_p50_ms', 'tpot_p90_ms', 'tpot_p99_ms',
     'e2el_mean_ms', 'e2el_p50_ms', 'e2el_p90_ms', 'e2el_p99_ms',
@@ -310,11 +390,12 @@ CSV_HEADERS = [
 CSV_HEADERS_ZH = [
     '模型', '接口类型',
     '输入长度(token)', '输出长度(token)', '总输入长度(token)', '前缀比例', '前缀tokens数',
-    '并发数', '测试轮数', '总请求数',
+    '并发数', '测试轮数', '总请求数', '随机种子',
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
     '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
-    '请求吞吐(req/s)', '输出Token吞吐(tok/s)',
+    '请求吞吐(req/s)', '输出Token系统吞吐(tok/s)', '输入Token系统吞吐(tok/s)',
+    'Prefill有效速率(tok/s)', 'Decode有效速率(tok/s)',
     'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
     'TPOT均值(ms)', 'TPOT_P50(ms)', 'TPOT_P90(ms)', 'TPOT_P99(ms)',
     'E2EL均值(ms)', 'E2EL_P50(ms)', 'E2EL_P90(ms)', 'E2EL_P99(ms)',
@@ -394,7 +475,10 @@ def save_xlsx(rows: List[dict], path: str) -> None:
         ('TPOT', '每输出 Token 时延 (Time-Per-Output-Token)', '(E2EL − TTFT) ÷ (output_tokens − 1)'),
         ('E2EL', '端到端延迟 (End-to-End Latency)', '最后一个 token 到达时间 − 请求发出时间'),
         ('throughput_req_s', '请求吞吐量', 'completed ÷ benchmark_duration'),
-        ('throughput_tok_s', '输出 Token 吞吐量', 'total_output_tokens ÷ benchmark_duration'),
+        ('throughput_tok_s', '输出 Token 系统吞吐量', 'total_output_tokens ÷ benchmark_duration（vLLM 官方 output_throughput 口径）'),
+        ('input_throughput_tok_s', '输入 Token 系统吞吐量', 'total_input_tokens ÷ benchmark_duration'),
+        ('prefill_effective_tok_s', 'Prefill 有效速率', 'avg_input_tokens ÷ mean_TTFT_s；TTFT 含排队、调度和首 token'),
+        ('decode_effective_tok_s', 'Decode 有效速率', '1 ÷ mean_TPOT_s；基于 TPOT 的 next-token decode 近似速率'),
         ('P50/P90/P99', '百分位数', 'P90 表示 90% 请求低于该延迟值'),
         ('', '', ''),
         ('并发控制说明', '',
@@ -425,8 +509,12 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
     为每组构建 serve.py 所需 args，调用 _serve.main_async()，
     收集并返回所有指标行。
     """
+    validate_seed(our_args.seed)
+    vary_seed_by_config = not our_args.no_vary_seed_by_config
+
     # 构建基础 Namespace（含全部 serve.py 默认值）
     base = _build_base_args(our_args)
+    _derive_prefix_suffix_tokens(1, our_args.prefix_ratio)
     model = our_args.served_model_name or our_args.model
 
     # 构建 (in_len, out_len) 测试对
@@ -458,6 +546,8 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
     logger.info("  (输入,输出) 组合: %s", io_pairs)
     logger.info("  并发数    : %s", sorted_parallels)
     logger.info("  每组轮数  : %d  → num_prompts = parallel × epochs", our_args.epochs)
+    logger.info("  随机种子  : base=%d  vary_by_config=%s",
+                our_args.seed, vary_seed_by_config)
     logger.info("  并发模型  : 滑动窗口（Semaphore=parallel_num, request_rate=inf）")
     logger.info("             每组一次性提交 parallel×epochs 个任务，Semaphore 保证")
     logger.info("             最多 parallel_num 个请求同时在途，非严格批次轮转")
@@ -483,31 +573,41 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                 )
                 continue
 
+            prefix_ratio = our_args.prefix_ratio
+            prefix_tokens, suffix_tokens = _derive_prefix_suffix_tokens(in_len, prefix_ratio)
+            effective_seed = effective_config_seed(
+                base_seed=our_args.seed,
+                input_len=in_len,
+                output_len=out_len,
+                parallel_num=parallel_num,
+                prefix_ratio=prefix_ratio,
+                config_index=config_count,
+                vary_seed_by_config=vary_seed_by_config,
+            )
+
             logger.info(
                 "\n%s\n[%d/%d] 开始测试: input=%d, output=%d, parallel=%d, "
-                "num_prompts=%d (=%d×%d epochs)%s\n%s",
+                "num_prompts=%d (=%d×%d epochs), seed=%d%s\n%s",
                 "─" * 65,
                 config_count, total_configs,
                 in_len, out_len, parallel_num,
                 parallel_num * our_args.epochs, parallel_num, our_args.epochs,
-                (f"  prefix={int(in_len * our_args.prefix_ratio)}tok"
-                 f"({our_args.prefix_ratio * 100:.0f}%)"
-                 if our_args.prefix_ratio > 0 else ""),
+                effective_seed,
+                (f"  total_input={in_len} prefix={prefix_tokens}tok({prefix_ratio * 100:.0f}%)"
+                 f" suffix={suffix_tokens}tok"),
                 "─" * 65,
             )
 
             # 复制 base args，按本次配置覆盖可变字段
             cfg = copy.copy(base)
-            cfg.input_len       = in_len       # serve.py 内部映射到 random_input_len（后缀长度）
+            cfg.input_len       = in_len       # serve.py 内部映射到 random_input_len（总输入长度）
             cfg.output_len      = out_len       # serve.py 内部映射到 random_output_len
             cfg.max_concurrency = parallel_num  # 最大并发数
             cfg.num_prompts     = parallel_num * our_args.epochs  # 总请求数
+            cfg.seed            = effective_seed
 
-            # 前缀缓存：按 prefix_ratio 从 input_len 计算共享前缀 token 数
-            # prefix_tokens 不计入 input_len（input_len 仅表示后缀唯一部分）
-            # 实际 prompt_len ≈ prefix_tokens + input_len
-            prefix_ratio = our_args.prefix_ratio
-            prefix_tokens = int(in_len * prefix_ratio) if prefix_ratio > 0 else 0
+            # input_len 表示总 prompt token 预算；prefix_tokens 是其中共享前缀部分。
+            # run_bench_serve.py 会生成 shared_prefix + unique_suffix，总长约等于 input_len。
             cfg.random_prefix_len = prefix_tokens
 
             # 第一次运行：做 ready check（超时 600s）；后续跳过（设为 0）
@@ -522,6 +622,12 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
             # 调用 vllm_bench/serve.py 的核心测试逻辑
             try:
                 result = asyncio.run(_serve.main_async(cfg))
+            except ValueError as exc:
+                if _is_random_prompt_generation_error(exc):
+                    raise
+                logger.error("测试失败 (input=%d, output=%d, parallel=%d): %s",
+                             in_len, out_len, parallel_num, exc)
+                continue
             except Exception as exc:
                 logger.error("测试失败 (input=%d, output=%d, parallel=%d): %s",
                              in_len, out_len, parallel_num, exc)
@@ -532,14 +638,20 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                                our_args.epochs, model, our_args.backend,
                                prefix_tokens=prefix_tokens,
                                prefix_ratio=prefix_ratio,
-                               has_tokenizer=bool(our_args.tokenizer))
+                               has_tokenizer=bool(our_args.tokenizer),
+                               seed=effective_seed)
             all_rows.append(row)
 
             # 打印摘要行
             logger.info(
-                "  ✓ 结果: tok/s=%.1f  TTFT_mean=%.1fms  TTFT_p90=%.1fms  "
-                "TPOT_mean=%.3fms  E2EL_mean=%.1fms  成功=%d",
+                "  ✓ 结果: out_sys_tok/s=%.1f  in_sys_tok/s=%.1f  "
+                "prefill_eff_tok/s=%.1f  decode_eff_tok/s=%.1f  "
+                "TTFT_mean=%.1fms  TTFT_p90=%.1fms  TPOT_mean=%.3fms  "
+                "E2EL_mean=%.1fms  成功=%d",
                 row['throughput_tok_s'],
+                row['input_throughput_tok_s'],
+                row['prefill_effective_tok_s'],
+                row['decode_effective_tok_s'],
                 row['ttft_mean_ms'], row['ttft_p90_ms'],
                 row['tpot_mean_ms'],
                 row['e2el_mean_ms'],
@@ -670,9 +782,13 @@ def _parse_args() -> argparse.Namespace:
                        help='前缀缓存比例 [0.0~1.0]（默认: 0.0 = 不使用共享前缀）。'
                             '取值 0.5 表示每个请求中有 50%% 的 input_len 作为共享前缀。'
                             '所有请求共享同一段前缀文本（固定生成一次），'
-                            '后缀部分每个请求独立随机生成。'
-                            '实际 prompt_len ≈ input_len × (1 + prefix_ratio)。'
+                            '后缀包含 request-index token 加随机 tail，用于保证非 full-prefix 请求差异。'
+                            '实际 prompt_len ≈ input_len；共享前缀 token 数约为 input_len × prefix_ratio。'
                             '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。')
+    bench.add_argument('--seed', type=int, default=0,
+                       help='随机种子基值。默认每个配置会基于该值派生独立 seed（默认: 0）')
+    bench.add_argument('--no-vary-seed-by-config', action='store_true', default=False,
+                       help='兼容旧行为：所有配置复用 --seed，不再按配置派生独立 seed')
 
     # ── Tokenizer ────────────────────────────────────────────────────────────
     tok = p.add_argument_group('Tokenizer（可选）')
@@ -686,7 +802,7 @@ def _parse_args() -> argparse.Namespace:
                        help='最大允许的 TTFT 均值（ms）；超过后跳过该 (input,output) '
                             '组合的更高并发测试')
     limit.add_argument('--min-throughput-tok-s', type=float, default=None,
-                       help='最低输出 Token 吞吐量阈值（tok/s）；低于此值时跳过该 '
+                       help='最低输出 Token 系统吞吐量阈值（tok/s）；低于此值时跳过该 '
                             '(input,output) 组合的更高并发测试。\n'
                             '通常在 parallel=1（单用户）时触发：若单用户吞吐已低于预期，'
                             '说明服务在该请求规格下性能不达标，无需继续测试更高并发。')
@@ -735,22 +851,26 @@ def main() -> None:
 
     # 终端汇总表
     print()
-    print('=' * 96)
+    print('=' * 120)
     print(
         f"{'输入':>6} {'输出':>6} {'并发':>5} "
-        f"{'tok/s':>10} {'req/s':>8} "
+        f"{'out_sys':>10} {'in_sys':>10} {'prefill':>10} {'decode':>10} {'req/s':>8} "
         f"{'TTFT均值':>10} {'TTFT_P90':>10} "
         f"{'TPOT均值':>10} {'E2EL均值':>10} {'成功':>6}"
     )
-    print('-' * 96)
+    print('-' * 120)
     for r in rows:
         print(
             f"{r['input_len']:>6} {r['output_len']:>6} {r['parallel_num']:>5} "
-            f"{r['throughput_tok_s']:>10.1f} {r['throughput_req_s']:>8.3f} "
+            f"{r['throughput_tok_s']:>10.1f} "
+            f"{r['input_throughput_tok_s']:>10.1f} "
+            f"{r['prefill_effective_tok_s']:>10.1f} "
+            f"{r['decode_effective_tok_s']:>10.1f} "
+            f"{r['throughput_req_s']:>8.3f} "
             f"{r['ttft_mean_ms']:>10.1f} {r['ttft_p90_ms']:>10.1f} "
             f"{r['tpot_mean_ms']:>10.3f} {r['e2el_mean_ms']:>10.1f} {r['n_success']:>6}"
         )
-    print('=' * 96)
+    print('=' * 120)
     if args.output_csv:
         print(f"CSV  → {args.output_csv}")
     if args.output_xlsx:

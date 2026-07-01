@@ -96,14 +96,13 @@ SLEEP_BETWEEN=2.0
 #
 # 用于测试 vLLM prefix caching（自动前缀缓存 / radix cache）对性能的影响。
 #
-# 原理：取值 X 时，每组测试中所有请求共享同一段前缀文本（占 input_len 的 X 倍 token），
-#        后缀部分每个请求独立随机生成，保证请求间差异性。
-#        实际 prompt_len ≈ input_len × (1 + X)
+# 原理：取值 X 时，每组测试中所有请求共享 input_len * X 的前缀 token，
+#        后缀部分每个请求独立生成，prefix + suffix 总长仍约等于 input_len。
 #
 # 典型用法：
 #   PREFIX_RATIO=0.0   → 全随机，无共享（测试无缓存基准）
-#   PREFIX_RATIO=0.5   → 50% 前缀共享（input_len=512 → 前缀256 + 后缀512）
-#   PREFIX_RATIO=0.9   → 90% 前缀共享（高缓存命中率场景）
+#   PREFIX_RATIO=0.5   → 50% 前缀共享（input_len=512 → 前缀256 + 后缀256）
+#   PREFIX_RATIO=0.9   → 90% 前缀共享（input_len=512 → 前缀460 + 后缀52）
 #
 # 注意：需同时在 vLLM 服务端启用前缀缓存（--enable-prefix-caching）才有效。
 PREFIX_RATIO=0.8
@@ -150,7 +149,18 @@ MIN_THROUGHPUT_TOK_S="5"
 WARMUP_REQUESTS=1
 
 # =============================================================================
-# ▌ 七、输出文件配置
+# ▌ 七、随机种子配置
+# =============================================================================
+#
+# SEED 是随机种子基值。默认情况下，每个 (input, output, parallel) 配置会
+# 基于该值派生独立 seed，避免高并发档位复用低并发档位的 prompt 序列。
+#
+# 如需复现旧行为（所有配置复用同一个 seed），设为 false。
+SEED=0
+VARY_SEED_BY_CONFIG=true
+
+# =============================================================================
+# ▌ 八、输出文件配置
 # =============================================================================
 
 # 结果保存目录（不存在时自动创建）
@@ -166,7 +176,7 @@ OUTPUT_CSV="${RESULT_DIR}/bench_${TIMESTAMP}.csv"
 OUTPUT_XLSX="${RESULT_DIR}/bench_${TIMESTAMP}.xlsx"
 
 # =============================================================================
-# ▌ 八、以下内容通常无需修改
+# ▌ 九、以下内容通常无需修改
 # =============================================================================
 
 # 脚本所在目录（自动识别，支持软链接）
@@ -192,6 +202,7 @@ CMD=(
     --parallel-nums ${PARALLEL_NUMS}
     --epochs "${EPOCHS}"
     --sleep-between "${SLEEP_BETWEEN}"
+    --seed "${SEED}"
     --output-csv "${OUTPUT_CSV}"
 )
 
@@ -247,6 +258,10 @@ if [[ "${CROSS_PRODUCT}" == "true" ]]; then
     CMD+=(--cross-product)
 fi
 
+if [[ "${VARY_SEED_BY_CONFIG}" != "true" ]]; then
+    CMD+=(--no-vary-seed-by-config)
+fi
+
 # 预热请求数
 CMD+=(--warmup-requests "${WARMUP_REQUESTS}")
 
@@ -266,6 +281,8 @@ printf "║  输出长度  : %-48s║\n" "${OUTPUT_LENS}"
 printf "║  并发数    : %-48s║\n" "${PARALLEL_NUMS}"
 printf "║  测试轮数  : %-48s║\n" "${EPOCHS}"
 printf "║  配置间隔  : %-48s║\n" "${SLEEP_BETWEEN}s"
+printf "║  随机种子  : %-48s║\n" "${SEED}"
+printf "║  配置派生  : %-48s║\n" "${VARY_SEED_BY_CONFIG}"
 printf "║  CSV 输出  : %-48s║\n" "${OUTPUT_CSV}"
 if [[ -n "${OUTPUT_XLSX:-}" ]]; then
     printf "║  XLSX 输出 : %-48s║\n" "${OUTPUT_XLSX}"

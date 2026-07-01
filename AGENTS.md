@@ -41,3 +41,74 @@ Skills 位于 `.Codex/skills/` 目录，每个 skill 有独立的 `SKILL.md` 文
 
 如果你认为哪怕只有 1% 的可能性某个 skill 适用于你正在做的事情，你必须调用该 skill 检查。
 <!-- superpowers-zh:end -->
+
+---
+
+# Worktree 开发流程
+
+> 本节是本仓库的**强制开发规范**，适用于所有 AI 编码助手与人类贡献者。配套技能见上文 `using-git-worktrees`、`finishing-a-development-branch`。
+
+## 核心规则
+
+**开发必须走 worktree。** 任何功能开发、bug 修复、重构都必须先从本地 `main` 新建 git worktree，在 worktree 中开发、调试、提交准备；**不要直接在 `main` 工作区改代码**。功能验证通过后，再回到本地 `main` 合并 worktree 分支。
+
+`main` 工作区仅用于：合并、运行服务 / 跑基线测试、紧急 hotfix 的快速验证。
+
+## 约定
+
+| 项 | 约定 |
+|---|---|
+| worktree 目录 | `.worktrees/<name>`（已在 `.gitignore` 第 99 行忽略，**不可提交**） |
+| 分支命名 | `feat/<name>`（新功能）/ `fix/<name>`（修复）/ `chore/<name>`（杂项） |
+| 基线分支 | 本地 `main`（先 `git pull --ff-only` 保持最新） |
+| 目录名 ↔ 分支名 | 目录用短名 `<name>`，分支带前缀；两边的 `<name>` 保持一致 |
+
+> 现有示例：`.worktrees/vllm-offline-auto-bench` ↔ 分支 `feat/vllm-offline-auto-bench`。新 worktree 沿用此命名。
+
+## 标准流程
+
+1. **建隔离工作区** — 调用 `using-git-worktrees` 技能，先做**步骤 0 检测**（避免在已有 worktree 内嵌套创建）。
+   ```bash
+   git checkout main && git pull --ff-only
+   git worktree add .worktrees/<name> -b feat/<name>
+   cd .worktrees/<name>
+   ```
+   创建前确认 `.worktrees/` 已被忽略：`git check-ignore -q .worktrees`（必须返回 0）。
+
+2. **项目设置** — Python 项目按需安装依赖：
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **验证基线干净** — 跑测试确认起点是绿的：
+   ```bash
+   pytest -q
+   ```
+   基线就失败要先报告、获明确许可后再继续，避免把已有问题算到新改动头上。
+
+4. **设计 → 实现** — 复杂功能先 `brainstorming` 再 `writing-plans`；写代码用 `test-driven-development`（先写测试）；调试用 `systematic-debugging`。
+
+5. **验证先于完成** — 声称完成前用 `verification-before-completion`：必须实际运行命令、确认输出，用证据支撑结论。
+
+6. **收尾合并** — 用 `finishing-a-development-branch` 检查工作树、测试、提交记录与合并路径；回到本地 `main` 合并 worktree 分支，合并成功且不再需要时清理 worktree：
+   ```bash
+   git checkout main
+   git merge --no-ff feat/<name>
+   git worktree remove .worktrees/<name>
+   git branch -d feat/<name>   # 可选：删掉已合并的分支
+   ```
+
+## 场景速查
+
+| 场景 | 流程 |
+|---|---|
+| 新功能 | worktree → `brainstorming` → `writing-plans` → `test-driven-development` → `verification-before-completion` → `finishing-a-development-branch` |
+| 小 bug 修复 | worktree → `systematic-debugging` → `test-driven-development` → `verification-before-completion` → `finishing-a-development-branch` |
+| 纯文档 / 规范 | worktree → 阅读相关规范 → 改文档 → `git diff --check` → commit → 合并 |
+
+## 红线
+
+- **绝不**直接在 `main` 工作区写业务代码。
+- **绝不**跳过步骤 0 在已有 worktree 内再建 worktree。
+- **绝不**带着失败测试宣称完成或发起合并。
+- **绝不**把 `.worktrees/` 内容提交进仓库。

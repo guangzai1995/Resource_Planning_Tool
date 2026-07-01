@@ -1,3 +1,5 @@
+import pytest
+
 import run_bench_multi as m
 
 
@@ -32,6 +34,18 @@ def test_token_source_none_when_all_failed():
         completed=0, has_tokenizer=True) == "none"
 
 
+def test_derive_prefix_suffix_tokens_from_total_input():
+    assert m._derive_prefix_suffix_tokens(128, 0.8) == (102, 26)
+    assert m._derive_prefix_suffix_tokens(128, 0.0) == (0, 128)
+    assert m._derive_prefix_suffix_tokens(128, 1.0) == (128, 0)
+
+
+@pytest.mark.parametrize("ratio", [-0.1, 1.1, float("nan")])
+def test_derive_prefix_suffix_tokens_rejects_invalid_ratio(ratio):
+    with pytest.raises(ValueError, match="--prefix-ratio"):
+        m._derive_prefix_suffix_tokens(128, ratio)
+
+
 # ---------- _extract_row: 真实 avg（不再回显 requested） ----------
 def _result(total_in=30, total_out=24, completed=3, usage_reported=3,
             finish_reason_length=3, tokenizer_fallback=0):
@@ -62,6 +76,25 @@ def test_extract_row_real_avg_from_totals():
     assert row["finish_reason_length_pct"] == 100.0
 
 
+def test_extract_row_throughput_and_effective_token_rates():
+    row = m._extract_row(
+        {
+            **_result(total_in=384, total_out=24, completed=3),
+            "duration": 2.0,
+            "output_throughput": 12.0,
+            "mean_ttft_ms": 50.0,
+            "mean_tpot_ms": 25.0,
+        },
+        in_len=128, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+
+    assert row["throughput_tok_s"] == 12.0
+    assert row["input_throughput_tok_s"] == 192.0
+    assert row["prefill_effective_tok_s"] == 2560.0
+    assert row["decode_effective_tok_s"] == 40.0
+    assert "total_throughput_tok_s" not in row
+
+
 def test_extract_row_compliance_when_undergenerated():
     # 服务端只生成了 12 token（请求 8×3=24，实测 12/3=4 < 8）
     row = m._extract_row(
@@ -73,15 +106,16 @@ def test_extract_row_compliance_when_undergenerated():
     assert row["token_source"] == "usage"
 
 
-def test_extract_row_prefix_total_input_len():
+def test_extract_row_prefix_total_input_len_uses_total_input_budget():
     row = m._extract_row(
-        _result(completed=3, total_in=690, total_out=24),  # prefix 场景
+        _result(completed=3, total_in=384, total_out=24),
         in_len=128, out_len=8, parallel_num=3, epochs=1,
         model="m", backend="openai", prefix_tokens=102,
         prefix_ratio=0.8, has_tokenizer=True)
-    assert row["total_input_len"] == 128 + 102
-    assert row["input_len"] == 128  # requested 后缀长度
-    assert row["avg_input_tokens"] == 230.0
+    assert row["total_input_len"] == 128
+    assert row["input_len"] == 128
+    assert row["prefix_tokens"] == 102
+    assert row["avg_input_tokens"] == 128.0
     assert row["input_compliance"] == 100.0
 
 
@@ -121,14 +155,14 @@ def test_output_compliance_uses_unrounded_mean():
 
 
 def test_input_compliance_uses_unrounded_mean():
-    """输入合规基于未取整均值和总输入目标长度（后缀 + prefix）。"""
+    """输入合规基于未取整均值和总输入目标长度。"""
     row = m._extract_row(
-        _result(total_in=689, total_out=24, completed=3),
+        _result(total_in=383, total_out=24, completed=3),
         in_len=128, out_len=8, parallel_num=3, epochs=1,
         model="m", backend="openai-chat", prefix_tokens=102,
         prefix_ratio=0.8, has_tokenizer=True)
-    assert row["avg_input_tokens"] == 229.7
-    assert row["input_compliance"] == 99.9
+    assert row["avg_input_tokens"] == 127.7
+    assert row["input_compliance"] == 99.7
 
 
 
@@ -145,6 +179,22 @@ def test_csv_headers_match_row_keys():
     assert not missing, f"CSV_HEADERS 有列在 row 中缺失: {missing}"
     # 新增列必须被写入 CSV/XLSX
     for required in ("total_input_len", "input_compliance", "output_compliance",
-                     "finish_reason_length_pct", "token_source"):
+                     "finish_reason_length_pct", "token_source", "seed",
+                     "input_throughput_tok_s", "prefill_effective_tok_s",
+                     "decode_effective_tok_s"):
         assert required in m.CSV_HEADERS, f"新列 {required} 未进 CSV_HEADERS"
+    assert "total_throughput_tok_s" not in m.CSV_HEADERS
+    assert row["seed"] == 0
     assert len(m.CSV_HEADERS) == len(m.CSV_HEADERS_ZH), "中英文表头数量不一致"
+
+
+def test_extract_row_records_effective_seed():
+    row = m._extract_row(
+        {"completed": 1, "total_input_tokens": 5, "total_output_tokens": 8,
+         "usage_reported_count": 1, "tokenizer_fallback_count": 0,
+         "finish_reason_length": 1, "num_prompts": 1,
+         "request_throughput": 1.0, "output_throughput": 8.0, "duration": 1.0},
+        in_len=5, out_len=8, parallel_num=1, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True, seed=98765)
+
+    assert row["seed"] == 98765

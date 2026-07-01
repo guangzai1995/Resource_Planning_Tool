@@ -228,6 +228,7 @@ def get_request_data(
             "temperature": 0,
             "top_p": 0.8,
             "max_tokens": output_len,
+            "ignore_eos": True,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -269,6 +270,7 @@ def get_request_data(
             "temperature": 0,
             "top_p": 0.8,
             "max_tokens": output_len,
+            "ignore_eos": True,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -326,6 +328,18 @@ def get_request_data(
         raise ValueError(f"Unknown backend: {backend}")
 
     return headers, pload, confirm_error_output
+
+
+def add_response_end_timestamp_if_needed(time_record, server_reported_output_tokens, response_end_time):
+    if server_reported_output_tokens is None or server_reported_output_tokens <= 0:
+        return
+
+    recorded_output_events = max(len(time_record) - 1, 0)
+    if recorded_output_events == 0:
+        return
+
+    if recorded_output_events < server_reported_output_tokens and time_record[-1] < response_end_time:
+        time_record.append(response_end_time)
 
 
 async def do_request(api_url, headers, pload, confirm_error_output, output_len, num_scheduler_steps,
@@ -416,6 +430,7 @@ async def do_request(api_url, headers, pload, confirm_error_output, output_len, 
                             return_token_num = min(num_scheduler_steps, output_len)
                             time_record.extend([timestamp] * return_token_num)
                             output_len -= return_token_num
+                response_end_time = time.perf_counter()
 
             if confirm_error_output:
                 # SSE 解析已完成（在 iter_any 循环中），
@@ -433,6 +448,12 @@ async def do_request(api_url, headers, pload, confirm_error_output, output_len, 
                     await asyncio.sleep(0.1)
             else:
                 break
+
+        add_response_end_timestamp_if_needed(
+            time_record,
+            server_reported_output_tokens,
+            response_end_time,
+        )
 
         # 可选：解析输出文本并打印预览（受 log_outputs 控制）
         if log_outputs:
