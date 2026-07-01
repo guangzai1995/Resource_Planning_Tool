@@ -323,9 +323,9 @@ def _container_abs_path(value: Any, field_name: str) -> str:
 
 
 def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
-    raw = run.get("vllm_cache")
-    if raw is None:
+    if "vllm_cache" not in run:
         return VllmCacheConfig()
+    raw = run["vllm_cache"]
     cache = _require_mapping(raw, "run.vllm_cache")
     enabled = _bool(cache.get("enabled", False), "run.vllm_cache.enabled")
     container_path = _container_abs_path(

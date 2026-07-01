@@ -3096,6 +3096,14 @@ def test_load_config_resolves_relative_vllm_cache_root_from_config_dir(tmp_path)
     assert config.run.vllm_cache.root == (config_dir / "relative-cache").resolve()
 
 
+def test_vllm_cache_null_is_rejected(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["vllm_cache"] = None
+
+    with pytest.raises(ab.ConfigError, match="vllm_cache.*object"):
+        ab.load_config(write_config(tmp_path, data))
+
+
 def test_build_bench_command_includes_warmup_opts(tmp_path):
     data = minimal_config(tmp_path)
     data["bench_profiles"][0]["warmup_concurrency"] = 4
