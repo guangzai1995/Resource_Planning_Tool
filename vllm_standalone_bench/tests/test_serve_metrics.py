@@ -179,3 +179,112 @@ def test_fetch_spec_decode_metrics_passes_headers_and_normalizes_url():
     assert metrics.num_drafts == 4
     assert metrics.num_accepted_tokens == 3
     assert metrics.num_draft_tokens == 4
+
+
+def test_parse_runtime_metrics_reads_gpu_kv_cache_usage_percent():
+    metrics = serve.parse_runtime_metrics_text(
+        "\n".join(
+            [
+                "# HELP vllm:gpu_cache_usage_perc GPU cache usage",
+                'vllm:gpu_cache_usage_perc{engine="0"} 9.8',
+            ]
+        )
+    )
+
+    assert metrics.gpu_kv_cache_usage == 9.8
+    assert metrics.spec_decode is None
+
+
+def test_parse_runtime_metrics_uses_max_gpu_kv_cache_usage_per_scrape():
+    metrics = serve.parse_runtime_metrics_text(
+        "\n".join(
+            [
+                'vllm:gpu_cache_usage_perc{engine="0"} 7.2',
+                'vllm:gpu_cache_usage_perc{engine="1"} 12.5',
+                'vllm:gpu_cache_usage_perc{engine="2"} 4.1',
+            ]
+        )
+    )
+
+    assert metrics.gpu_kv_cache_usage == 12.5
+
+
+def test_parse_runtime_metrics_normalizes_fraction_gpu_kv_cache_usage():
+    metrics = serve.parse_runtime_metrics_text(
+        "\n".join(
+            [
+                "vllm:kv_cache_usage_perc 0.098",
+                "ray_vllm_kv_cache_usage_perc 0.052",
+            ]
+        )
+    )
+
+    assert metrics.gpu_kv_cache_usage == 9.8
+
+
+def test_parse_runtime_metrics_keeps_spec_decode_metrics():
+    metrics = serve.parse_runtime_metrics_text(
+        "\n".join(
+            [
+                "vllm:spec_decode_num_drafts_total 4",
+                "vllm:spec_decode_num_accepted_tokens_total 3",
+                "vllm:spec_decode_num_draft_tokens_total 8",
+                'vllm:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 3',
+            ]
+        )
+    )
+
+    assert metrics.spec_decode is not None
+    assert metrics.spec_decode.num_drafts == 4
+    assert metrics.spec_decode.num_accepted_tokens == 3
+    assert metrics.spec_decode.num_draft_tokens == 8
+    assert metrics.spec_decode.accepted_per_pos == {0: 3}
+
+
+def test_runtime_metrics_summary_aggregates_avg_and_peak():
+    summary = serve.RuntimeMetricsSummary.from_samples([7.0, 11.0, 9.0])
+
+    assert summary.avg_gpu_kv_cache_usage == 9.0
+    assert summary.peak_gpu_kv_cache_usage == 11.0
+
+
+def test_runtime_metrics_summary_defaults_zero_without_samples():
+    summary = serve.RuntimeMetricsSummary.from_samples([])
+
+    assert summary.avg_gpu_kv_cache_usage == 0.0
+    assert summary.peak_gpu_kv_cache_usage == 0.0
+
+
+def test_fetch_runtime_metrics_passes_headers_and_normalizes_url():
+    class FakeResponse:
+        status = 200
+
+        async def text(self):
+            return "vllm:gpu_cache_usage_perc 9.8"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, headers=None):
+            self.calls.append((url, headers))
+            return FakeResponse()
+
+    session = FakeSession()
+    headers = {"Authorization": "Bearer local-bench-key"}
+
+    metrics = asyncio.run(
+        serve.fetch_runtime_metrics("http://127.0.0.1:8000/v1", session, headers)
+    )
+
+    assert session.calls == [
+        ("http://127.0.0.1:8000/metrics", headers),
+    ]
+    assert metrics is not None
+    assert metrics.gpu_kv_cache_usage == 9.8

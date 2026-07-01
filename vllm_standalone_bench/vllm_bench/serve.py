@@ -102,11 +102,142 @@ class SpecDecodeMetrics:
     accepted_per_pos: dict[int, int]
 
 
+@dataclass
+class RuntimeMetrics:
+    """Runtime metrics parsed from the server's Prometheus endpoint."""
+
+    spec_decode: SpecDecodeMetrics | None = None
+    gpu_kv_cache_usage: float | None = None
+
+
+@dataclass
+class RuntimeMetricsSummary:
+    """Aggregated runtime metrics for a single benchmark run."""
+
+    avg_gpu_kv_cache_usage: float = 0.0
+    peak_gpu_kv_cache_usage: float = 0.0
+
+    @classmethod
+    def from_samples(cls, samples: Iterable[float]) -> "RuntimeMetricsSummary":
+        values = [float(sample) for sample in samples]
+        if not values:
+            return cls()
+        return cls(
+            avg_gpu_kv_cache_usage=round(sum(values) / len(values), 4),
+            peak_gpu_kv_cache_usage=round(max(values), 4),
+        )
+
+
 def _metrics_url_from_base(base_url: str) -> str:
     normalized = base_url.rstrip("/")
     if normalized.endswith("/v1"):
         normalized = normalized[:-3]
     return f"{normalized}/metrics"
+
+
+GPU_KV_CACHE_USAGE_METRICS = {
+    "vllm:gpu_cache_usage_perc",
+    "vllm:kv_cache_usage_perc",
+    "ray_vllm_kv_cache_usage_perc",
+}
+
+
+def _metric_name_from_prometheus_line(line: str) -> str:
+    return line.split(None, 1)[0].split("{", 1)[0]
+
+
+def _metric_value_from_prometheus_line(line: str) -> float | None:
+    parts = line.split()
+    if not parts:
+        return None
+    with contextlib.suppress(ValueError, OverflowError):
+        value = float(parts[-1])
+        if np.isfinite(value):
+            return value
+    return None
+
+
+def _normalize_gpu_kv_cache_usage(value: float) -> float:
+    if 0.0 <= value <= 1.0:
+        return value * 100.0
+    return value
+
+
+def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
+    num_drafts = 0
+    num_draft_tokens = 0
+    num_accepted_tokens = 0
+    accepted_per_pos: dict[int, int] = {}
+    found_spec_decode = False
+    gpu_kv_cache_usage_samples: list[float] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        metric_name = _metric_name_from_prometheus_line(line)
+        value = _metric_value_from_prometheus_line(line)
+        if value is None:
+            continue
+
+        if metric_name in GPU_KV_CACHE_USAGE_METRICS:
+            gpu_kv_cache_usage_samples.append(_normalize_gpu_kv_cache_usage(value))
+            continue
+
+        if not metric_name.startswith("vllm:spec_decode"):
+            continue
+        if not metric_name.endswith("_total"):
+            continue
+
+        found_spec_decode = True
+        if "num_drafts" in metric_name:
+            num_drafts += int(value)
+        elif "num_draft_tokens" in metric_name:
+            num_draft_tokens += int(value)
+        elif "num_accepted_tokens_per_pos" in metric_name:
+            pos_label = 'position="'
+            if pos_label in line:
+                with contextlib.suppress(ValueError):
+                    start = line.index(pos_label) + len(pos_label)
+                    end = line.index('"', start)
+                    pos = int(line[start:end])
+                    accepted_per_pos[pos] = accepted_per_pos.get(pos, 0) + int(value)
+        elif "num_accepted_tokens" in metric_name:
+            num_accepted_tokens += int(value)
+
+    spec_decode = None
+    if found_spec_decode:
+        spec_decode = SpecDecodeMetrics(
+            num_drafts=num_drafts,
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            accepted_per_pos=accepted_per_pos,
+        )
+
+    gpu_kv_cache_usage = (
+        max(gpu_kv_cache_usage_samples) if gpu_kv_cache_usage_samples else None
+    )
+    return RuntimeMetrics(
+        spec_decode=spec_decode,
+        gpu_kv_cache_usage=gpu_kv_cache_usage,
+    )
+
+
+async def fetch_runtime_metrics(
+    base_url: str,
+    session: aiohttp.ClientSession,
+    extra_headers: dict[str, str] | None = None,
+) -> RuntimeMetrics | None:
+    """Fetch runtime metrics from the server's Prometheus endpoint."""
+    metrics_url = _metrics_url_from_base(base_url)
+    try:
+        async with session.get(metrics_url, headers=extra_headers) as response:
+            if response.status != 200:
+                return None
+            return parse_runtime_metrics_text(await response.text())
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
 
 
 async def fetch_spec_decode_metrics(
@@ -118,61 +249,10 @@ async def fetch_spec_decode_metrics(
 
     Returns None if speculative decoding is not enabled or metrics are not available.
     """
-    metrics_url = _metrics_url_from_base(base_url)
-    try:
-        async with session.get(metrics_url, headers=extra_headers) as response:
-            if response.status != 200:
-                return None
-            text = await response.text()
-
-            num_drafts = 0
-            num_draft_tokens = 0
-            num_accepted_tokens = 0
-            accepted_per_pos: dict[int, int] = {}
-            found_spec_decode = False
-
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                if line.startswith("vllm:spec_decode"):
-                    # Extract metric name (before labels) to avoid matching
-                    # substrings inside label values.
-                    parts = line.split(None, 1)
-                    metric_name = parts[0].split("{")[0]
-                    if not metric_name.endswith("_total"):
-                        continue
-                    found_spec_decode = True
-                    with contextlib.suppress(ValueError):
-                        if "num_drafts" in metric_name:
-                            num_drafts += int(float(parts[-1]))
-                        elif "num_draft_tokens" in metric_name:
-                            num_draft_tokens += int(float(parts[-1]))
-                        elif "num_accepted_tokens_per_pos" in metric_name:
-                            pos_label = 'position="'
-                            if pos_label in line:
-                                start = line.index(pos_label) + len(pos_label)
-                                end = line.index('"', start)
-                                pos = int(line[start:end])
-                                val = int(float(parts[-1]))
-                                accepted_per_pos[pos] = (
-                                    accepted_per_pos.get(pos, 0) + val
-                                )
-                        elif "num_accepted_tokens" in metric_name:
-                            num_accepted_tokens += int(float(parts[-1]))
-
-            if not found_spec_decode:
-                return None
-
-            return SpecDecodeMetrics(
-                num_drafts=num_drafts,
-                num_draft_tokens=num_draft_tokens,
-                num_accepted_tokens=num_accepted_tokens,
-                accepted_per_pos=accepted_per_pos,
-            )
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    metrics = await fetch_runtime_metrics(base_url, session, extra_headers)
+    if metrics is None:
         return None
+    return metrics.spec_decode
 
 
 class TaskType(Enum):
