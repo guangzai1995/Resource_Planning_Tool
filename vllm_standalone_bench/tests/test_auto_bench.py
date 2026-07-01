@@ -3147,12 +3147,31 @@ def test_resolve_vllm_cache_dir_uses_stable_default_key(tmp_path):
     case = ab.expand_cases(config, run_id="run123")[0]
 
     cache_dir = ab.resolve_vllm_cache_dir(config, case)
+    expected_name = (
+        f"{case.model.name}__{case.serve_profile.name}__"
+        f"{ab._short_hash(config.run.images['vllm'])}"
+    )
 
     assert cache_dir is not None
     assert cache_dir.parent == (tmp_path / "cache").resolve()
-    assert case.model.name in cache_dir.name
-    assert case.serve_profile.name in cache_dir.name
+    assert cache_dir.name == expected_name
     assert ab.resolve_vllm_cache_dir(config, case) == cache_dir
+
+
+def test_default_vllm_cache_dir_changes_when_image_changes(tmp_path):
+    first_data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    first_config = ab.load_config(write_config(tmp_path, first_data))
+    first_case = ab.expand_cases(first_config, run_id="run123")[0]
+
+    second_data = json.loads(json.dumps(first_data))
+    second_data["run"]["vllm_image"] = "vllm-openai:changed"
+    second_config = ab.load_config(write_config(tmp_path, second_data))
+    second_case = ab.expand_cases(second_config, run_id="run123")[0]
+
+    assert (
+        ab.resolve_vllm_cache_dir(first_config, first_case).name
+        != ab.resolve_vllm_cache_dir(second_config, second_case).name
+    )
 
 
 def test_build_vllm_cache_env_defaults(tmp_path):
@@ -3163,6 +3182,18 @@ def test_build_vllm_cache_env_defaults(tmp_path):
         "VLLM_CACHE_ROOT": "/vllm-cache",
         "DG_JIT_CACHE_DIR": "/vllm-cache/deep_gemm",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/vllm-cache/flashinfer_autotune",
+    }
+
+
+def test_build_vllm_cache_env_handles_container_root(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["run"]["vllm_cache"]["container_path"] = "/"
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert ab.build_vllm_cache_env(config) == {
+        "VLLM_CACHE_ROOT": "/",
+        "DG_JIT_CACHE_DIR": "/deep_gemm",
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/flashinfer_autotune",
     }
 
 

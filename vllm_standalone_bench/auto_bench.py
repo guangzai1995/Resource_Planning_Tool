@@ -576,6 +576,7 @@ def _short_hash(value: str) -> str:
 
 
 def default_vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str:
+    # Default key hashes the configured image reference; use cache_key for mutable tags.
     image = config.run.images["vllm"]
     return f"{case.model.name}__{case.serve_profile.name}__{_short_hash(image)}"
 
@@ -599,11 +600,12 @@ def build_vllm_cache_env(config: AutoBenchConfig) -> dict[str, str]:
     cache = config.run.vllm_cache
     if not cache.enabled or not cache.set_default_env:
         return {}
-    root = cache.container_path.rstrip("/")
+    root = cache.container_path
+    root_path = PurePosixPath(root)
     return {
         "VLLM_CACHE_ROOT": root,
-        "DG_JIT_CACHE_DIR": f"{root}/deep_gemm",
-        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": f"{root}/flashinfer_autotune",
+        "DG_JIT_CACHE_DIR": str(root_path / "deep_gemm"),
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": str(root_path / "flashinfer_autotune"),
     }
 
 
