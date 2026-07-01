@@ -1,10 +1,10 @@
 # vLLM 编译/JIT Cache 持久化实现计划
 
-> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
+> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [x]`）语法来跟踪进度。
 
 **目标：** 为 `vllm_standalone_bench/auto_bench.py` 增加 vLLM serving 容器编译/JIT cache 持久化能力，让 GLM5.2 自动化 benchmark 第一次运行填充 cache，后续相同 profile 复用 cache 降低反复启停总耗时。
 
-**架构：** 在 `run.vllm_cache` 中配置宿主机 cache 根目录和容器内路径，在 `serve_profiles[].cache_key` 中可选指定稳定 key。`auto_bench.py` 解析配置、创建 cache 目录、为 vLLM docker run 注入 cache mount/env，并在 serve 目录写入 `vllm_cache.json` 记录实际使用的 cache 信息。默认不启用 cache，现有命令和配置行为保持不变。
+**架构：** 在 `run.vllm_cache` 中配置宿主机 cache 根目录和容器内路径，在 `serve_profiles[].cache_key` 中可选指定稳定 key；启用 cache 且省略 `root` 时默认使用配置文件目录下 `.cache/vllm_auto_bench`。`auto_bench.py` 解析配置、创建 cache 目录、为 vLLM docker run 注入 cache mount/env，并在 serve 目录写入 `vllm_cache.json` 记录实际使用的 cache key、key 来源和 fingerprint 输入。默认不启用 cache，现有命令和配置行为保持不变。
 
 **技术栈：** Python 3 标准库、dataclasses、pathlib、Docker CLI 命令拼装、pytest。
 
@@ -14,10 +14,13 @@
 
 - Worktree：`/Resource_Planning_Tool/.worktrees/vllm-cache-persistence`
 - 分支：`feat/vllm-cache-persistence`
-- 已完成并通过两阶段审查：任务 1、任务 2、任务 3。
-- 已完成实现、尚未审查：任务 4（commit `1b6eecd`，`feat(bench): create vllm cache directories`）。
-- 下一步：对任务 4 执行规格合规审查和代码质量审查；通过后进入任务 5。
-- 当前 targeted 测试状态：`PYTHONPATH=vllm_standalone_bench pytest -q vllm_standalone_bench/tests/test_auto_bench.py` 为 `168 passed`（任务 4 worker 报告）。
+- 任务 1-8 已完成并通过前序审查。
+- 最终只读审查发现并由本修复提交处理：
+  - 默认 vLLM cache key 指纹过窄，已改为 canonical JSON fingerprint，输入包含 image ref、模型路径/tokenizer/served name、serve profile 名称、gpus、args。
+  - `enabled=true` 且缺省 `root` 已改为默认 `<config_dir>/.cache/vllm_auto_bench`；显式 `root: null` 仍报配置错误。
+  - `container_path` 已拒绝 `/`、`/models` 和 `/models/...`，避免遮蔽容器根或模型挂载。
+  - `vllm_cache.json` 已增加 `cache_key_source` 和 `cache_key_inputs` 便于审计。
+- 当前 targeted 测试状态：本修复提交前红灯为 `11 failed, 172 passed`；实现后 `PYTHONPATH=vllm_standalone_bench pytest -q vllm_standalone_bench/tests/test_auto_bench.py` 为 `183 passed`。
 - 已知完整基线问题：`pytest -q` 仍有与本任务无关的既有失败，`tests/test_inference_token_factory_report.py` 依赖缺失的 `outputs/context_analysis_20260609_034248/01_overview.json`。
 - 详细 handoff：`docs/superpowers/plans/2026-07-01-vllm-cache-persistence-handoff.md`
 
@@ -58,7 +61,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q vllm_standalone_bench/tests/test_auto
 - 修改：`vllm_standalone_bench/auto_bench.py`
 - 测试：`vllm_standalone_bench/tests/test_auto_bench.py`
 
-- [ ] **步骤 1：编写失败的解析测试**
+- [x] **步骤 1：编写失败的解析测试**
 
 在 `vllm_standalone_bench/tests/test_auto_bench.py` 中追加以下测试，放在现有 `test_load_config_warmup_opts_default_none` 附近：
 
@@ -105,7 +108,7 @@ def test_load_config_resolves_relative_vllm_cache_root_from_config_dir(tmp_path)
     assert config.run.vllm_cache.root == (config_dir / "relative-cache").resolve()
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -118,7 +121,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 预期：FAIL，报错包含 `RunConfig` 没有 `vllm_cache` 或 `ServeProfile` 没有 `cache_key`。
 
-- [ ] **步骤 3：实现配置 dataclass 与解析**
+- [x] **步骤 3：实现配置 dataclass 与解析**
 
 在 `vllm_standalone_bench/auto_bench.py` 中做以下修改。
 
@@ -230,7 +233,7 @@ def _parse_run(data: dict[str, Any], config_dir: Path) -> RunConfig:
         ))
 ```
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行：
 
@@ -243,7 +246,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 预期：3 passed。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add vllm_standalone_bench/auto_bench.py vllm_standalone_bench/tests/test_auto_bench.py
@@ -258,7 +261,7 @@ git commit -m "feat(bench): parse vllm cache config"
 - 修改：`vllm_standalone_bench/tests/test_auto_bench.py`
 - 修改：`vllm_standalone_bench/auto_bench.py`
 
-- [ ] **步骤 1：编写失败的非法配置测试**
+- [x] **步骤 1：编写失败的非法配置测试**
 
 在 `vllm_standalone_bench/tests/test_auto_bench.py` 中追加：
 
@@ -289,7 +292,7 @@ def test_serve_profile_cache_key_must_be_safe(tmp_path, cache_key):
         ab.load_config(write_config(tmp_path, data))
 ```
 
-- [ ] **步骤 2：运行测试验证失败或通过现有实现**
+- [x] **步骤 2：运行测试验证失败或通过现有实现**
 
 运行：
 
@@ -302,7 +305,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 预期：如果任务 1 实现已覆盖全部校验，则 5 passed；否则按失败信息补齐 `_parse_vllm_cache()` 或 `_parse_serve_profiles()`。
 
-- [ ] **步骤 3：补齐最少实现代码**
+- [x] **步骤 3：补齐最少实现代码**
 
 如果失败，确保以下行为存在：
 
@@ -320,13 +323,13 @@ if ".." in container_path.parts:
 
 以及 `cache_key` 使用 `_safe_name(cache_key, "serve_profile.cache_key")`。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行同步骤 2 命令。
 
 预期：5 passed。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add vllm_standalone_bench/auto_bench.py vllm_standalone_bench/tests/test_auto_bench.py
@@ -341,7 +344,7 @@ git commit -m "test(bench): cover invalid vllm cache config"
 - 修改：`vllm_standalone_bench/auto_bench.py`
 - 修改：`vllm_standalone_bench/tests/test_auto_bench.py`
 
-- [ ] **步骤 1：编写失败的 helper 测试**
+- [x] **步骤 1：编写失败的 helper 测试**
 
 在 `vllm_standalone_bench/tests/test_auto_bench.py` 中追加：
 
@@ -390,7 +393,7 @@ def test_build_vllm_cache_env_can_be_disabled(tmp_path):
     assert ab.build_vllm_cache_env(config) == {}
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -404,7 +407,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 预期：FAIL，报错包含 `resolve_vllm_cache_dir` 或 `build_vllm_cache_env` 未定义。
 
-- [ ] **步骤 3：实现 helper**
+- [x] **步骤 3：实现 helper**
 
 在 `vllm_standalone_bench/auto_bench.py` 顶部 import 增加：
 
@@ -451,13 +454,13 @@ def build_vllm_cache_env(config: AutoBenchConfig) -> dict[str, str]:
     }
 ```
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行同步骤 2 命令。
 
 预期：4 passed。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add vllm_standalone_bench/auto_bench.py vllm_standalone_bench/tests/test_auto_bench.py
@@ -472,7 +475,7 @@ git commit -m "feat(bench): resolve vllm cache paths"
 - 修改：`vllm_standalone_bench/auto_bench.py`
 - 修改：`vllm_standalone_bench/tests/test_auto_bench.py`
 
-- [ ] **步骤 1：编写失败的目录创建测试**
+- [x] **步骤 1：编写失败的目录创建测试**
 
 在 `vllm_standalone_bench/tests/test_auto_bench.py` 中追加：
 
@@ -492,7 +495,7 @@ def test_validate_local_paths_creates_vllm_cache_dirs(tmp_path):
     assert cache_dir.is_dir()
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -503,7 +506,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 预期：FAIL，`cache_dir.is_dir()` 为 false。
 
-- [ ] **步骤 3：实现目录创建**
+- [x] **步骤 3：实现目录创建**
 
 在 `vllm_standalone_bench/auto_bench.py` 中新增：
 
@@ -529,13 +532,13 @@ def ensure_vllm_cache_dirs(config: AutoBenchConfig) -> None:
     ensure_vllm_cache_dirs(config)
 ```
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行同步骤 2 命令。
 
 预期：1 passed。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add vllm_standalone_bench/auto_bench.py vllm_standalone_bench/tests/test_auto_bench.py
@@ -550,7 +553,7 @@ git commit -m "feat(bench): create vllm cache directories"
 - 修改：`vllm_standalone_bench/auto_bench.py`
 - 修改：`vllm_standalone_bench/tests/test_auto_bench.py`
 
-- [ ] **步骤 1：编写失败的命令测试**
+- [x] **步骤 1：编写失败的命令测试**
 
 在 `vllm_standalone_bench/tests/test_auto_bench.py` 中追加：
 
@@ -592,7 +595,7 @@ def test_build_sglang_command_omits_vllm_cache_mount_and_env(tmp_path):
     assert "VLLM_CACHE_ROOT=/vllm-cache" not in cmd
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -605,7 +608,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 预期：第二个测试 FAIL，命令缺少 cache mount/env；另外两个应通过或随着实现通过。
 
-- [ ] **步骤 3：实现命令注入**
+- [x] **步骤 3：实现命令注入**
 
 在 `build_vllm_run_command()` 中，模型挂载之后、`--entrypoint` 之前加入：
 
@@ -619,13 +622,13 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 保持 `_build_sglang_run_command()` 不变。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行同步骤 2 命令。
 
 预期：3 passed。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add vllm_standalone_bench/auto_bench.py vllm_standalone_bench/tests/test_auto_bench.py
@@ -640,7 +643,7 @@ git commit -m "feat(bench): mount persistent vllm cache"
 - 修改：`vllm_standalone_bench/auto_bench.py`
 - 修改：`vllm_standalone_bench/tests/test_auto_bench.py`
 
-- [ ] **步骤 1：编写失败的 metadata 测试**
+- [x] **步骤 1：编写失败的 metadata 测试**
 
 在 `vllm_standalone_bench/tests/test_auto_bench.py` 中追加：
 
@@ -684,7 +687,7 @@ def test_run_controller_writes_vllm_cache_metadata(tmp_path, monkeypatch):
     )
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -696,7 +699,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 预期：FAIL，`vllm_cache_metadata` 未定义或 `vllm_cache.json` 不存在。
 
-- [ ] **步骤 3：实现 metadata helper 与控制器写入**
+- [x] **步骤 3：实现 metadata helper 与控制器写入**
 
 在 `vllm_standalone_bench/auto_bench.py` 中新增：
 
@@ -734,13 +737,13 @@ def write_vllm_cache_metadata(config: AutoBenchConfig, case: BenchmarkCase,
 
 不要改 `_run_controller_dry_run()` 的文件输出行为；dry-run 仍只写 `config.resolved.json`。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 运行同步骤 2 命令。
 
 预期：2 passed。
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```bash
 git add vllm_standalone_bench/auto_bench.py vllm_standalone_bench/tests/test_auto_bench.py
@@ -756,7 +759,7 @@ git commit -m "feat(bench): record vllm cache metadata"
 - 修改：`.gitignore`
 - 修改：`vllm_standalone_bench/tests/test_auto_bench.py`
 
-- [ ] **步骤 1：编写失败的文档/ignore 测试**
+- [x] **步骤 1：编写失败的文档/ignore 测试**
 
 在 `vllm_standalone_bench/tests/test_auto_bench.py` 中追加：
 
@@ -778,7 +781,7 @@ def test_gitignore_ignores_local_cache_dir():
     assert ".cache/" in gitignore.splitlines()
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -790,7 +793,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q \
 
 预期：FAIL，README 或 `.gitignore` 缺少对应内容。
 
-- [ ] **步骤 3：更新 README**
+- [x] **步骤 3：更新 README**
 
 在 `vllm_standalone_bench/README.md` 的 auto_bench 章节、fixed warmup 说明之后加入：
 
@@ -836,7 +839,7 @@ auto_bench 停止并删除容器后会丢失。需要反复运行同一套 bench
 run 清理，可手动删除 `.cache/vllm_auto_bench/<cache_key>` 释放磁盘空间。
 ````
 
-- [ ] **步骤 4：更新 `.gitignore`**
+- [x] **步骤 4：更新 `.gitignore`**
 
 在 `.gitignore` 的 Outputs / temp 或 Local agent/tooling 附近加入：
 
@@ -844,13 +847,13 @@ run 清理，可手动删除 `.cache/vllm_auto_bench/<cache_key>` 释放磁盘�
 .cache/
 ```
 
-- [ ] **步骤 5：运行测试验证通过**
+- [x] **步骤 5：运行测试验证通过**
 
 运行同步骤 2 命令。
 
 预期：2 passed。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```bash
 git add .gitignore vllm_standalone_bench/README.md vllm_standalone_bench/tests/test_auto_bench.py
@@ -867,7 +870,7 @@ git commit -m "docs(bench): document vllm cache persistence"
 - 只读验证：`vllm_standalone_bench/README.md`
 - 只读验证：`.gitignore`
 
-- [ ] **步骤 1：运行 auto_bench targeted tests**
+- [x] **步骤 1：运行 auto_bench targeted tests**
 
 运行：
 
@@ -877,7 +880,7 @@ PYTHONPATH=vllm_standalone_bench pytest -q vllm_standalone_bench/tests/test_auto
 
 预期：所有 `test_auto_bench.py` 测试通过。
 
-- [ ] **步骤 2：运行 dry-run 验证命令拼装**
+- [x] **步骤 2：运行 dry-run 验证命令拼装**
 
 创建临时配置：
 
@@ -921,7 +924,7 @@ python3 vllm_standalone_bench/auto_bench.py run \
 -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/vllm-cache/flashinfer_autotune
 ```
 
-- [ ] **步骤 3：检查 `.cache/` 被 git 忽略**
+- [x] **步骤 3：检查 `.cache/` 被 git 忽略**
 
 运行：
 
@@ -931,7 +934,7 @@ git check-ignore -q .cache
 
 预期：exit 0。
 
-- [ ] **步骤 4：运行 whitespace 检查**
+- [x] **步骤 4：运行 whitespace 检查**
 
 运行：
 
@@ -941,7 +944,7 @@ git diff --check
 
 预期：exit 0，无输出。
 
-- [ ] **步骤 5：记录完整 pytest 基线状态**
+- [x] **步骤 5：记录完整 pytest 基线状态**
 
 运行：
 
@@ -951,7 +954,7 @@ pytest -q
 
 预期：允许仍出现既有失败 `tests/test_inference_token_factory_report.py` 缺少 `outputs/context_analysis_20260609_034248/01_overview.json`。最终汇报必须明确区分该既有失败和本次 targeted tests。
 
-- [ ] **步骤 6：最终 Commit**
+- [x] **步骤 6：最终 Commit**
 
 如果任务 1-7 已经分步 commit，本步骤只确认没有未提交变更：
 

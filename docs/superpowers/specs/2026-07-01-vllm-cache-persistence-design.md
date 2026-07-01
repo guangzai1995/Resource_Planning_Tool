@@ -46,7 +46,6 @@ GLM5.2 启动时间很长，尤其在 `vllm_standalone_bench/auto_bench.py` 自�
   "run": {
     "vllm_cache": {
       "enabled": true,
-      "root": "/Resource_Planning_Tool/.cache/vllm_auto_bench",
       "container_path": "/vllm-cache",
       "set_default_env": true
     }
@@ -57,8 +56,8 @@ GLM5.2 启动时间很长，尤其在 `vllm_standalone_bench/auto_bench.py` 自�
 字段语义：
 
 - `enabled`：布尔值，默认 `false`。关闭时不挂载 cache、不设置 cache env。
-- `root`：宿主机 cache 根目录。必填于 `enabled=true`。相对路径按配置文件所在目录解析。
-- `container_path`：容器内 cache 根目录，默认 `/vllm-cache`。必须是绝对 POSIX 路径，不能包含 `..`。
+- `root`：宿主机 cache 根目录。`enabled=true` 时可省略，默认解析为配置文件所在目录下 `.cache/vllm_auto_bench`；显式配置时必须是非空字符串，相对路径按配置文件所在目录解析。
+- `container_path`：容器内 cache 根目录，默认 `/vllm-cache`。必须是绝对 POSIX 路径，不能包含 `..`，不能是 `/`，也不能是 `/models` 或 `/models/...`。
 - `set_default_env`：默认 `true`。启用时自动注入：
   - `VLLM_CACHE_ROOT=<container_path>`
   - `DG_JIT_CACHE_DIR=<container_path>/deep_gemm`
@@ -77,7 +76,12 @@ GLM5.2 启动时间很长，尤其在 `vllm_standalone_bench/auto_bench.py` 自�
 ```
 
 - `cache_key`：安全文件名，默认自动生成。
-- 默认 key 按 `BenchmarkCase` 生成：`<model.name>__<serve_profile.name>__<image_hash>`。
+- 默认 key 按 `BenchmarkCase` 生成：`<model.name>__<serve_profile.name>__<fingerprint>`。
+- `fingerprint` 为 canonical JSON 的 sha256 前 12 位，序列化参数固定为 `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=True)`。
+- 默认 key 输入对象至少包含：
+  - `vllm_image_ref`：配置中的 vLLM image ref 字符串。
+  - `model.name`、`model.model_path`、`model.tokenizer_path`、`model.served_model_name`。
+  - `serve_profile.name`、`serve_profile.gpus`、`serve_profile.args`。
 - 推荐 GLM5.2 正式配置显式写 `cache_key`，把模型、GPU 架构、TP、dtype、优化口径写进名字，例如 `glm52-fp8-tp8-h20-o2`。
 - 如果同一个 serve profile 同时用于多个模型，不建议手写同一个 `cache_key`；应使用默认 key，或为不同模型拆分 serve profile。
 
@@ -126,10 +130,11 @@ docker run -d ... -v <models>:/models:ro --entrypoint vllm <image> serve ...
 
 - `run.vllm_cache` 必须是对象。
 - `enabled`、`set_default_env` 必须是布尔值。
-- `enabled=true` 时 `root` 必须存在或可创建；实现应在启动前 `mkdir -p`。
-- `container_path` 必须是绝对 POSIX 路径，不能包含 `..`。
+- `enabled=true` 且省略 `root` 时使用 `<config_dir>/.cache/vllm_auto_bench`；显式 `root` 如果不是字符串（例如 `null`）必须报配置错误。
+- `enabled=true` 时 `root` 必须可创建；实现应在启动前 `mkdir -p`。
+- `container_path` 必须是绝对 POSIX 路径，不能包含 `..`，不能是 `/`，也不能遮蔽 `/models` 模型挂载。
 - `cache_key` 必须满足现有 `SAFE_NAME_RE`，不能是 `.` 或 `..`。
-- 自动 key 使用模型名、serve profile 名和镜像字符串 hash，避免 Docker image tag 中的 `/`、`:` 污染路径。
+- 自动 key 使用模型名、serve profile 名和 canonical JSON fingerprint，避免 Docker image tag 中的 `/`、`:` 污染路径。
 
 本地路径验证阶段：
 
@@ -149,6 +154,21 @@ docker run -d ... -v <models>:/models:ro --entrypoint vllm <image> serve ...
 {
   "enabled": true,
   "cache_key": "glm52-fp8-tp8-h20-o2",
+  "cache_key_source": "explicit",
+  "cache_key_inputs": {
+    "vllm_image_ref": "vllm-openai:v0.10.0",
+    "model": {
+      "name": "glm52",
+      "model_path": "/models/GLM-5.2",
+      "tokenizer_path": "/models/GLM-5.2",
+      "served_model_name": "glm52"
+    },
+    "serve_profile": {
+      "name": "glm52_fp8_tp8_o2",
+      "gpus": "all",
+      "args": ["--tensor-parallel-size", "8", "--kv-cache-dtype", "fp8"]
+    }
+  },
   "host_dir": "/Resource_Planning_Tool/.cache/vllm_auto_bench/glm52-fp8-tp8-h20-o2",
   "container_path": "/vllm-cache",
   "env": {
@@ -159,7 +179,7 @@ docker run -d ... -v <models>:/models:ro --entrypoint vllm <image> serve ...
 }
 ```
 
-这样后续复现实验时能明确知道实际使用了哪个 cache 目录。
+这样后续复现实验时能明确知道实际使用了哪个 cache 目录、key 是显式还是默认，以及默认 fingerprint 对应的输入对象。显式 key 场景也记录相同输入，方便审计用户是否把多个不兼容 profile 复用到同一个显式 key。
 
 ### Example Config
 
@@ -172,7 +192,6 @@ docker run -d ... -v <models>:/models:ro --entrypoint vllm <image> serve ...
   "run": {
     "vllm_cache": {
       "enabled": true,
-      "root": "/Resource_Planning_Tool/.cache/vllm_auto_bench",
       "container_path": "/vllm-cache",
       "set_default_env": true
     }
@@ -218,8 +237,9 @@ docker run -d ... -v <models>:/models:ro --entrypoint vllm <image> serve ...
 
 ## Risks / Trade-offs
 
-- **Cache key 过宽**：不同 TP、dtype、优化参数共用 cache key，可能导致 cache 污染或难以解释结果。通过显式 `cache_key` 和文档约束缓解。
-- **Cache key 过窄**：每次 profile 名变化都生成新 cache，复用率下降。通过 README 建议稳定命名。
+- **Cache key 过宽**：显式 `cache_key` 可能让不同 TP、dtype、优化参数共用 cache key，导致 cache 污染或难以解释结果。通过 metadata 记录 `cache_key_inputs` 并在 README 建议正式 GLM5.2 profile 使用可审计命名缓解。
+- **Cache key 过窄**：默认 key 会随模型路径、serve args、GPU 选择等输入变化，复用率可能下降。通过显式 `cache_key` 支持用户在确认兼容时稳定复用。
+- **可变镜像 tag**：默认 key 只看 image ref 字符串，不会自动知道 tag 背后的 image id 或 digest。使用可变 tag 时应改用 digest/image id，或显式把构建号写入 `cache_key`。
 - **磁盘增长**：cache 不随 run 清理。需要用户定期删除 `.cache/vllm_auto_bench/<key>`。
 - **正式 benchmark 口径**：持久化 cache 会改变“冷启动时间”指标，但不应改变服务启动后的请求性能口径。结果报告应说明这是 warm-cache benchmark harness。
 - **跨 GPU 复用**：不同 GPU 架构或驱动环境不应强行共享同一个 key。GLM5.2 配置建议把硬件代号写入 `cache_key`。
@@ -228,12 +248,12 @@ docker run -d ... -v <models>:/models:ro --entrypoint vllm <image> serve ...
 
 - `tests/test_auto_bench.py`
   - 默认配置不启用 cache，`build_vllm_run_command()` 不包含 `/vllm-cache`、`VLLM_CACHE_ROOT` 或额外 `-v`。
-  - 启用 `run.vllm_cache` 后，解析得到绝对 `root`、默认 `container_path` 和 `set_default_env=true`。
+  - 启用 `run.vllm_cache` 后，缺省 `root` 解析为 `<config_dir>/.cache/vllm_auto_bench`，显式相对路径解析为绝对路径，默认 `container_path` 和 `set_default_env=true`。
   - 启用 cache 的 vLLM 命令包含 cache mount 和三个 env。
   - `engine=sglang` 时不注入 vLLM cache mount/env。
-  - 非法 `container_path`、非法 `cache_key`、非对象 `vllm_cache` 抛 `ConfigError`。
-  - `resolve_vllm_cache_dir()` 对默认 key 和显式 key 都返回正确目录。
-  - 启用 cache 后，run 的 serve 目录写入 `vllm_cache.json`。
+  - 非法 `container_path`（相对路径、包含 `..`、`/`、`/models`、`/models/...`）、非法 `cache_key`、非对象 `vllm_cache`、显式 `root: null` 抛 `ConfigError`。
+  - `resolve_vllm_cache_dir()` 对默认 key 和显式 key 都返回正确目录；默认 key 会随 image ref、serve args、gpus、model_path 变化。
+  - 启用 cache 后，run 的 serve 目录写入 `vllm_cache.json`，包含 `cache_key_source` 和 `cache_key_inputs`。
   - `validate_local_paths()` 会创建 cache root/key 目录。
 
 - Dry-run

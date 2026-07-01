@@ -320,6 +320,14 @@ def _container_abs_path(value: Any, field_name: str) -> str:
         raise ConfigError(f"{field_name} must be absolute inside the container: {path_text}")
     if ".." in container_path.parts:
         raise ConfigError(f"{field_name} must not contain '..': {path_text}")
+    if container_path == PurePosixPath("/"):
+        raise ConfigError(f"{field_name} must not be the container root: {path_text}")
+    try:
+        container_path.relative_to(MODEL_CONTAINER_ROOT)
+    except ValueError:
+        pass
+    else:
+        raise ConfigError(f"{field_name} must not overlap the /models mount: {path_text}")
     return str(container_path)
 
 
@@ -337,7 +345,6 @@ def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
         cache.get("set_default_env", True),
         "run.vllm_cache.set_default_env",
     )
-    root_raw = cache.get("root")
     if not enabled:
         return VllmCacheConfig(
             enabled=False,
@@ -345,9 +352,10 @@ def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
             container_path=container_path,
             set_default_env=set_default_env,
         )
-    if root_raw is None:
-        raise ConfigError("run.vllm_cache.root is required when enabled=true")
-    root = Path(_string(root_raw, "run.vllm_cache.root"))
+    if "root" in cache:
+        root = Path(_string(cache["root"], "run.vllm_cache.root"))
+    else:
+        root = config_dir / ".cache" / "vllm_auto_bench"
     if not root.is_absolute():
         root = config_dir / root
     return VllmCacheConfig(
@@ -575,16 +583,49 @@ def _short_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
+def vllm_cache_key_inputs(config: AutoBenchConfig,
+                          case: BenchmarkCase) -> dict[str, Any]:
+    return {
+        "vllm_image_ref": config.run.images["vllm"],
+        "model": {
+            "name": case.model.name,
+            "model_path": case.model.model_path,
+            "tokenizer_path": case.model.tokenizer_path,
+            "served_model_name": case.model.served_model_name,
+        },
+        "serve_profile": {
+            "name": case.serve_profile.name,
+            "gpus": case.serve_profile.gpus,
+            "args": list(case.serve_profile.args),
+        },
+    }
+
+
+def _short_json_fingerprint(data: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return _short_hash(canonical)
+
+
 def default_vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str:
-    # Default key hashes the configured image reference; use cache_key for mutable tags.
-    image = config.run.images["vllm"]
-    return f"{case.model.name}__{case.serve_profile.name}__{_short_hash(image)}"
+    fingerprint = _short_json_fingerprint(vllm_cache_key_inputs(config, case))
+    return f"{case.model.name}__{case.serve_profile.name}__{fingerprint}"
 
 
 def vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
     if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
         return None
     return case.serve_profile.cache_key or default_vllm_cache_key(config, case)
+
+
+def vllm_cache_key_source(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
+    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+        return None
+    return "explicit" if case.serve_profile.cache_key else "default"
 
 
 def resolve_vllm_cache_dir(config: AutoBenchConfig, case: BenchmarkCase) -> Path | None:
@@ -618,6 +659,8 @@ def vllm_cache_metadata(config: AutoBenchConfig,
     return {
         "enabled": True,
         "cache_key": key,
+        "cache_key_source": vllm_cache_key_source(config, case),
+        "cache_key_inputs": vllm_cache_key_inputs(config, case),
         "host_dir": str(cache_dir),
         "container_path": config.run.vllm_cache.container_path,
         "env": build_vllm_cache_env(config),

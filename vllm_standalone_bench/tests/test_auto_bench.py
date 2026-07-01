@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import sys
@@ -1508,6 +1509,11 @@ def test_readme_documents_vllm_cache_persistence():
     assert "VLLM_CACHE_ROOT" in readme
     assert "DG_JIT_CACHE_DIR" in readme
     assert "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR" in readme
+    assert "可省略" in readme
+    assert ".cache/vllm_auto_bench" in readme
+    assert "model_path" in readme
+    assert "gpus" in readme
+    assert "serve args" in readme
     assert "image id" in readme_lower
     assert "digest" in readme_lower
     assert "cache_key" in readme
@@ -3086,6 +3092,33 @@ def enable_vllm_cache(data, root):
     return data
 
 
+def expected_vllm_cache_key_inputs(config, case):
+    return {
+        "vllm_image_ref": config.run.images["vllm"],
+        "model": {
+            "name": case.model.name,
+            "model_path": case.model.model_path,
+            "tokenizer_path": case.model.tokenizer_path,
+            "served_model_name": case.model.served_model_name,
+        },
+        "serve_profile": {
+            "name": case.serve_profile.name,
+            "gpus": case.serve_profile.gpus,
+            "args": list(case.serve_profile.args),
+        },
+    }
+
+
+def expected_vllm_cache_fingerprint(inputs):
+    canonical = json.dumps(
+        inputs,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
 def test_load_config_vllm_cache_defaults_disabled(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
 
@@ -3109,6 +3142,21 @@ def test_load_config_parses_enabled_vllm_cache(tmp_path):
     assert config.serve_profiles[0].cache_key == "glm52-fp8-tp8-h20-o2"
 
 
+def test_load_config_defaults_enabled_vllm_cache_root_from_config_dir(tmp_path):
+    config_dir = tmp_path / "configs"
+    data = minimal_config(tmp_path)
+    data["run"]["vllm_cache"] = {"enabled": True}
+
+    config = ab.load_config(write_config_at(config_dir / "config.json", data))
+
+    assert config.run.vllm_cache.enabled is True
+    assert config.run.vllm_cache.root == (
+        config_dir / ".cache" / "vllm_auto_bench"
+    ).resolve()
+    assert config.run.vllm_cache.container_path == "/vllm-cache"
+    assert config.run.vllm_cache.set_default_env is True
+
+
 def test_load_config_resolves_relative_vllm_cache_root_from_config_dir(tmp_path):
     config_dir = tmp_path / "configs"
     data = enable_vllm_cache(minimal_config(tmp_path), "relative-cache")
@@ -3126,15 +3174,21 @@ def test_vllm_cache_null_is_rejected(tmp_path):
         ab.load_config(write_config(tmp_path, data))
 
 
-def test_vllm_cache_enabled_requires_root(tmp_path):
-    data = minimal_config(tmp_path)
-    data["run"]["vllm_cache"] = {"enabled": True}
+def test_vllm_cache_explicit_null_root_is_rejected(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["run"]["vllm_cache"]["root"] = None
 
     with pytest.raises(ab.ConfigError, match="vllm_cache.root"):
         ab.load_config(write_config(tmp_path, data))
 
 
-@pytest.mark.parametrize("container_path", ["relative/cache", "/cache/../bad"])
+@pytest.mark.parametrize("container_path", [
+    "relative/cache",
+    "/cache/../bad",
+    "/",
+    "/models",
+    "/models/cache",
+])
 def test_vllm_cache_container_path_must_be_absolute_and_safe(tmp_path, container_path):
     data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
     data["run"]["vllm_cache"]["container_path"] = container_path
@@ -3169,9 +3223,11 @@ def test_resolve_vllm_cache_dir_uses_stable_default_key(tmp_path):
     case = ab.expand_cases(config, run_id="run123")[0]
 
     cache_dir = ab.resolve_vllm_cache_dir(config, case)
+    key_inputs = expected_vllm_cache_key_inputs(config, case)
+    expected_fingerprint = expected_vllm_cache_fingerprint(key_inputs)
     expected_name = (
         f"{case.model.name}__{case.serve_profile.name}__"
-        f"{ab._short_hash(config.run.images['vllm'])}"
+        f"{expected_fingerprint}"
     )
 
     assert cache_dir is not None
@@ -3187,6 +3243,54 @@ def test_default_vllm_cache_dir_changes_when_image_changes(tmp_path):
 
     second_data = json.loads(json.dumps(first_data))
     second_data["run"]["vllm_image"] = "vllm-openai:changed"
+    second_config = ab.load_config(write_config(tmp_path, second_data))
+    second_case = ab.expand_cases(second_config, run_id="run123")[0]
+
+    assert (
+        ab.resolve_vllm_cache_dir(first_config, first_case).name
+        != ab.resolve_vllm_cache_dir(second_config, second_case).name
+    )
+
+
+def test_default_vllm_cache_dir_changes_when_serve_args_change(tmp_path):
+    first_data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    first_config = ab.load_config(write_config(tmp_path, first_data))
+    first_case = ab.expand_cases(first_config, run_id="run123")[0]
+
+    second_data = json.loads(json.dumps(first_data))
+    second_data["serve_profiles"][0]["args"] = ["--dtype", "float16"]
+    second_config = ab.load_config(write_config(tmp_path, second_data))
+    second_case = ab.expand_cases(second_config, run_id="run123")[0]
+
+    assert (
+        ab.resolve_vllm_cache_dir(first_config, first_case).name
+        != ab.resolve_vllm_cache_dir(second_config, second_case).name
+    )
+
+
+def test_default_vllm_cache_dir_changes_when_serve_gpus_change(tmp_path):
+    first_data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    first_config = ab.load_config(write_config(tmp_path, first_data))
+    first_case = ab.expand_cases(first_config, run_id="run123")[0]
+
+    second_data = json.loads(json.dumps(first_data))
+    second_data["serve_profiles"][0]["gpus"] = "device=0,1"
+    second_config = ab.load_config(write_config(tmp_path, second_data))
+    second_case = ab.expand_cases(second_config, run_id="run123")[0]
+
+    assert (
+        ab.resolve_vllm_cache_dir(first_config, first_case).name
+        != ab.resolve_vllm_cache_dir(second_config, second_case).name
+    )
+
+
+def test_default_vllm_cache_dir_changes_when_model_path_changes(tmp_path):
+    first_data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    first_config = ab.load_config(write_config(tmp_path, first_data))
+    first_case = ab.expand_cases(first_config, run_id="run123")[0]
+
+    second_data = json.loads(json.dumps(first_data))
+    second_data["models"][0]["model_path"] = "/models/Qwen2.5-1.5B-Instruct-Alt"
     second_config = ab.load_config(write_config(tmp_path, second_data))
     second_case = ab.expand_cases(second_config, run_id="run123")[0]
 
@@ -3222,16 +3326,12 @@ def test_build_vllm_cache_env_defaults(tmp_path):
     }
 
 
-def test_build_vllm_cache_env_handles_container_root(tmp_path):
+def test_vllm_cache_container_path_rejects_container_root(tmp_path):
     data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
     data["run"]["vllm_cache"]["container_path"] = "/"
-    config = ab.load_config(write_config(tmp_path, data))
 
-    assert ab.build_vllm_cache_env(config) == {
-        "VLLM_CACHE_ROOT": "/",
-        "DG_JIT_CACHE_DIR": "/deep_gemm",
-        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/flashinfer_autotune",
-    }
+    with pytest.raises(ab.ConfigError, match="container_path|root|/models"):
+        ab.load_config(write_config(tmp_path, data))
 
 
 def test_build_vllm_cache_env_can_be_disabled(tmp_path):
@@ -3279,6 +3379,8 @@ def test_vllm_cache_metadata_payload(tmp_path):
     assert payload == {
         "enabled": True,
         "cache_key": "glm52-fp8-tp8-h20-o2",
+        "cache_key_source": "explicit",
+        "cache_key_inputs": expected_vllm_cache_key_inputs(config, case),
         "host_dir": str((tmp_path / "cache" / "glm52-fp8-tp8-h20-o2").resolve()),
         "container_path": "/vllm-cache",
         "env": {
@@ -3287,6 +3389,18 @@ def test_vllm_cache_metadata_payload(tmp_path):
             "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/vllm-cache/flashinfer_autotune",
         },
     }
+
+
+def test_vllm_cache_metadata_payload_for_default_key_includes_audit_inputs(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    payload = ab.vllm_cache_metadata(config, case)
+
+    assert payload is not None
+    assert payload["cache_key_source"] == "default"
+    assert payload["cache_key_inputs"] == expected_vllm_cache_key_inputs(config, case)
 
 
 def test_run_controller_writes_vllm_cache_metadata(tmp_path, monkeypatch):
