@@ -138,6 +138,112 @@ def test_run_all_rejects_invalid_prefix_ratio_before_serving(monkeypatch):
         m._run_all(args)
 
 
+def test_run_all_maps_openai_audio_to_custom_audio_dataset(monkeypatch):
+    seen_cfgs = []
+
+    async def fake_main_async(cfg):
+        seen_cfgs.append(cfg)
+        return {
+            **_fake_result(0, 128, completed=2),
+            "rtfx": 3.5,
+            "duration": 4.0,
+        }
+
+    monkeypatch.setattr(serve, "main_async", fake_main_async)
+    args = argparse.Namespace(
+        model="Qwen/Qwen3-ASR-1.7B",
+        served_model_name="qwen3-asr",
+        backend="openai-audio",
+        base_url="http://x/v1",
+        host="127.0.0.1",
+        port=8000,
+        insecure=False,
+        api_key=None,
+        tokenizer=None,
+        dataset_name="custom_audio",
+        dataset_path="/opt/vllm_standalone_bench/assets/librispeech_test_clean_256/asr_smoke.jsonl",
+        language="en",
+        input_lens=[0],
+        output_lens=[128],
+        cross_product=False,
+        parallel_nums=[2],
+        epochs=1,
+        sleep_between=0,
+        warmup_requests=0,
+        warmup_concurrency=None,
+        warmup_output_len=None,
+        prefix_ratio=0.0,
+        seed=0,
+        no_vary_seed_by_config=False,
+        output_csv=None,
+        output_xlsx=None,
+        result_dir=None,
+        max_ttft_ms=None,
+        min_throughput_tok_s=None,
+        min_output_compliance=0.0,
+    )
+
+    rows = m._run_all(args)
+
+    cfg = seen_cfgs[0]
+    assert cfg.backend == "openai-audio"
+    assert cfg.endpoint == "/audio/transcriptions"
+    assert cfg.dataset_name == "custom_audio"
+    assert cfg.dataset_path.endswith("asr_smoke.jsonl")
+    assert cfg.custom_output_len == 128
+    assert cfg.language == "en"
+    assert cfg.skip_tokenizer_init is True
+    assert cfg.input_len == 0
+    assert cfg.random_prefix_len == 0
+    assert rows[0]["dataset_name"] == "custom_audio"
+    assert rows[0]["language"] == "en"
+    assert rows[0]["audio_duration_s_total"] == 14.0
+    assert rows[0]["audio_duration_s_avg"] == 7.0
+    assert rows[0]["rtfx"] == 3.5
+
+
+def test_run_all_rejects_openai_audio_without_dataset_path(monkeypatch):
+    async def fail_if_called(cfg):
+        raise AssertionError("main_async should not be called")
+
+    monkeypatch.setattr(serve, "main_async", fail_if_called)
+    args = argparse.Namespace(
+        model="Qwen/Qwen3-ASR-1.7B",
+        served_model_name="qwen3-asr",
+        backend="openai-audio",
+        base_url="http://x/v1",
+        host="127.0.0.1",
+        port=8000,
+        insecure=False,
+        api_key=None,
+        tokenizer=None,
+        dataset_name=None,
+        dataset_path=None,
+        language="en",
+        input_lens=[0],
+        output_lens=[128],
+        cross_product=False,
+        parallel_nums=[2],
+        epochs=1,
+        sleep_between=0,
+        warmup_requests=0,
+        warmup_concurrency=None,
+        warmup_output_len=None,
+        prefix_ratio=0.0,
+        seed=0,
+        no_vary_seed_by_config=False,
+        output_csv=None,
+        output_xlsx=None,
+        result_dir=None,
+        max_ttft_ms=None,
+        min_throughput_tok_s=None,
+        min_output_compliance=0.0,
+    )
+
+    with pytest.raises(ValueError, match="openai-audio.*dataset-path"):
+        m._run_all(args)
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -186,6 +292,15 @@ def test_seed_column_is_reported_after_num_prompts():
 
     assert m.CSV_HEADERS[m.CSV_HEADERS.index("num_prompts") + 1] == "seed"
     assert m.CSV_HEADERS_ZH[seed_index] == "随机种子"
+    assert len(m.CSV_HEADERS) == len(m.CSV_HEADERS_ZH)
+
+
+def test_csv_headers_include_asr_columns_without_removing_existing_columns():
+    assert m.CSV_HEADERS[:4] == ["model", "backend", "dataset_name", "language"]
+    assert "audio_duration_s_total" in m.CSV_HEADERS
+    assert "audio_duration_s_avg" in m.CSV_HEADERS
+    assert "rtfx" in m.CSV_HEADERS
+    assert "输入长度(token)" in m.CSV_HEADERS_ZH
     assert len(m.CSV_HEADERS) == len(m.CSV_HEADERS_ZH)
 
 
