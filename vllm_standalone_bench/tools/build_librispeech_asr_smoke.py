@@ -10,9 +10,9 @@ import shutil
 import tarfile
 import tempfile
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 
 DEFAULT_SOURCE_URL = "https://www.openslr.org/resources/12/test-clean.tar.gz"
@@ -36,11 +36,11 @@ class LibriSpeechSample:
 
 
 def duration_bucket(duration_s: float) -> str | None:
-    if 5.0 <= duration_s < 10.0:
+    if DEFAULT_MIN_DURATION_S <= duration_s < 10.0:
         return "medium"
     if 10.0 <= duration_s < 20.0:
         return "long"
-    if 20.0 <= duration_s <= 30.0:
+    if 20.0 <= duration_s <= DEFAULT_MAX_DURATION_S:
         return "xlong"
     return None
 

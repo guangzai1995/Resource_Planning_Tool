@@ -26,6 +26,16 @@ def test_duration_bucket_uses_medium_long_xlong_ranges():
     assert builder.duration_bucket(30.01) is None
 
 
+def test_duration_bucket_uses_configured_outer_duration_bounds(monkeypatch):
+    monkeypatch.setattr(builder, "DEFAULT_MIN_DURATION_S", 6.0)
+    monkeypatch.setattr(builder, "DEFAULT_MAX_DURATION_S", 25.0)
+
+    assert builder.duration_bucket(5.99) is None
+    assert builder.duration_bucket(6.0) == "medium"
+    assert builder.duration_bucket(25.0) == "xlong"
+    assert builder.duration_bucket(25.01) is None
+
+
 def test_select_samples_is_seeded_and_balanced():
     samples = (
         [_sample(i, 5.5) for i in range(20)]
