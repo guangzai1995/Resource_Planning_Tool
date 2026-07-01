@@ -657,8 +657,15 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--gpus", case.serve_profile.gpus,
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
-        "--entrypoint", "vllm",
     ]
+    cache_dir = resolve_vllm_cache_dir(config, case)
+    if cache_dir is not None:
+        cmd.extend(["-v", f"{cache_dir}:{config.run.vllm_cache.container_path}:rw"])
+        for name, value in build_vllm_cache_env(config).items():
+            cmd.extend(["-e", f"{name}={value}"])
+    cmd.extend([
+        "--entrypoint", "vllm",
+    ])
     if config.run.publish_host_port:
         if config.run.host_port is None:
             raise ConfigError("host_port is required when publish_host_port=true")

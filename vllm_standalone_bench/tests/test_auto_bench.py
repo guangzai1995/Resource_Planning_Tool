@@ -3220,6 +3220,43 @@ def test_build_vllm_cache_env_can_be_disabled(tmp_path):
     assert ab.build_vllm_cache_env(config) == {}
 
 
+def test_build_vllm_command_omits_cache_when_disabled(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_vllm_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert "/vllm-cache" not in " ".join(cmd)
+    assert "VLLM_CACHE_ROOT=/vllm-cache" not in cmd
+
+
+def test_build_vllm_command_includes_cache_mount_and_env(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_vllm_run_command(config, case, tmp_path / "results" / "run123")
+
+    mounts = values_after(cmd, "-v")
+    envs = values_after(cmd, "-e")
+    assert f"{(tmp_path / 'cache' / 'glm52-fp8-tp8-h20-o2').resolve()}:/vllm-cache:rw" in mounts
+    assert "VLLM_CACHE_ROOT=/vllm-cache" in envs
+    assert "DG_JIT_CACHE_DIR=/vllm-cache/deep_gemm" in envs
+    assert "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/vllm-cache/flashinfer_autotune" in envs
+
+
+def test_build_sglang_command_omits_vllm_cache_mount_and_env(tmp_path):
+    data = enable_vllm_cache(sglang_config(tmp_path), tmp_path / "cache")
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_serve_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert "/vllm-cache" not in " ".join(cmd)
+    assert "VLLM_CACHE_ROOT=/vllm-cache" not in cmd
+
+
 def test_build_bench_command_includes_warmup_opts(tmp_path):
     data = minimal_config(tmp_path)
     data["bench_profiles"][0]["warmup_concurrency"] = 4
