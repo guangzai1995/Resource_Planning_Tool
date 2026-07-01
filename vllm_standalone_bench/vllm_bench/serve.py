@@ -255,6 +255,61 @@ async def fetch_spec_decode_metrics(
     return metrics.spec_decode
 
 
+class RuntimeMetricsSampler:
+    """Background sampler for runtime Prometheus metrics during a benchmark."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        session: aiohttp.ClientSession,
+        extra_headers: dict[str, str] | None = None,
+        interval_s: float = 1.0,
+    ) -> None:
+        self.base_url = base_url
+        self.session = session
+        self.extra_headers = extra_headers
+        self.interval_s = interval_s
+        self._samples: list[float] = []
+        self._task: asyncio.Task | None = None
+        self._stopped = asyncio.Event()
+
+    async def start(self) -> None:
+        await self._scrape_once()
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> RuntimeMetricsSummary:
+        self._stopped.set()
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+        await self._scrape_once()
+        return RuntimeMetricsSummary.from_samples(self._samples)
+
+    async def _run(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=self.interval_s)
+            except asyncio.TimeoutError:
+                await self._scrape_once()
+
+    async def _scrape_once(self) -> None:
+        metrics = await fetch_runtime_metrics(
+            self.base_url, self.session, self.extra_headers
+        )
+        if metrics is not None and metrics.gpu_kv_cache_usage is not None:
+            self._samples.append(metrics.gpu_kv_cache_usage)
+
+
+def add_runtime_metrics_to_result(
+    result: dict[str, Any],
+    summary: RuntimeMetricsSummary,
+) -> None:
+    result["avg_gpu_kv_cache_usage"] = summary.avg_gpu_kv_cache_usage
+    result["peak_gpu_kv_cache_usage"] = summary.peak_gpu_kv_cache_usage
+
+
 class TaskType(Enum):
     GENERATION = "generation"
     POOLING = "pooling"
@@ -941,6 +996,12 @@ async def benchmark(
     spec_decode_metrics_before = await fetch_spec_decode_metrics(
         base_url, session, extra_headers
     )
+    runtime_sampler = RuntimeMetricsSampler(
+        base_url=base_url,
+        session=session,
+        extra_headers=extra_headers,
+    )
+    await runtime_sampler.start()
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -1019,7 +1080,10 @@ async def benchmark(
                 )
             )
         )
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    try:
+        outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    finally:
+        runtime_metrics_summary = await runtime_sampler.stop()
 
     if pbar is not None:
         pbar.close()
@@ -1180,6 +1244,8 @@ async def benchmark(
 
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
+
+    add_runtime_metrics_to_result(result, runtime_metrics_summary)
 
     if spec_decode_stats is not None:
         result["spec_decode_acceptance_rate"] = spec_decode_stats["acceptance_rate"]

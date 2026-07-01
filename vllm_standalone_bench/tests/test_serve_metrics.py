@@ -288,3 +288,72 @@ def test_fetch_runtime_metrics_passes_headers_and_normalizes_url():
     ]
     assert metrics is not None
     assert metrics.gpu_kv_cache_usage == 9.8
+
+
+def test_runtime_metrics_sampler_scrapes_start_and_stop():
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, text):
+            self._text = text
+
+        async def text(self):
+            return self._text
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                "vllm:gpu_cache_usage_perc 8.0",
+                "vllm:gpu_cache_usage_perc 12.0",
+            ]
+
+        def get(self, url, headers=None):
+            self.calls.append((url, headers))
+            return FakeResponse(self.responses.pop(0))
+
+    async def run_sampler():
+        session = FakeSession()
+        sampler = serve.RuntimeMetricsSampler(
+            base_url="http://127.0.0.1:8000/v1",
+            session=session,
+            extra_headers={"Authorization": "Bearer local-bench-key"},
+            interval_s=60.0,
+        )
+        await sampler.start()
+        summary = await sampler.stop()
+        return session.calls, summary
+
+    calls, summary = asyncio.run(run_sampler())
+
+    assert calls == [
+        (
+            "http://127.0.0.1:8000/metrics",
+            {"Authorization": "Bearer local-bench-key"},
+        ),
+        (
+            "http://127.0.0.1:8000/metrics",
+            {"Authorization": "Bearer local-bench-key"},
+        ),
+    ]
+    assert summary.avg_gpu_kv_cache_usage == 10.0
+    assert summary.peak_gpu_kv_cache_usage == 12.0
+
+
+def test_add_runtime_metrics_to_result_sets_gpu_kv_fields():
+    result = {"completed": 1}
+    summary = serve.RuntimeMetricsSummary(
+        avg_gpu_kv_cache_usage=9.5,
+        peak_gpu_kv_cache_usage=13.0,
+    )
+
+    serve.add_runtime_metrics_to_result(result, summary)
+
+    assert result["avg_gpu_kv_cache_usage"] == 9.5
+    assert result["peak_gpu_kv_cache_usage"] == 13.0
