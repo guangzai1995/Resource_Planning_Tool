@@ -40,6 +40,7 @@ import csv
 import hashlib
 import importlib.util
 import itertools
+import json
 import logging
 import os
 import sys
@@ -136,8 +137,19 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
         # 无 tokenizer 时跳过 tokenizer 初始化，使用近似字符串模式
         base.skip_tokenizer_init = True
 
-    # ── 数据集固定为 random ──────────────────────────────────────────────────
-    base.dataset_name = 'random'
+    # ── 数据集 ────────────────────────────────────────────────────────────────
+    dataset = getattr(our_args, 'dataset', 'random')
+    if dataset == 'builtin_mtp_chat' and not our_args.tokenizer:
+        raise ValueError('builtin_mtp_chat requires --tokenizer')
+    base.dataset_name = dataset
+    base.dataset_length_policy = getattr(our_args, 'dataset_length_policy', 'exact')
+    base.dataset_input_len_tolerance = getattr(
+        our_args, 'dataset_input_len_tolerance', 0.2
+    )
+    base.dataset_on_bucket_shortage = getattr(
+        our_args, 'dataset_on_bucket_shortage', 'error'
+    )
+    base.dataset_sampling = getattr(our_args, 'dataset_sampling', 'shuffle')
 
     # ── 流量控制：不限速，仅用 max_concurrency 控制并发 ───────────────────────
     base.request_rate = float('inf')
@@ -280,6 +292,10 @@ def _extract_row(
     def _i(key: str, default=0) -> int:
         return int(result.get(key, default) or default)
 
+    def _json_list(key: str) -> str:
+        value = result.get(key) or []
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
     def _rate(numerator: float, denominator_s: float) -> float:
         if denominator_s <= 0:
             return 0.0
@@ -354,6 +370,15 @@ def _extract_row(
         'token_source':        token_source,
         'avg_cached_tokens':   avg_cached_tokens,   # 平均命中缓存的 prompt token 数
         'cache_hit_rate':      cache_hit_rate,       # token 加权缓存命中率 (%) = total_cached/total_in*100
+        # ── MTP / Spec Decode ───────────────────────
+        'spec_decode_acceptance_rate': _f('spec_decode_acceptance_rate'),
+        'spec_decode_system_efficiency': _f('spec_decode_system_efficiency'),
+        'spec_decode_num_drafts': _i('spec_decode_num_drafts'),
+        'spec_decode_num_accepted_tokens': _i('spec_decode_num_accepted_tokens'),
+        'spec_decode_num_draft_tokens': _i('spec_decode_num_draft_tokens'),
+        'spec_decode_per_position_acceptance_rates': _json_list(
+            'spec_decode_per_position_acceptance_rates'
+        ),
         # ── 吞吐量 ──────────────────────────────────
         'throughput_req_s':   _f('request_throughput'),
         'throughput_tok_s':   _f('output_throughput'),  # 输出 Token 系统吞吐，vLLM 官方口径
@@ -391,6 +416,9 @@ CSV_HEADERS = [
     'input_compliance', 'output_compliance',
     'finish_reason_length_pct', 'token_source',
     'avg_cached_tokens', 'cache_hit_rate',
+    'spec_decode_acceptance_rate', 'spec_decode_system_efficiency',
+    'spec_decode_num_drafts', 'spec_decode_num_accepted_tokens',
+    'spec_decode_num_draft_tokens', 'spec_decode_per_position_acceptance_rates',
     'throughput_req_s', 'throughput_tok_s', 'input_throughput_tok_s',
     'prefill_effective_tok_s', 'decode_effective_tok_s',
     'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
@@ -407,6 +435,9 @@ CSV_HEADERS_ZH = [
     '平均实际输入tokens', '平均实际输出tokens',
     '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
     '平均缓存命中tokens', '缓存命中率(%)',
+    'SpecDecode接受率(%)', 'SpecDecode系统效率',
+    'SpecDecode草稿轮数', 'SpecDecode接受tokens数',
+    'SpecDecode草稿tokens数', 'SpecDecode分位置接受率(%)',
     '请求吞吐(req/s)', '输出Token系统吞吐(tok/s)', '输入Token系统吞吐(tok/s)',
     'Prefill有效速率(tok/s)', 'Decode有效速率(tok/s)',
     'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
@@ -494,6 +525,12 @@ def save_xlsx(rows: List[dict], path: str) -> None:
         ('decode_effective_tok_s', 'Decode 有效速率', '1 ÷ mean_TPOT_s；基于 TPOT 的 next-token decode 近似速率'),
         ('avg_cached_tokens', '平均缓存命中 tokens', 'total_cached_tokens ÷ completed（服务端 usage.cached_tokens 累计）'),
         ('cache_hit_rate', '缓存命中率(%)', 'total_cached_tokens ÷ total_input_tokens × 100（token 加权；仅服务端开启 prefix caching 时非零）'),
+        ('spec_decode_acceptance_rate', 'Spec Decode 接受率(%)', 'accepted_tokens ÷ draft_tokens × 100（来自 /metrics 差分）'),
+        ('spec_decode_system_efficiency', 'Spec Decode 系统效率', '接受 tokens 相对 draft tokens 的服务端效率指标'),
+        ('spec_decode_num_drafts', 'Spec Decode 草稿轮数', 'num_drafts_total 差分'),
+        ('spec_decode_num_accepted_tokens', 'Spec Decode 接受 tokens 数', 'num_accepted_tokens_total 差分'),
+        ('spec_decode_num_draft_tokens', 'Spec Decode 草稿 tokens 数', 'num_draft_tokens_total 差分'),
+        ('spec_decode_per_position_acceptance_rates', '分位置接受率(%)', '各 speculative position 的接受率列表'),
         ('P50/P90/P99', '百分位数', 'P90 表示 90% 请求低于该延迟值'),
         ('', '', ''),
         ('并发控制说明', '',
@@ -806,6 +843,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             '后缀包含 request-index token 加随机 tail，用于保证非 full-prefix 请求差异。'
                             '实际 prompt_len ≈ input_len；共享前缀 token 数约为 input_len × prefix_ratio。'
                             '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。')
+    bench.add_argument('--dataset', default='random',
+                       choices=['random', 'builtin_mtp_chat'],
+                       help='请求数据集（默认 random；builtin_mtp_chat 使用内置真实风格 MTP chat prompt）')
+    bench.add_argument('--dataset-length-policy', default='exact',
+                       choices=['exact', 'bucket'],
+                       help='dataset 输入长度策略：exact 精确匹配，bucket 按容忍度筛选')
+    bench.add_argument('--dataset-input-len-tolerance', type=float, default=0.2,
+                       help='dataset-length-policy=bucket 时的 input_len 容忍度')
+    bench.add_argument('--dataset-on-bucket-shortage', default='error',
+                       choices=['error'],
+                       help='bucket 无候选样本时的处理策略')
+    bench.add_argument('--dataset-sampling', default='shuffle',
+                       choices=['shuffle', 'round_robin'],
+                       help='内置数据集采样顺序')
     bench.add_argument('--seed', type=int, default=0,
                        help='随机种子基值。默认每个配置会基于该值派生独立 seed（默认: 0）')
     bench.add_argument('--no-vary-seed-by-config', action='store_true', default=False,

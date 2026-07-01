@@ -246,6 +246,49 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert value_after(cmd, "--output-xlsx") == "/results/result.xlsx"
 
 
+def test_build_bench_command_passes_builtin_dataset(tmp_path):
+    data = minimal_config(tmp_path)
+    data["bench_profiles"][0]["dataset"] = {
+        "name": "builtin_mtp_chat",
+        "length_policy": "bucket",
+        "input_len_tolerance": 0.2,
+        "on_bucket_shortage": "error",
+        "sampling": "shuffle",
+    }
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = Path("relative-results") / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
+
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+
+    assert value_after(cmd, "--dataset") == "builtin_mtp_chat"
+    assert value_after(cmd, "--dataset-length-policy") == "bucket"
+    assert value_after(cmd, "--dataset-input-len-tolerance") == "0.2"
+    assert value_after(cmd, "--dataset-on-bucket-shortage") == "error"
+    assert value_after(cmd, "--dataset-sampling") == "shuffle"
+
+
+def test_build_bench_command_omits_dataset_for_legacy_config(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = Path("relative-results") / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
+
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+
+    assert "--dataset" not in cmd
+
+
+def test_serve_profile_rejects_speculative_config_without_dashes(tmp_path):
+    data = minimal_config(tmp_path)
+    data["serve_profiles"][0]["args"] = [
+        "speculative-config.num_speculative_tokens",
+        "1",
+    ]
+
+    with pytest.raises(ab.ConfigError, match="--speculative-config"):
+        ab.load_config(write_config(tmp_path, data))
+
+
 def test_build_bench_command_includes_name_and_ownership_labels(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     case = ab.expand_cases(config, run_id="run123")[0]

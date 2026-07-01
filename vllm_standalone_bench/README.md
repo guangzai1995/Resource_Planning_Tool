@@ -36,9 +36,10 @@ python3 vllm_standalone_bench/auto_bench.py run \
 | 端点就绪检查 | ✅ | ✅ |
 | Random 数据集 | ✅ | ✅ |
 | ShareGPT 数据集 | ✅ | ✅（基础） |
+| Built-in MTP Chat 数据集 | ❌ | ✅ |
 | Ramp-up 策略 | ✅ | ❌ |
 | Burstiness (Gamma) | ✅ | ❌ |
-| Speculative Decoding 指标 | ✅ | ❌ |
+| Speculative Decoding 指标 | ✅ | ✅（/metrics 差分） |
 | 多模态 | ✅ | ❌ |
 | Timeline Plot | ✅ | ❌ |
 
@@ -173,6 +174,39 @@ run 结束后在 `results/<run_id>/` 产出 `compare.csv`、`compare.xlsx` 与 `
 凑齐一波满并发，热起 vLLM 多请求调度路径。`smoke` / `sglang_compare` 配置
 默认 `warmup_concurrency=4`、`warmup_output_len=128`。CLI 直跑可用
 `--warmup-concurrency 4 --warmup-output-len 128`。
+
+### MTP 真实风格内置数据集
+
+`bench_profiles[].dataset.name = "builtin_mtp_chat"` 会启用离线内置的 chat-style
+MTP prompt 数据集。该数据集用真实任务风格的中文/英文技术场景构造 prompt，适合替代随机
+token prompt 来观察 MTP/Spec Decode 接受率。
+
+```json
+"dataset": {
+  "name": "builtin_mtp_chat",
+  "length_policy": "bucket",
+  "input_len_tolerance": 0.2,
+  "on_bucket_shortage": "error",
+  "sampling": "shuffle"
+}
+```
+
+启用该数据集后，`input_lens` 不会失效，而是作为 prompt token bucket 目标。例如
+`input_lens: [4096]` 且 `input_len_tolerance: 0.2` 表示选择约 3276 到 4915 token
+的真实风格 prompt。`output_lens`、`parallel_nums`、`epochs`、`cross_product` 保持
+现有矩阵语义。
+
+注意事项：
+- `builtin_mtp_chat` 需要模型 tokenizer，配置中必须提供 `models[].tokenizer_path`。
+- 数据集只负责 prompt；MTP 本身仍通过 `serve_profiles[].args` 配置，例如
+  `--speculative-config.method mtp` 和 `--speculative-config.num_speculative_tokens 1`。
+- 自动化配置会拒绝漏写前导 `--` 的 `speculative-config.*` 参数。
+- 结果表会导出 `spec_decode_acceptance_rate`、`spec_decode_system_efficiency`、
+  `spec_decode_num_drafts`、`spec_decode_num_accepted_tokens`、
+  `spec_decode_num_draft_tokens` 和 `spec_decode_per_position_acceptance_rates`。
+
+示例配置见
+`vllm_standalone_bench/configs/auto_bench.mtp_builtin_dataset.example.json`。
 
 ### vLLM 编译/JIT cache 持久化
 

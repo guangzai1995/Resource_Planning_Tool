@@ -102,16 +102,25 @@ class SpecDecodeMetrics:
     accepted_per_pos: dict[int, int]
 
 
+def _metrics_url_from_base(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3]
+    return f"{normalized}/metrics"
+
+
 async def fetch_spec_decode_metrics(
-    base_url: str, session: aiohttp.ClientSession
+    base_url: str,
+    session: aiohttp.ClientSession,
+    extra_headers: dict[str, str] | None = None,
 ) -> SpecDecodeMetrics | None:
     """Fetch speculative decoding metrics from the server's Prometheus endpoint.
 
     Returns None if speculative decoding is not enabled or metrics are not available.
     """
-    metrics_url = f"{base_url}/metrics"
+    metrics_url = _metrics_url_from_base(base_url)
     try:
-        async with session.get(metrics_url) as response:
+        async with session.get(metrics_url, headers=extra_headers) as response:
             if response.status != 200:
                 return None
             text = await response.text()
@@ -849,7 +858,9 @@ async def benchmark(
     else:
         print("Self timing is set, using the timestamps from the trace file.")
 
-    spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
+    spec_decode_metrics_before = await fetch_spec_decode_metrics(
+        base_url, session, extra_headers
+    )
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -935,7 +946,9 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    spec_decode_metrics_after = await fetch_spec_decode_metrics(base_url, session)
+    spec_decode_metrics_after = await fetch_spec_decode_metrics(
+        base_url, session, extra_headers
+    )
     spec_decode_stats: dict[str, Any] | None = None
     if spec_decode_metrics_before is not None and spec_decode_metrics_after is not None:
         delta_drafts = (

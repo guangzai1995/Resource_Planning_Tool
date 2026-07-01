@@ -17,7 +17,7 @@ import time
 import types
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
 
@@ -92,6 +92,15 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class DatasetConfig:
+    name: str
+    length_policy: str = "exact"
+    input_len_tolerance: float = 0.2
+    on_bucket_shortage: str = "error"
+    sampling: str = "shuffle"
+
+
+@dataclass(frozen=True)
 class ServeProfile:
     name: str
     engine: str = "vllm"
@@ -116,6 +125,7 @@ class BenchProfile:
     max_ttft_ms: float | None = None
     min_throughput_tok_s: float | None = None
     min_output_compliance: float | None = None
+    dataset: DatasetConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -464,6 +474,7 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
         args = profile.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ConfigError("serve_profile.args must be a string array")
+        _validate_serve_args(args, "serve_profile")
         engine = _string(profile.get("engine", "vllm"), "serve_profile.engine")
         if engine not in SUPPORTED_ENGINES:
             raise ConfigError(
@@ -482,6 +493,50 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
             ),
         ))
     return tuple(parsed)
+
+
+def _validate_serve_args(args: Sequence[str], path: str) -> None:
+    for value in args:
+        if value.startswith("speculative-config."):
+            raise ConfigError(
+                f"{path}.args contains {value!r}; use '--{value}' for vLLM dotted flags"
+            )
+
+
+def _parse_dataset_config(raw: object, path: str) -> DatasetConfig | None:
+    if raw is None:
+        return None
+    dataset = _require_mapping(raw, path)
+    name = _string(_required(dataset, "name", f"{path}.name"), f"{path}.name")
+    if name not in {"random", "builtin_mtp_chat"}:
+        raise ConfigError(f"{path}.name unsupported dataset: {name}")
+
+    length_policy = _string(dataset.get("length_policy", "exact"),
+                            f"{path}.length_policy")
+    if length_policy not in {"exact", "bucket"}:
+        raise ConfigError(f"{path}.length_policy must be exact or bucket")
+
+    tolerance = _finite_float(dataset.get("input_len_tolerance", 0.2),
+                              f"{path}.input_len_tolerance")
+    if tolerance < 0 or tolerance >= 1:
+        raise ConfigError(f"{path}.input_len_tolerance must be >= 0 and < 1")
+
+    shortage = _string(dataset.get("on_bucket_shortage", "error"),
+                       f"{path}.on_bucket_shortage")
+    if shortage != "error":
+        raise ConfigError(f"{path}.on_bucket_shortage only supports error")
+
+    sampling = _string(dataset.get("sampling", "shuffle"), f"{path}.sampling")
+    if sampling not in {"shuffle", "round_robin"}:
+        raise ConfigError(f"{path}.sampling must be shuffle or round_robin")
+
+    return DatasetConfig(
+        name=name,
+        length_policy=length_policy,
+        input_len_tolerance=tolerance,
+        on_bucket_shortage=shortage,
+        sampling=sampling,
+    )
 
 
 def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
@@ -528,6 +583,8 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
                 profile.get("min_output_compliance"),
                 "bench_profile.min_output_compliance",
             ),
+            dataset=_parse_dataset_config(profile.get("dataset"),
+                                          "bench_profile.dataset"),
         ))
     return tuple(parsed)
 
@@ -827,6 +884,13 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         cmd.extend(["--api-key", config.run.api_key])
     if case.model.tokenizer_path:
         cmd.extend(["--tokenizer", case.model.tokenizer_path])
+    if bench.dataset is not None:
+        cmd.extend(["--dataset", bench.dataset.name])
+        cmd.extend(["--dataset-length-policy", bench.dataset.length_policy])
+        cmd.extend(["--dataset-input-len-tolerance",
+                    str(bench.dataset.input_len_tolerance)])
+        cmd.extend(["--dataset-on-bucket-shortage", bench.dataset.on_bucket_shortage])
+        cmd.extend(["--dataset-sampling", bench.dataset.sampling])
     _append_many(cmd, "--input-lens", bench.input_lens)
     _append_many(cmd, "--output-lens", bench.output_lens)
     _append_many(cmd, "--parallel-nums", bench.parallel_nums)

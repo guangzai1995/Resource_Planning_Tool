@@ -162,6 +162,44 @@ def test_extract_row_cache_hit_rate_safe_when_totals_zero():
     assert row_missing["avg_cached_tokens"] == 0.0
 
 
+def test_extract_row_includes_spec_decode_metrics():
+    result = {
+        **_result(),
+        "spec_decode_acceptance_rate": 75.0,
+        "spec_decode_system_efficiency": 0.82,
+        "spec_decode_num_drafts": 12,
+        "spec_decode_num_accepted_tokens": 9,
+        "spec_decode_num_draft_tokens": 12,
+        "spec_decode_per_position_acceptance_rates": [90.0, 60.0],
+    }
+
+    row = m._extract_row(
+        result,
+        in_len=1024, out_len=512, parallel_num=4, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+
+    assert row["spec_decode_acceptance_rate"] == 75.0
+    assert row["spec_decode_system_efficiency"] == 0.82
+    assert row["spec_decode_num_drafts"] == 12
+    assert row["spec_decode_num_accepted_tokens"] == 9
+    assert row["spec_decode_num_draft_tokens"] == 12
+    assert row["spec_decode_per_position_acceptance_rates"] == "[90.0,60.0]"
+
+
+def test_extract_row_spec_decode_defaults_when_metrics_missing():
+    row = m._extract_row(
+        _result(total_in=300, total_out=24, completed=3),
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+
+    assert row["spec_decode_acceptance_rate"] == 0.0
+    assert row["spec_decode_system_efficiency"] == 0.0
+    assert row["spec_decode_num_drafts"] == 0
+    assert row["spec_decode_num_accepted_tokens"] == 0
+    assert row["spec_decode_num_draft_tokens"] == 0
+    assert row["spec_decode_per_position_acceptance_rates"] == "[]"
+
+
 def test_token_source_tokenizer_fallback_when_no_usage():
     row = m._extract_row(
         _result(total_out=24, completed=3, usage_reported=0,
@@ -225,7 +263,13 @@ def test_csv_headers_match_row_keys():
                      "finish_reason_length_pct", "token_source", "seed",
                      "input_throughput_tok_s", "prefill_effective_tok_s",
                      "decode_effective_tok_s",
-                     "avg_cached_tokens", "cache_hit_rate"):
+                     "avg_cached_tokens", "cache_hit_rate",
+                     "spec_decode_acceptance_rate",
+                     "spec_decode_system_efficiency",
+                     "spec_decode_num_drafts",
+                     "spec_decode_num_accepted_tokens",
+                     "spec_decode_num_draft_tokens",
+                     "spec_decode_per_position_acceptance_rates"):
         assert required in m.CSV_HEADERS, f"新列 {required} 未进 CSV_HEADERS"
     assert "total_throughput_tok_s" not in m.CSV_HEADERS
     assert row["seed"] == 0

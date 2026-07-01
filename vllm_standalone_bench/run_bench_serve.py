@@ -65,6 +65,8 @@ import importlib.util as _ilu
 from dataclasses import dataclass, field
 from typing import Any
 
+from vllm_bench.datasets import builtin_mtp_chat
+
 # ─── 路径配置 ─────────────────────────────────────────────────────────────────
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 VLLM_BENCH_DIR = os.path.join(_THIS_DIR, 'vllm_bench')
@@ -217,7 +219,7 @@ _make_mod('vllm.tokenizers',
           get_tokenizer=_get_tokenizer,
           TokenizerLike=_TokenizerLike)
 
-# ─── Step 3: 轻量 datasets shim（仅支持 random / sharegpt）────────────────────
+# ─── Step 3: 轻量 datasets shim（支持 random / sharegpt / builtin_mtp_chat）───
 
 @dataclass
 class SampleRequest:
@@ -244,7 +246,7 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
     # ── 通用 ──────────────────────────────────────────────────────────────────
     g.add_argument(
         '--dataset-name', type=str, default=None,
-        help='数据集类型（shim 支持: random / sharegpt；'
+        help='数据集类型（shim 支持: random / sharegpt / builtin_mtp_chat；'
              '其他类型请安装完整 vllm 包）',
     )
     g.add_argument(
@@ -271,6 +273,15 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
     # ── sharegpt dataset ──────────────────────────────────────────────────────
     g.add_argument('--sharegpt-output-len', type=int, default=None,
                    help='覆盖 sharegpt 数据集的 output len（None 则用数据集原始值）')
+
+    # ── builtin_mtp_chat dataset ──────────────────────────────────────────────
+    g.add_argument('--dataset-length-policy', default='exact',
+                   choices=('exact', 'bucket'))
+    g.add_argument('--dataset-input-len-tolerance', type=float, default=0.2)
+    g.add_argument('--dataset-on-bucket-shortage', default='error',
+                   choices=('error',))
+    g.add_argument('--dataset-sampling', default='shuffle',
+                   choices=('shuffle', 'round_robin'))
 
     # ── sonnet dataset（参数占位，get_samples 不支持）────────────────────────
     g.add_argument('--sonnet-input-len', type=int, default=550)
@@ -527,7 +538,7 @@ def _load_sharegpt_requests(args: argparse.Namespace,
 def get_samples(args: argparse.Namespace, tokenizer) -> list[SampleRequest]:
     """
     数据集入口函数，与原版 vllm.benchmarks.datasets.get_samples 接口兼容。
-    当前 shim 支持: random / sharegpt。
+    当前 shim 支持: random / sharegpt / builtin_mtp_chat。
     """
     name = getattr(args, 'dataset_name', 'random') or 'random'
 
@@ -535,10 +546,12 @@ def get_samples(args: argparse.Namespace, tokenizer) -> list[SampleRequest]:
         return _generate_random_requests(args, tokenizer)
     elif name == 'sharegpt':
         return _load_sharegpt_requests(args, tokenizer)
+    elif name == 'builtin_mtp_chat':
+        return builtin_mtp_chat.build_requests(args, tokenizer, SampleRequest)
     else:
         raise NotImplementedError(
             f"dataset '{name}' 不在 shim 支持范围。\n"
-            f"shim 支持的数据集: random / sharegpt\n"
+            f"shim 支持的数据集: random / sharegpt / builtin_mtp_chat\n"
             f"如需 sonnet/burstgpt/huggingface 等，请安装完整 vllm 包后使用 "
             f"`vllm bench serve`。"
         )
