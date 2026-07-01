@@ -3613,11 +3613,55 @@ def test_builtin_asr_dataset_manifest_is_valid():
     root = Path(__file__).resolve().parents[1] / "assets" / "librispeech_test_clean_256"
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     jsonl = root / "asr_smoke.jsonl"
+    audio_dir = root / "audio"
 
-    assert 192 <= manifest["sample_count"] <= 256
+    import soundfile
+
+    rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()]
+    audio_refs = [row["audio"] for row in rows]
+    audio_paths = [root / audio_ref for audio_ref in audio_refs]
+    root_resolved = root.resolve()
+    referenced_files = {path.resolve() for path in audio_paths}
+    actual_flacs = {path.resolve() for path in audio_dir.glob("*.flac")}
+    missing_flacs = sorted(
+        path.relative_to(root_resolved).as_posix() for path in referenced_files - actual_flacs
+    )
+    extra_flacs = sorted(
+        path.relative_to(root_resolved).as_posix() for path in actual_flacs - referenced_files
+    )
+
+    def duration_bucket(duration_s):
+        if 5.0 <= duration_s < 10.0:
+            return "medium"
+        if 10.0 <= duration_s < 20.0:
+            return "long"
+        if 20.0 <= duration_s <= 30.0:
+            return "xlong"
+        return None
+
+    assert len(rows) == 256
+    assert manifest["sample_count"] == 256
     assert manifest["requested_sample_count"] == 256
     assert 5.0 <= manifest["min_duration_s"] <= manifest["max_duration_s"] <= 30.0
     assert manifest["total_audio_bytes"] <= 104857600
-    assert sum(1 for _ in jsonl.open(encoding="utf-8")) == manifest["sample_count"]
+    assert len(audio_refs) == len(set(audio_refs))
+    assert all(audio_ref.startswith("audio/") for audio_ref in audio_refs)
+    assert all(Path(audio_ref).name == audio_ref.removeprefix("audio/") for audio_ref in audio_refs)
+    assert all(Path(audio_ref).suffix == ".flac" for audio_ref in audio_refs)
+    assert missing_flacs == []
+    assert extra_flacs == []
+
+    durations = [soundfile.info(path).duration for path in audio_paths]
+    duration_buckets = {"medium": 0, "long": 0, "xlong": 0}
+    for duration in durations:
+        bucket = duration_bucket(duration)
+        assert bucket is not None
+        duration_buckets[bucket] += 1
+
+    assert duration_buckets == manifest["duration_buckets"]
+    assert min(durations) == pytest.approx(manifest["min_duration_s"])
+    assert max(durations) == pytest.approx(manifest["max_duration_s"])
+    assert round(sum(durations), 3) == manifest["total_duration_s"]
+    assert sum(path.stat().st_size for path in audio_paths) == manifest["total_audio_bytes"]
     assert (root / "ATTRIBUTION.md").is_file()
     assert (root / "LICENSE.LibriSpeech.txt").is_file()
