@@ -113,6 +113,7 @@ def _jsonable_manifest(
     seed: int,
     source_url: str,
     max_bytes: int,
+    requested_sample_count: int = DEFAULT_TARGET_COUNT,
 ) -> dict:
     total_bytes = sum(sample.size_bytes for sample in samples)
     total_duration = sum(sample.duration_s for sample in samples)
@@ -121,7 +122,7 @@ def _jsonable_manifest(
         "source_url": source_url,
         "license": "CC BY 4.0",
         "seed": seed,
-        "requested_sample_count": DEFAULT_TARGET_COUNT,
+        "requested_sample_count": requested_sample_count,
         "sample_count": len(samples),
         "duration_buckets": bucket_counts(samples),
         "min_duration_s": min((sample.duration_s for sample in samples), default=0.0),
@@ -139,6 +140,7 @@ def write_dataset(
     seed: int,
     source_url: str = DEFAULT_SOURCE_URL,
     max_bytes: int = DEFAULT_MAX_BYTES,
+    requested_sample_count: int = DEFAULT_TARGET_COUNT,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     audio_dir = output_dir / "audio"
@@ -149,6 +151,7 @@ def write_dataset(
         seed=seed,
         source_url=source_url,
         max_bytes=max_bytes,
+        requested_sample_count=requested_sample_count,
     )
     jsonl_path = output_dir / "asr_smoke.jsonl"
     with jsonl_path.open("w", encoding="utf-8") as jsonl:
@@ -246,6 +249,7 @@ def build_dataset(args: argparse.Namespace) -> dict:
             seed=args.seed,
             source_url=args.source_url,
             max_bytes=args.max_bytes,
+            requested_sample_count=args.target_count,
         )
 
 
