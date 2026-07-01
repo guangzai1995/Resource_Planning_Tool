@@ -3174,6 +3174,21 @@ def test_default_vllm_cache_dir_changes_when_image_changes(tmp_path):
     )
 
 
+def test_validate_local_paths_creates_vllm_cache_dirs(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    cache_dir = ab.resolve_vllm_cache_dir(config, case)
+
+    assert cache_dir is not None
+    assert not cache_dir.exists()
+
+    ab.validate_local_paths(config)
+
+    assert cache_dir.is_dir()
+
+
 def test_build_vllm_cache_env_defaults(tmp_path):
     data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
     config = ab.load_config(write_config(tmp_path, data))

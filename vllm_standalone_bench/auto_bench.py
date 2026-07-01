@@ -609,6 +609,21 @@ def build_vllm_cache_env(config: AutoBenchConfig) -> dict[str, str]:
     }
 
 
+def ensure_vllm_cache_dirs(config: AutoBenchConfig) -> None:
+    if not config.run.vllm_cache.enabled:
+        return
+    seen: set[Path] = set()
+    for case in expand_cases(config, run_id="cache-validation"):
+        cache_dir = resolve_vllm_cache_dir(config, case)
+        if cache_dir is None or cache_dir in seen:
+            continue
+        seen.add(cache_dir)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ConfigError(f"cannot create vllm cache dir: {cache_dir}") from exc
+
+
 def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[BenchmarkCase, ...]:
     resolved_run_id = run_id or make_run_id(config.run.name)
     _safe_name(resolved_run_id, "run_id")
@@ -776,6 +791,7 @@ def validate_local_paths(config: AutoBenchConfig) -> None:
             raise ConfigError(f"model path does not exist: {model.host_model_path}")
         if model.host_tokenizer_path is not None and not model.host_tokenizer_path.exists():
             raise ConfigError(f"tokenizer path does not exist: {model.host_tokenizer_path}")
+    ensure_vllm_cache_dirs(config)
 
 
 def build_layout(config: AutoBenchConfig, run_id: str, case: BenchmarkCase) -> CaseLayout:
