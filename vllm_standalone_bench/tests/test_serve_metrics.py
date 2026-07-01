@@ -139,6 +139,16 @@ def test_resolve_warmup_config_concurrency_none_falls_back_even_when_output_set(
     assert ol == 128
 
 
+def test_resolve_connection_limit_allows_warmup_to_exceed_first_profile_parallel():
+    assert serve.resolve_connection_limit(
+        max_concurrency=1, warmup_concurrency=8) == 8
+
+
+def test_warmup_batch_sizes_use_concurrency_as_round_size():
+    assert serve.warmup_batch_sizes(
+        num_warmups=32, warmup_concurrency=8) == [8, 8, 8, 8]
+
+
 def test_fetch_spec_decode_metrics_passes_headers_and_normalizes_url():
     class FakeResponse:
         status = 200

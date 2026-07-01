@@ -571,6 +571,28 @@ def resolve_warmup_config(
     return cc, ol
 
 
+def resolve_connection_limit(
+    *,
+    max_concurrency: int | None,
+    warmup_concurrency: int | None,
+) -> int:
+    return max(max_concurrency or 0, warmup_concurrency or 0)
+
+
+def warmup_batch_sizes(
+    *,
+    num_warmups: int,
+    warmup_concurrency: int | None,
+) -> list[int]:
+    if num_warmups <= 0:
+        return []
+    batch_size = warmup_concurrency or num_warmups
+    return [
+        min(batch_size, num_warmups - start)
+        for start in range(0, num_warmups, batch_size)
+    ]
+
+
 def calculate_metrics(
     input_requests: list[SampleRequest],
     outputs: list[RequestFuncOutput],
@@ -843,9 +865,13 @@ async def benchmark(
     # Reuses connections across requests to reduce TLS handshake overhead.
     # Use ssl_context if provided, otherwise default to True for https URLs
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
+    connector_limit = resolve_connection_limit(
+        max_concurrency=max_concurrency,
+        warmup_concurrency=warmup_concurrency,
+    )
     connector = aiohttp.TCPConnector(
-        limit=max_concurrency or 0,
-        limit_per_host=max_concurrency or 0,
+        limit=connector_limit,
+        limit_per_host=connector_limit,
         ttl_dns_cache=300,
         use_dns_cache=True,
         keepalive_timeout=60,
@@ -923,18 +949,21 @@ async def benchmark(
             if warmup_cc
             else contextlib.nullcontext()
         )
-        warmup_tasks = []
-
         async def warmup_limited_request_func():
             async with warmup_semaphore:
                 return await request_func(
                     request_func_input=test_input, session=session, pbar=warmup_pbar
                 )
 
-        for _ in range(num_warmups):
-            request_task = asyncio.create_task(warmup_limited_request_func())
-            warmup_tasks.append(request_task)
-        _ = await asyncio.gather(*warmup_tasks)
+        for batch_size in warmup_batch_sizes(
+            num_warmups=num_warmups,
+            warmup_concurrency=warmup_cc,
+        ):
+            warmup_tasks = [
+                asyncio.create_task(warmup_limited_request_func())
+                for _ in range(batch_size)
+            ]
+            _ = await asyncio.gather(*warmup_tasks)
 
         if warmup_pbar is not None:
             warmup_pbar.close()
