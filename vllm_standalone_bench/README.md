@@ -214,6 +214,13 @@ auto_bench 停止并删除容器后会丢失。需要反复运行同一套 bench
 应复用 cache。不要让不同硬件或不同 serve 参数共享同一个 `cache_key`。cache 目录不会随
 run 清理，可手动删除 `.cache/vllm_auto_bench/<cache_key>` 释放磁盘空间。
 
+注意可变镜像 tag 的风险：默认 cache key 会包含配置里的镜像引用字符串，但 `latest`、
+`offline` 等 tag 可能在底层镜像变更后仍保持相同引用；显式 `cache_key` 也会绕过默认
+image-ref hash。使用可变 tag 时，建议把 `run.images.vllm` 改成稳定的 image id 或
+digest，或把 image id、digest、构建号纳入 `cache_key`。升级 vLLM 镜像、GPU 架构、
+TP、dtype 或关键 serve args 后，应更换 `cache_key` 或清理对应 cache 目录，避免复用
+不兼容的编译/JIT cache。
+
 ## 使用方法
 
 ### 基本用法（Random 数据集）

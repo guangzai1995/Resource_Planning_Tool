@@ -1502,11 +1502,16 @@ def test_follow_file_tails_from_end(tmp_path, monkeypatch, capsys):
 
 def test_readme_documents_vllm_cache_persistence():
     readme = (Path(ab.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+    readme_lower = readme.lower()
 
     assert "vllm_cache" in readme
     assert "VLLM_CACHE_ROOT" in readme
     assert "DG_JIT_CACHE_DIR" in readme
     assert "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR" in readme
+    assert "image id" in readme_lower
+    assert "digest" in readme_lower
+    assert "cache_key" in readme
+    assert "更换" in readme or "清理" in readme
 
 
 def test_gitignore_ignores_local_cache_dir():
