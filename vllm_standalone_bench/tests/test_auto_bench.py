@@ -309,14 +309,29 @@ def test_external_asr_dataset_requires_datasets_mount(tmp_path):
 def test_external_asr_dataset_mount_is_added(tmp_path):
     data = asr_config(tmp_path)
     host_datasets = tmp_path / "datasets"
-    host_datasets.mkdir()
+    host_dataset_file = host_datasets / "asr" / "custom.jsonl"
+    host_dataset_file.parent.mkdir(parents=True)
+    host_dataset_file.write_text("{}", encoding="utf-8")
     data["mounts"]["datasets"] = str(host_datasets)
     data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/custom.jsonl"
     config = ab.load_config(write_config(tmp_path, data))
+    ab.validate_local_paths(config)
     case = ab.expand_cases(config, run_id="run123")[0]
     cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
     mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
     assert f"{host_datasets.resolve()}:/datasets:ro" in mounts
+
+
+def test_validate_local_paths_rejects_missing_external_asr_dataset_file(tmp_path):
+    data = asr_config(tmp_path)
+    host_datasets = tmp_path / "datasets"
+    host_datasets.mkdir()
+    data["mounts"]["datasets"] = str(host_datasets)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/missing.jsonl"
+    config = ab.load_config(write_config(tmp_path, data))
+
+    with pytest.raises(ab.ConfigError, match="dataset"):
+        ab.validate_local_paths(config)
 
 
 @pytest.mark.parametrize(
@@ -333,6 +348,36 @@ def test_asr_dataset_path_must_be_absolute_and_not_escape(tmp_path, dataset_path
 
     with pytest.raises(ab.ConfigError, match="dataset_path"):
         ab.load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("dataset_name", 123, "dataset_name"),
+        ("language", "", "language"),
+        ("dataset_path", 123, "dataset_path"),
+        ("dataset_path", "", "dataset_path"),
+    ],
+)
+def test_asr_dataset_fields_must_be_non_empty_strings(tmp_path, field, value, match):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0][field] = value
+
+    with pytest.raises(ab.ConfigError, match=match):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_asr_output_lens_can_have_multiple_values_without_cross_product(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["output_lens"] = [64, 128]
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+
+    output_index = cmd.index("--output-lens")
+    assert cmd[output_index + 1:output_index + 3] == ["64", "128"]
+    assert "--cross-product" not in cmd
 
 
 def test_build_bench_command_includes_name_and_ownership_labels(tmp_path):

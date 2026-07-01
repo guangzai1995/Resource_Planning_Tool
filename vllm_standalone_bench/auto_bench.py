@@ -527,19 +527,22 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
         if backend == "openai-audio":
             input_lens = (0,)
             prefix_ratio = 0.0
-            dataset_name = str(profile.get("dataset_name") or "custom_audio")
-            if not dataset_name:
-                raise ConfigError("bench_profile.dataset_name must be a non-empty string")
-            raw_dataset_path = str(
-                profile.get("dataset_path") or BUILTIN_ASR_DATASET_PATH
+            dataset_name = (
+                _string(profile["dataset_name"], "bench_profile.dataset_name")
+                if "dataset_name" in profile else "custom_audio"
+            )
+            raw_dataset_path = (
+                _string(profile["dataset_path"], "bench_profile.dataset_path")
+                if "dataset_path" in profile else BUILTIN_ASR_DATASET_PATH
             )
             dataset_path = _dataset_container_path(
                 raw_dataset_path,
                 "bench_profile.dataset_path",
             )
-            language = str(profile.get("language") or "en")
-            if not language:
-                raise ConfigError("bench_profile.language must be a non-empty string")
+            language = (
+                _string(profile["language"], "bench_profile.language")
+                if "language" in profile else "en"
+            )
         else:
             input_lens = _positive_int_list(profile.get("input_lens", [512]), "input_lens")
             prefix_ratio = _ratio(profile.get("prefix_ratio", 0.0),
@@ -547,7 +550,11 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
             dataset_name = "random"
             dataset_path = None
             language = ""
-        if not cross_product and len(output_lens) not in (1, len(input_lens)):
+        if (
+            backend != "openai-audio"
+            and not cross_product
+            and len(output_lens) not in (1, len(input_lens))
+        ):
             raise ConfigError(
                 "output_lens length must be 1 or match input_lens unless cross_product=true"
             )
@@ -938,6 +945,22 @@ def validate_local_paths(config: AutoBenchConfig) -> None:
         raise ConfigError(f"model root does not exist: {config.mounts.models}")
     if config.mounts.datasets is not None and not config.mounts.datasets.is_dir():
         raise ConfigError(f"datasets root does not exist: {config.mounts.datasets}")
+    for bench in config.bench_profiles:
+        if (
+            bench.backend == "openai-audio"
+            and bench.dataset_path is not None
+            and _is_under_container_path(bench.dataset_path, DATASET_CONTAINER_ROOT)
+        ):
+            if config.mounts.datasets is None:
+                raise ConfigError(
+                    "bench_profile.dataset_path under /datasets requires mounts.datasets"
+                )
+            relative_dataset = PurePosixPath(bench.dataset_path).relative_to(
+                DATASET_CONTAINER_ROOT
+            )
+            host_dataset = config.mounts.datasets.joinpath(*relative_dataset.parts)
+            if not host_dataset.is_file():
+                raise ConfigError(f"dataset file does not exist: {host_dataset}")
     for model in config.models:
         if not model.host_model_path.is_dir():
             raise ConfigError(f"model path does not exist: {model.host_model_path}")
