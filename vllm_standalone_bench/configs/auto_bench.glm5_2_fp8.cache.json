@@ -15,7 +15,7 @@
     "cooldown_sec": 20,
     "vllm_cache": {
       "enabled": true,
-      "root": "../../.cache/vllm_auto_bench",
+      "root": "../.cache/vllm_auto_bench",
       "container_path": "/vllm-cache",
       "set_default_env": true
     }
