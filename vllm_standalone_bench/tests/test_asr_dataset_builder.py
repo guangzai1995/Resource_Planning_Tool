@@ -1,7 +1,9 @@
 import io
 import json
+import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -228,6 +230,49 @@ def test_build_dataset_passes_requested_sample_count_to_writer(monkeypatch, tmp_
     assert captured["requested_sample_count"] == 10
     assert captured["samples"] == [sample]
     assert captured["output_dir"] == tmp_path / "out"
+
+
+def test_scan_librispeech_reads_transcripts_and_audio_metadata(monkeypatch, tmp_path):
+    root = tmp_path / "LibriSpeech" / "test-clean"
+    transcript_dir = root / "1089" / "134686"
+    transcript_dir.mkdir(parents=True)
+    audio_path = transcript_dir / "1089-134686-0001.flac"
+    audio_path.write_bytes(b"fake-audio")
+    (transcript_dir / "1089-134686.trans.txt").write_text(
+        "1089-134686-0001 A LONG ENOUGH TRANSCRIPT\n",
+        encoding="utf-8",
+    )
+
+    seen_audio_paths = []
+    fake_soundfile = SimpleNamespace(
+        info=lambda path: seen_audio_paths.append(path)
+        or SimpleNamespace(duration=12.5)
+    )
+    monkeypatch.setitem(sys.modules, "soundfile", fake_soundfile)
+
+    samples = builder.scan_librispeech(root)
+
+    assert samples == [
+        builder.LibriSpeechSample(
+            speaker_id="1089",
+            chapter_id="134686",
+            utterance_id="1089-134686-0001",
+            audio_path=audio_path,
+            text="A LONG ENOUGH TRANSCRIPT",
+            duration_s=12.5,
+            size_bytes=audio_path.stat().st_size,
+        )
+    ]
+    assert seen_audio_paths == [audio_path]
+
+
+def test_requirements_declares_soundfile_as_runtime_dependency():
+    requirements = (
+        Path(__file__).resolve().parents[1] / "requirements.txt"
+    ).read_text(encoding="utf-8")
+    runtime_requirements, _, _dev_requirements = requirements.partition("# 开发/测试")
+
+    assert "soundfile>=0.12.1" in runtime_requirements
 
 
 def test_extract_archive_rejects_path_traversal_member(tmp_path):
