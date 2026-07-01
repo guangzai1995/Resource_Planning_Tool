@@ -138,13 +138,18 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
         base.skip_tokenizer_init = True
 
     # ── 数据集 ────────────────────────────────────────────────────────────────
-    if our_args.dataset == 'builtin_mtp_chat' and not our_args.tokenizer:
+    dataset = getattr(our_args, 'dataset', 'random')
+    if dataset == 'builtin_mtp_chat' and not our_args.tokenizer:
         raise ValueError('builtin_mtp_chat requires --tokenizer')
-    base.dataset_name = our_args.dataset
-    base.dataset_length_policy = our_args.dataset_length_policy
-    base.dataset_input_len_tolerance = our_args.dataset_input_len_tolerance
-    base.dataset_on_bucket_shortage = our_args.dataset_on_bucket_shortage
-    base.dataset_sampling = our_args.dataset_sampling
+    base.dataset_name = dataset
+    base.dataset_length_policy = getattr(our_args, 'dataset_length_policy', 'exact')
+    base.dataset_input_len_tolerance = getattr(
+        our_args, 'dataset_input_len_tolerance', 0.2
+    )
+    base.dataset_on_bucket_shortage = getattr(
+        our_args, 'dataset_on_bucket_shortage', 'error'
+    )
+    base.dataset_sampling = getattr(our_args, 'dataset_sampling', 'shuffle')
 
     # ── 流量控制：不限速，仅用 max_concurrency 控制并发 ───────────────────────
     base.request_rate = float('inf')
