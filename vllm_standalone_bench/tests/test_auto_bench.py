@@ -209,7 +209,12 @@ def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, c
         "password": "secret-p1-password",
     }
     topology["hosts"]["p2"]["auth"]["key_path"] = "/home/bench/.ssh/id_ed25519"
-    topology["frontend"]["args"] = ["--api-key", "router-secret"]
+    topology["frontend"]["args"] = [
+        "--api-key",
+        "router-secret",
+        "--openai-api-key",
+        "router-openai-secret",
+    ]
     topology["env"] = {
         "OPENAI_API_KEY": "profile-openai-secret",
         "DB_PASSWORD": "profile-db-password",
@@ -219,6 +224,12 @@ def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, c
         "SERVICE_TOKEN": "node-service-token",
         "VISIBLE_NODE_ENV": "node-visible",
     }
+    topology["prefill"][0]["args"] = [
+        "--db-password",
+        "node-db-secret",
+        "--tokenizer-path",
+        "/models/Qwen2.5-1.5B-Instruct",
+    ]
     config = ab.load_config(write_config(tmp_path, data))
 
     result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
@@ -239,16 +250,26 @@ def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, c
     assert "docker network rm" not in out
     assert "secret-p1-password" not in out
     assert "router-secret" not in out
+    assert "router-openai-secret" not in out
+    assert "node-db-secret" not in out
     assert "local-bench-key" not in out
     assert "secret-p1-password" not in rendered_resolved
     assert "router-secret" not in rendered_resolved
+    assert "router-openai-secret" not in rendered_resolved
+    assert "node-db-secret" not in rendered_resolved
     assert "local-bench-key" not in rendered_resolved
     assert "profile-openai-secret" not in rendered_resolved
     assert "profile-db-password" not in rendered_resolved
     assert "node-service-token" not in rendered_resolved
+    assert resolved["models"][0]["tokenizer_path"] == (
+        "/models/Qwen2.5-1.5B-Instruct"
+    )
+    assert resolved["models"][0]["host_tokenizer_path"] != "***"
     assert resolved["run"]["api_key"] == "***"
     assert resolved["topology_profiles"][0]["frontend"]["args"] == [
         "--api-key",
+        "***",
+        "--openai-api-key",
         "***",
     ]
     assert resolved["topology_profiles"][0]["env"]["OPENAI_API_KEY"] == "***"
@@ -262,6 +283,12 @@ def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, c
         "SERVICE_TOKEN": "***",
         "VISIBLE_NODE_ENV": "node-visible",
     }
+    assert resolved["topology_profiles"][0]["prefill"][0]["args"] == [
+        "--db-password",
+        "***",
+        "--tokenizer-path",
+        "/models/Qwen2.5-1.5B-Instruct",
+    ]
     assert (
         resolved["topology_profiles"][0]["hosts"]["p1"]["auth"].get("password")
         == "***"

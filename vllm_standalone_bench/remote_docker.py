@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -12,8 +13,19 @@ from remote_topology import RemoteHost
 
 
 _REDACTED = "***"
-_SENSITIVE_VALUE_FLAGS = {"--password", "--api-key"}
 _SENSITIVE_ENV_TOKENS = ("API_KEY", "PASSWORD", "SECRET", "TOKEN")
+
+
+def _is_sensitive_value_flag(arg: str) -> bool:
+    if not arg.startswith("--"):
+        return False
+    flag = arg[2:].partition("=")[0].lower()
+    if "tokenizer" in flag:
+        return False
+    if "api-key" in flag or "api_key" in flag:
+        return True
+    parts = [part for part in re.split(r"[^a-z0-9]+", flag) if part]
+    return any(part in {"password", "secret", "token"} for part in parts)
 
 
 def build_ssh_base_command(
@@ -53,13 +65,13 @@ def mask_command(
             masked.append(_REDACTED)
             redact_next = False
             continue
-        if arg in _SENSITIVE_VALUE_FLAGS:
-            masked.append(arg)
-            redact_next = True
-            continue
-        if any(arg.startswith(f"{flag}=") for flag in _SENSITIVE_VALUE_FLAGS):
+        if _is_sensitive_value_flag(arg):
             flag, _sep, _value = arg.partition("=")
-            masked.append(f"{flag}={_REDACTED}")
+            if _sep:
+                masked.append(f"{flag}={_REDACTED}")
+            else:
+                masked.append(arg)
+                redact_next = True
             continue
         masked.append(_mask_env_assignment(arg))
 
@@ -195,11 +207,11 @@ def _command_secrets(command: Sequence[str]) -> tuple[str, ...]:
                 secrets.append(arg)
             redact_next = False
             continue
-        if arg in _SENSITIVE_VALUE_FLAGS:
-            redact_next = True
-            continue
-        if any(arg.startswith(f"{flag}=") for flag in _SENSITIVE_VALUE_FLAGS):
-            _flag, _separator, value = arg.partition("=")
+        if _is_sensitive_value_flag(arg):
+            _flag, separator, value = arg.partition("=")
+            if not separator:
+                redact_next = True
+                continue
             if value:
                 secrets.append(value)
             continue

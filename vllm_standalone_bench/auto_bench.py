@@ -2105,9 +2105,12 @@ def config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
 
 def _is_sensitive_dry_run_key(key: object) -> bool:
     normalized = str(key).lower()
+    if normalized == "tokenizer" or normalized.endswith("_path"):
+        return False
     if normalized == "api_key" or normalized.endswith("_api_key"):
         return True
-    return any(token in normalized for token in ("password", "token", "secret"))
+    parts = [part for part in re.split(r"[^a-z0-9]+", normalized) if part]
+    return any(part in {"password", "token", "secret"} for part in parts)
 
 
 def _mask_dry_run_resolved_value(value: Any) -> Any:

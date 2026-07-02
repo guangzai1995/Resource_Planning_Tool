@@ -141,6 +141,13 @@ def test_mask_command_redacts_flags_and_sensitive_env_assignments():
         "--password",
         "password-secret",
         "--password=inline-secret",
+        "--openai-api-key",
+        "openai-secret",
+        "--db-password=database-secret",
+        "--service-token",
+        "service-token-secret",
+        "--tokenizer-path",
+        "/models/tokenizer",
         "OPENAI_API_KEY=env-secret",
         "PASSWORD=password-secret",
         "TOKEN=token-secret",
@@ -152,6 +159,9 @@ def test_mask_command_redacts_flags_and_sensitive_env_assignments():
     assert "equal-api-secret" not in rendered
     assert "password-secret" not in rendered
     assert "inline-secret" not in rendered
+    assert "openai-secret" not in rendered
+    assert "database-secret" not in rendered
+    assert "service-token-secret" not in rendered
     assert "env-secret" not in rendered
     assert "token-secret" not in rendered
     assert "secret-secret" not in rendered
@@ -164,6 +174,13 @@ def test_mask_command_redacts_flags_and_sensitive_env_assignments():
         "--password",
         "***",
         "--password=***",
+        "--openai-api-key",
+        "***",
+        "--db-password=***",
+        "--service-token",
+        "***",
+        "--tokenizer-path",
+        "/models/tokenizer",
         "OPENAI_API_KEY=***",
         "PASSWORD=***",
         "TOKEN=***",
