@@ -60,6 +60,13 @@ class VllmCacheConfig:
 
 
 @dataclass(frozen=True)
+class ResourceMonitorRunConfig:
+    enabled: bool = True
+    backend: str = "nvidia-smi"
+    interval_sec: float = 1.0
+
+
+@dataclass(frozen=True)
 class RunConfig:
     name: str
     results_dir: Path
@@ -78,6 +85,9 @@ class RunConfig:
         default_factory=lambda: types.MappingProxyType({})
     )
     vllm_cache: VllmCacheConfig = field(default_factory=VllmCacheConfig)
+    resource_monitor: ResourceMonitorRunConfig = field(
+        default_factory=ResourceMonitorRunConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -396,6 +406,28 @@ def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
     )
 
 
+def _parse_resource_monitor(run: dict[str, Any]) -> ResourceMonitorRunConfig:
+    raw = run.get("resource_monitor")
+    if raw is None:
+        return ResourceMonitorRunConfig()
+    data = _require_mapping(raw, "run.resource_monitor")
+    enabled = _bool(data.get("enabled", True), "run.resource_monitor.enabled")
+    backend = _string(data.get("backend", "nvidia-smi"), "run.resource_monitor.backend")
+    if backend != "nvidia-smi":
+        raise ConfigError("run.resource_monitor.backend only supports nvidia-smi")
+    interval_sec = _finite_float(
+        data.get("interval_sec", 1.0),
+        "run.resource_monitor.interval_sec",
+    )
+    if interval_sec <= 0:
+        raise ConfigError("run.resource_monitor.interval_sec must be > 0")
+    return ResourceMonitorRunConfig(
+        enabled=enabled,
+        backend=backend,
+        interval_sec=interval_sec,
+    )
+
+
 def _parse_run(data: dict[str, Any], config_dir: Path) -> RunConfig:
     run = _require_mapping(data.get("run"), "run")
     host_port = run.get("host_port")
@@ -422,6 +454,7 @@ def _parse_run(data: dict[str, Any], config_dir: Path) -> RunConfig:
         vllm_image=vllm_image,
         images=images,
         vllm_cache=_parse_vllm_cache(run, config_dir),
+        resource_monitor=_parse_resource_monitor(run),
     )
 
 

@@ -113,6 +113,66 @@ def test_load_config_applies_defaults_and_expands_cases(tmp_path):
     assert cases[0].container_name.startswith("bench-vllm-qwen2_5_1_5b-bf16_default-")
 
 
+def test_resource_monitor_defaults_enabled(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+
+    assert config.run.resource_monitor.enabled is True
+    assert config.run.resource_monitor.backend == "nvidia-smi"
+    assert config.run.resource_monitor.interval_sec == 1.0
+
+
+def test_resource_monitor_can_be_disabled(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {"enabled": False}
+
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert config.run.resource_monitor.enabled is False
+    assert config.run.resource_monitor.backend == "nvidia-smi"
+
+
+def test_resource_monitor_rejects_unsupported_backend(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {
+        "enabled": True,
+        "backend": "dcmi",
+        "interval_sec": 1.0,
+    }
+
+    with pytest.raises(ab.ConfigError, match="resource_monitor.backend"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_resource_monitor_interval_must_be_positive(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {
+        "enabled": True,
+        "backend": "nvidia-smi",
+        "interval_sec": 0,
+    }
+
+    with pytest.raises(ab.ConfigError, match="resource_monitor.interval_sec"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_config_to_dict_includes_resource_monitor(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {
+        "enabled": True,
+        "backend": "nvidia-smi",
+        "interval_sec": 2.5,
+    }
+    config = ab.load_config(write_config(tmp_path, data))
+
+    payload = ab.config_to_dict(config)
+
+    assert payload["run"]["resource_monitor"] == {
+        "enabled": True,
+        "backend": "nvidia-smi",
+        "interval_sec": 2.5,
+    }
+
+
 def test_make_run_id_is_unique_within_same_second():
     first = ab.make_run_id("smoke", now=1782849600.0)
     second = ab.make_run_id("smoke", now=1782849600.0)
