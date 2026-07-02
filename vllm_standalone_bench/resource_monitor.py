@@ -187,9 +187,12 @@ def summarize_samples(
     aggregate["gpu_mem_total_mb"] = _maximum(_sample_values(samples, "gpu_mem_total_mb"))
     aggregate["gpu_mem_used_max_pct"] = _maximum(_sample_values(samples, "gpu_mem_used_pct"))
 
+    system_available = sample_count > 0
+    gpu_available = bool(gpu_details)
     return {
-        "system_available": sample_count > 0,
-        "gpu_available": bool(gpu_details),
+        "available": system_available or gpu_available,
+        "system_available": system_available,
+        "gpu_available": gpu_available,
         "backend": backend,
         "interval_sec": interval_sec,
         "sample_count": sample_count,

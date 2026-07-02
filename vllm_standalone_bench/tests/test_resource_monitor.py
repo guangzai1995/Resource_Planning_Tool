@@ -135,6 +135,7 @@ def test_summarize_samples_computes_avg_p95_and_max():
 
     summary = rm.summarize_samples(samples, gpu_details=gpu_details)
 
+    assert summary["available"] is True
     assert summary["system_available"] is True
     assert summary["gpu_available"] is True
     assert summary["gpus"] == gpu_details
@@ -216,3 +217,12 @@ def test_summarize_samples_computes_avg_p95_and_max():
     assert aggregate["gpu_temp_avg_c"] == pytest.approx(60.0)
     assert aggregate["gpu_temp_p95_c"] == pytest.approx(70.0)
     assert aggregate["gpu_temp_max_c"] == pytest.approx(70.0)
+
+
+def test_summarize_samples_reports_unavailable_when_empty():
+    summary = rm.summarize_samples([], gpu_details=[])
+
+    assert summary["available"] is False
+    assert summary["system_available"] is False
+    assert summary["gpu_available"] is False
+    assert summary["sample_count"] == 0
