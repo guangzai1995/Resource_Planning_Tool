@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
-from remote_topology import TopologyProfile, parse_topology_profiles
+from remote_topology import RemoteAuth, TopologyProfile, parse_topology_profiles
 from resource_monitor import ResourceMonitor, append_summary_to_result_files
 
 logger = logging.getLogger("auto_bench")
@@ -584,6 +584,20 @@ def _parse_topology_profiles(data: dict[str, Any]) -> tuple[TopologyProfile, ...
     )
 
 
+def _validate_serving_profile_names_unique(
+    serve_profiles: tuple[ServeProfile, ...],
+    topology_profiles: tuple[TopologyProfile, ...],
+) -> None:
+    serve_names = {profile.name for profile in serve_profiles}
+    topology_names = {profile.name for profile in topology_profiles}
+    duplicates = sorted(serve_names & topology_names)
+    if duplicates:
+        raise ConfigError(
+            "duplicate profile name across serve_profiles and topology_profiles: "
+            + ", ".join(duplicates)
+        )
+
+
 def _validate_serve_args(args: Sequence[str], path: str) -> None:
     for value in args:
         if value.startswith("speculative-config."):
@@ -735,6 +749,7 @@ def load_config(path: str | Path) -> AutoBenchConfig:
     topology_profiles = _parse_topology_profiles(config_data)
     if not serve_profiles and not topology_profiles:
         raise ConfigError("serve_profiles or topology_profiles must be configured")
+    _validate_serving_profile_names_unique(serve_profiles, topology_profiles)
     bench_profiles = _parse_bench_profiles(config_data)
     config = AutoBenchConfig(
         run,
@@ -2013,6 +2028,14 @@ def load_resume_child_startup_context(results_dir: Path, run_id: str,
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, RemoteAuth):
+        payload = {
+            field_name: _jsonable(getattr(value, field_name))
+            for field_name in value.__dataclass_fields__
+        }
+        if value.password is not None:
+            payload["password"] = "***"
+        return payload
     if isinstance(value, tuple):
         return [_jsonable(item) for item in value]
     if isinstance(value, list):
@@ -2221,7 +2244,13 @@ def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, s
     return grouped
 
 
+def _reject_topology_profiles_until_runner_supported(config: AutoBenchConfig) -> None:
+    if config.topology_profiles:
+        raise ConfigError("topology_profiles are parsed but not runnable yet")
+
+
 def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
+    _reject_topology_profiles_until_runner_supported(config)
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
     network_owned = config.run.create_network
@@ -2253,6 +2282,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                    initial_manifest: Manifest | None = None,
                    cases_to_run: tuple[BenchmarkCase, ...] | None = None) -> int:
     active_runner: Runner = runner or DockerRunner()
+    _reject_topology_profiles_until_runner_supported(config)
     if dry_run:
         return _run_controller_dry_run(config, run_id)
 

@@ -126,6 +126,15 @@ def test_expand_cases_uses_topology_profiles(tmp_path):
     assert case.serving_name == "sglang_pd_2p2d"
 
 
+def test_topology_cases_are_not_runnable_before_topology_runner(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
+
+    with pytest.raises(ab.ConfigError, match="topology_profiles.*not runnable"):
+        ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+
 def test_resource_monitor_defaults_enabled(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
 

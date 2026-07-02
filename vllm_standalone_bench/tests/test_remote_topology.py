@@ -21,22 +21,22 @@ def pd_topology_config(tmp_path):
         "mode": "pd",
         "provider": "ssh_docker",
         "hosts": {
-            "prefill-a": {
+            "p1": {
                 "address": "10.0.0.11",
                 "ssh_user": "bench",
                 "auth": {"type": "key"},
             },
-            "prefill-b": {
+            "p2": {
                 "address": "10.0.0.12",
                 "ssh_user": "bench",
                 "auth": {"type": "key"},
             },
-            "decode-a": {
+            "d1": {
                 "address": "10.0.0.21",
                 "ssh_user": "bench",
                 "auth": {"type": "key"},
             },
-            "decode-b": {
+            "d2": {
                 "address": "10.0.0.22",
                 "ssh_user": "bench",
                 "auth": {"type": "key"},
@@ -48,12 +48,12 @@ def pd_topology_config(tmp_path):
             },
         },
         "prefill": [
-            {"name": "p1", "host": "prefill-a", "port": 30000},
-            {"name": "p2", "host": "prefill-b", "port": 30000},
+            {"name": "p1", "host": "p1", "port": 30000},
+            {"name": "p2", "host": "p2", "port": 30000},
         ],
         "decode": [
-            {"name": "d1", "host": "decode-a", "port": 31000},
-            {"name": "d2", "host": "decode-b", "port": 31000},
+            {"name": "d1", "host": "d1", "port": 31000},
+            {"name": "d2", "host": "d2", "port": 31000},
         ],
         "frontend": {
             "kind": "router",
@@ -80,4 +80,31 @@ def test_topology_profile_rejects_missing_host_reference(tmp_path):
     data["topology_profiles"][0]["prefill"][0]["host"] = "missing"
 
     with pytest.raises(ab.ConfigError, match="missing"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_config_to_dict_masks_inline_password(tmp_path):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "secret-for-review",
+    }
+
+    config = ab.load_config(write_config(tmp_path, data))
+    resolved = ab.config_to_dict(config)
+
+    assert "secret-for-review" not in json.dumps(resolved)
+    assert (
+        resolved["topology_profiles"][0]["hosts"]["p1"]["auth"].get("password")
+        == "***"
+    )
+
+
+def test_topology_profile_name_cannot_duplicate_serve_profile(tmp_path):
+    data = minimal_config(tmp_path)
+    topology = pd_topology_config(tmp_path / "topology")["topology_profiles"][0]
+    topology["name"] = data["serve_profiles"][0]["name"]
+    data["topology_profiles"] = [topology]
+
+    with pytest.raises(ab.ConfigError, match="duplicate|profile name"):
         ab.load_config(write_config(tmp_path, data))
