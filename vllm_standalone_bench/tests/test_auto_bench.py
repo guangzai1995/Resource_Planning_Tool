@@ -1462,9 +1462,36 @@ class ForeignLabelRemoteRunner(FakeRemoteDockerRunner):
                 container_name,
             ],
         ))
+        if container_name not in self.labels:
+            return None
         return {
             "vllm_auto_bench.managed": "true",
             "vllm_auto_bench.run_id": "foreign-run",
+        }
+
+
+class ForeignSameNameRemoteRunner(FakeRemoteDockerRunner):
+    def __init__(self, container_name):
+        super().__init__()
+        self.container_name = container_name
+
+    def inspect_labels(self, host, container_name):
+        self.commands.append((
+            host.name,
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .Config.Labels}}",
+                container_name,
+            ],
+        ))
+        if container_name != self.container_name:
+            return None
+        return {
+            "vllm_auto_bench.managed": "true",
+            "vllm_auto_bench.run_id": "foreign-run",
+            "vllm_auto_bench.role_name": "p1",
         }
 
 
@@ -1555,6 +1582,12 @@ def topology_config_with_image(tmp_path):
     return ab.load_config(write_config(tmp_path, data))
 
 
+def topology_role_command(config, role_name, run_id="run123"):
+    case = ab.expand_cases(config, run_id=run_id)[0]
+    layout = ab.build_layout(config, run_id, case)
+    return case.topology_profile.build_commands(config, case, layout.run_dir)[role_name]
+
+
 def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatch):
     from test_remote_topology import pd_topology_config, write_config
 
@@ -1614,6 +1647,64 @@ def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatc
     assert "inline-secret" not in topology_text
     resolved = json.loads(topology_text)
     assert resolved["topology_profiles"][0]["hosts"]["p1"]["auth"]["password"] == "***"
+
+
+def test_topology_owned_stale_role_removed_before_start(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    role_command = topology_role_command(config, "p1")
+    remote = FakeRemoteDockerRunner()
+    remote.labels[role_command.container_name] = labels_from(list(role_command.argv))
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    inspect_index = command_index(
+        [command for _host, command in remote.commands],
+        [
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .Config.Labels}}",
+            role_command.container_name,
+        ],
+    )
+    rm_index = command_index(
+        [command for _host, command in remote.commands],
+        ["docker", "rm", "-f", role_command.container_name],
+    )
+    run_index = command_index(
+        [command for _host, command in remote.commands],
+        ["docker", "run", "-d"],
+    )
+    assert inspect_index < rm_index < run_index
+
+
+def test_topology_foreign_same_name_role_fails_without_removal(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    role_command = topology_role_command(config, "p1")
+    remote = ForeignSameNameRemoteRunner(role_command.container_name)
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 1
+    assert not any(
+        cmd[1][:2] == ["docker", "stop"] and cmd[1][2] == role_command.container_name
+        for cmd in remote.commands
+    )
+    assert not any(
+        cmd[1][:3] == ["docker", "rm", "-f"] and cmd[1][3] == role_command.container_name
+        for cmd in remote.commands
+    )
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["cases"][0]["status"] == "failed"
 
 
 def test_topology_run_does_not_start_local_resource_monitor(tmp_path, monkeypatch):

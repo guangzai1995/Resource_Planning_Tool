@@ -1818,8 +1818,8 @@ def _role_start_order(case: BenchmarkCase,
     ordered_set = {command.role_name for command in ordered}
     ordered.extend(
         command
-        for name, command in role_commands.items()
-        if name not in ordered_set
+        for command in role_commands.values()
+        if command.role_name not in ordered_set
     )
     return ordered
 
@@ -2083,6 +2083,29 @@ def cleanup_topology_roles_best_effort(remote_runner: RemoteDockerRunner,
                     file=sys.stderr,
                 )
     return stop_requested
+
+
+def remove_existing_topology_role_if_owned(remote_runner: RemoteDockerRunner,
+                                           case: BenchmarkCase,
+                                           role_command: RoleCommand,
+                                           run_dir: Path) -> bool:
+    host = _topology_role_host(case, role_command)
+    labels = remote_runner.inspect_labels(host, role_command.container_name)
+    if labels is None:
+        return True
+    if not topology_role_labels_match(labels, case, role_command, run_dir):
+        return False
+    result = remote_runner.run(
+        host,
+        ["docker", "rm", "-f", role_command.container_name],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "failed to remove stale topology role container: "
+            f"{role_command.container_name} ({result.returncode})"
+        )
+    return True
 
 
 def stop_and_remove_container(runner: Runner, container_name: str, dry_run: bool) -> None:
@@ -2742,6 +2765,16 @@ def run_topology_group(config: AutoBenchConfig, run_id: str,
         ordered_roles = _role_start_order(serve_case, role_commands)
         for role_command in ordered_roles:
             host = _topology_role_host(serve_case, role_command)
+            if not remove_existing_topology_role_if_owned(
+                remote_runner,
+                serve_case,
+                role_command,
+                serve_layout.run_dir,
+            ):
+                raise RuntimeError(
+                    "topology role container exists but is not owned by this run: "
+                    f"{role_command.container_name}"
+                )
             start_result = remote_runner.run(
                 host,
                 list(role_command.argv),
