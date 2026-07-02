@@ -1574,6 +1574,7 @@ def is_process_running(pid: int) -> bool:
 
 
 RUN_LOCK_FILE = ".run.lock"
+RESUME_STARTUP_STATE_FILE = ".resume-startup-state.json"
 TERMINAL_RUN_STATUSES = frozenset({
     "completed",
     "completed_with_failures",
@@ -1860,11 +1861,10 @@ def _config_with_results_dir(config: AutoBenchConfig, results_dir: Path) -> Auto
     return replace(config, run=replace(config.run, results_dir=results_dir))
 
 
-def load_resume_context(results_dir: Path, run_id: str) -> ResumeContext:
-    _safe_name(run_id, "run_id")
+def _resume_context_from_state(results_dir: Path, run_id: str,
+                               state: dict[str, Any]) -> ResumeContext:
     resolved_results_dir = Path(results_dir)
     run_dir = resolved_results_dir / run_id
-    state = _read_json_object(run_dir / "state.json", "state")
     status = state.get("status")
     if state.get("run_id") not in (None, run_id):
         raise ConfigError(f"state run_id mismatch: expected {run_id}, got {state.get('run_id')}")
@@ -1894,6 +1894,30 @@ def load_resume_context(results_dir: Path, run_id: str) -> ResumeContext:
         pending_cases=pending,
         unknown_manifest_cases=tuple(unknown),
     )
+
+
+def load_resume_context(results_dir: Path, run_id: str) -> ResumeContext:
+    _safe_name(run_id, "run_id")
+    run_dir = Path(results_dir) / run_id
+    state = _read_json_object(run_dir / "state.json", "state")
+    return _resume_context_from_state(results_dir, run_id, state)
+
+
+def load_resume_child_startup_context(results_dir: Path, run_id: str,
+                                      lock_token: str | None) -> ResumeContext:
+    _safe_name(run_id, "run_id")
+    run_dir = Path(results_dir) / run_id
+    try:
+        state = _read_json_object(run_dir / "state.json", "state")
+    except ConfigError:
+        return load_resume_context(results_dir, run_id)
+    if state.get("status") == "starting" and run_lock_token_matches(run_dir, lock_token):
+        startup_state = _read_json_object(
+            run_dir / RESUME_STARTUP_STATE_FILE,
+            "resume startup state",
+        )
+        return _resume_context_from_state(results_dir, run_id, startup_state)
+    return load_resume_context(results_dir, run_id)
 
 
 def _jsonable(value: Any) -> Any:
@@ -2514,6 +2538,13 @@ def start_detached(config_path: Path | None, config: AutoBenchConfig, run_id: st
     except (ConfigError, OSError) as exc:
         return fail_start(str(exc))
 
+    if command_name == "resume":
+        try:
+            startup_state = _read_json_object(run_dir / "state.json", "state")
+            write_json_atomic(run_dir / RESUME_STARTUP_STATE_FILE, startup_state)
+        except (ConfigError, OSError) as exc:
+            return fail_start(str(exc))
+
     try:
         write_state(run_dir, _detached_state(run_id, "starting", total))
     except OSError as exc:
@@ -2803,7 +2834,7 @@ def is_controller_process(pid: int, run_id: str,
 def resume_run(results_dir: Path, run_id: str, *,
                runner: Runner | None = None,
                lock_token: str | None = None) -> int:
-    context = load_resume_context(results_dir, run_id)
+    context = load_resume_child_startup_context(results_dir, run_id, lock_token)
     if context.unknown_manifest_cases:
         print(
             f"warning: ignoring manifest cases not in resolved config: {context.unknown_manifest_cases}",

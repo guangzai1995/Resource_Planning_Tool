@@ -920,6 +920,51 @@ def test_main_resume_detach_starts_resume_child(tmp_path, monkeypatch):
     assert controller["command"][2] == "resume"
 
 
+def test_main_resume_detach_child_uses_saved_resume_state_after_parent_starting(
+    tmp_path,
+    monkeypatch,
+):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    child_exits = []
+    controller_calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_run_controller(config_arg, run_id, runner=None, dry_run=False, lock_token=None,
+                            initial_manifest=None, cases_to_run=None):
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        controller_calls.append((
+            run_id,
+            tuple(case.bench_profile.name for case in cases_to_run),
+            tuple(row["bench_profile"] for row in initial_manifest.cases),
+            state["status"],
+        ))
+        return 0
+
+    def fake_popen(command, **kwargs):
+        child_exits.append(ab.main(command[2:]))
+        return FakeProcess()
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: None, raising=False)
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(ab, "run_controller", fake_run_controller)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(tmp_path / "results"),
+        "--run-id", "run123",
+        "--detach",
+    ])
+
+    assert exit_code == 0
+    assert child_exits == [0]
+    assert controller_calls == [("run123", ("smoke2",), ("smoke",), "starting")]
+
+
 def test_main_resume_empty_pending_does_not_start_controller(tmp_path, monkeypatch, capsys):
     config, run_dir = write_resolved_config_for_resume(tmp_path)
     cases = ab.expand_cases(config, run_id="run123")
