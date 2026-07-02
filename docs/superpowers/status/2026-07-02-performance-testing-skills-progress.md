@@ -48,6 +48,14 @@ The package must include runnable scripts that Codex/Claude-style tools can exec
 - `080e604` feat: send portable benchmark HTTP requests
 - `4423159` fix: harden portable benchmark HTTP results
 - `41ee1e4` feat: add manual interface testing CLI
+- `ac59863` fix: validate manual timeout values
+- `e17a07f` test: cover manual CLI failure responses
+- `6f6eed7` feat: add automated performance testing CLI
+- `6fe8ba2` fix: harden automated benchmark failures
+- `41242bd` test: validate automated CLI report outputs
+- `fd2f616` test: harden CLI E2E checks
+- `8e73890` docs: document portable performance testing skills
+- `7b71a02` docs: clarify automated benchmark thresholds
 
 Note: Task 5 has two implementation commits because a pre-compaction worker and a restarted worker both completed. The final state was reviewed after `4423159` and passed.
 
@@ -89,56 +97,54 @@ Note: Task 5 has two implementation commits because a pre-compaction worker and 
    - Spec review after fix: pass.
    - Quality review after fix: pass.
 
-6. Task 6 manual interface testing CLI and `run_manual.sh`: implementation complete, review pending.
-   - Commit: `41ee1e4`.
-   - Changed files:
-     - `performance-testing-skills/scripts/perf_manual.py`
-     - `performance-testing-skills/scripts/run_manual.sh`
-     - `performance-testing-skills/tests/test_cli_dry_run.py`
-   - Worker tests:
-     - `pytest -q tests/test_cli_dry_run.py` first red: `3 failed`.
-     - Same command after implementation: `3 passed`.
-     - `pytest -q tests/test_cli_dry_run.py tests/test_clients.py` -> `12 passed`.
-     - `git diff --check` -> passed.
-   - Next action: run Task 6 spec review and quality review before marking complete.
+6. Task 6 manual interface testing CLI and `run_manual.sh`: complete.
+   - Commits: `41ee1e4`, `ac59863`, `e17a07f`.
+   - Fixes after review:
+     - Reject non-finite timeout values such as `nan` and `inf`.
+     - Cover non-dry-run local failure response saving.
+     - Cover `--save-response` parent directory creation.
+   - Tests after fixes: `tests/test_cli_dry_run.py tests/test_clients.py` -> `16 passed`.
+   - Spec review after fixes: pass.
+   - Quality review after fixes: pass.
 
-7. Task 7 automated performance CLI and `run_auto.sh`: pending.
+7. Task 7 automated performance CLI and `run_auto.sh`: complete.
+   - Commits: `6f6eed7`, `6fe8ba2`.
+   - Fixes after review:
+     - All-failed benchmark runs return non-zero even without explicit thresholds.
+     - Duration mode submits an initial batch and cannot succeed with zero requests.
+     - Relative output directories resolve consistently under the package root.
+   - Tests after fixes: `tests/test_cli_dry_run.py tests/test_clients.py tests/test_metrics_and_reporters.py` -> `37 passed`.
+   - Spec review after fixes: pass.
+   - Quality review after fixes: pass.
 
-8. Task 8 CLI end-to-end report validation: pending.
+8. Task 8 CLI end-to-end report validation: complete.
+   - Commits: `41242bd`, `fd2f616`.
+   - Added local HTTPServer E2E coverage for `perf_auto.py`, report files, metrics rows, request rows, and empty errors.
+   - Hardened subprocess test timeouts and report assertions.
+   - Tests after fixes: `tests/test_cli_dry_run.py` -> `24 passed`.
+   - Spec review: pass.
+   - Quality review after fixes: pass.
 
-9. Task 9 README and skill-specific usage docs: pending.
+9. Task 9 README and skill-specific usage docs: complete.
+   - Commits: `8e73890`, `7b71a02`.
+   - README and both skills now document portable usage, protocols, configs, datasets, commands, reports, threshold semantics, and safety rules.
+   - Removed stale `--mode smoke` guidance and clarified p90 threshold versus `--fail-fast` behavior.
+   - Tests after fixes: `tests/test_package_structure.py tests/test_cli_dry_run.py` -> `33 passed`.
+   - Spec review after fixes: pass.
+   - Quality review after fixes: pass.
 
-10. Task 10 final verification and merge preparation: pending.
+10. Task 10 final verification and merge preparation: in progress.
+   - Full package tests with local socket permission: `PYTHONPATH=. python -B -m pytest tests -q -p no:cacheprovider` -> `55 passed`.
+   - Non-socket package tests: `28 passed`.
+   - Portable copy validation in `/tmp/performance-testing-skills-portable.eU3Q85/performance-testing-skills`: non-socket tests `28 passed`, `run_manual.sh --dry-run` passed, `run_auto.sh --dry-run` passed.
+   - `git diff --check` passed.
+   - Secret scan found no real API keys or Bearer tokens in `performance-testing-skills/`.
 
 ## Continue From Here
 
-First confirm the worktree is clean:
-
-```bash
-cd /work/development-code/Resource_Planning_Tool/.worktrees/performance-testing-skills-design
-git status --short --branch
-```
-
-Then review Task 6:
-
-- Spec review scope:
-  - `performance-testing-skills/scripts/perf_manual.py`
-  - `performance-testing-skills/scripts/run_manual.sh`
-  - `performance-testing-skills/tests/test_cli_dry_run.py`
-- Task 6 acceptance:
-  - `perf_manual.py` supports `--config`, `--mode request|curl`, `--input`, `--audio-file`, `--request-count`, `--print-curl`, `--save-response`, `--dry-run`, `--timeout-seconds`.
-  - Dry-run prints `DRY RUN`, protocol/method/url, and curl.
-  - `--mode curl` only prints curl and does not send a request.
-  - Non-dry request mode calls `send_request()` in a loop, prints per-request status fields, saves optional JSON response, and exits nonzero on failure.
-  - `scripts/run_manual.sh` is executable and forwards args.
-  - Tests use subprocess rather than direct import.
-
-If Task 6 reviews pass, mark Task 6 complete and proceed to Task 7. If a review fails, send the findings back to the Task 6 implementation worker if still open, or fix locally in the same write scope and commit a follow-up.
+Continue with final code review, then use the finishing workflow to merge or keep the branch for PR.
 
 ## Remaining Plan Summary
 
-- Task 7: implement automated CLI `scripts/perf_auto.py` and `scripts/run_auto.sh` with dry-run concurrency plan, epochs, duration, thresholds, and ThreadPoolExecutor execution.
-- Task 8: add local HTTP end-to-end report validation for CLI outputs, including report files and smoke failure behavior.
-- Task 9: write portable package README and strengthen both skill `SKILL.md` files with concrete usage and guardrails.
-- Task 10: run final verification, copy package to `/tmp` and validate portability, scan for secrets/host-specific addresses, request final code review, then use finishing workflow for merge/cleanup.
-
+- Run final code review over `performance-testing-skills/` and the status/spec/plan docs.
+- Use finishing workflow for merge/cleanup.
