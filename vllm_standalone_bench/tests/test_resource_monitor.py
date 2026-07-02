@@ -581,6 +581,71 @@ def test_resource_monitor_stop_reraises_background_passthrough_exception(tmp_pat
         monitor.stop()
 
 
+def test_resource_monitor_stop_reraises_late_background_passthrough_exception(
+    tmp_path,
+    monkeypatch,
+):
+    class PassthroughError(Exception):
+        pass
+
+    sample_attempts = 0
+    background_reader_entered = threading.Event()
+    allow_background_error = threading.Event()
+
+    def proc_stat():
+        nonlocal sample_attempts
+        sample_attempts += 1
+        if sample_attempts == 2:
+            background_reader_entered.set()
+            assert allow_background_error.wait(timeout=1.0)
+            raise PassthroughError("late background stop requested")
+        return "cpu  100 0 50 850 0 0 0 0 0 0\n"
+
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=0.01,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=proc_stat,
+            meminfo=lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+            net_dev=lambda: "",
+            diskstats=lambda: "",
+            nvidia_smi=lambda: "",
+        ),
+        passthrough_exceptions=(PassthroughError,),
+    )
+
+    monitor.start()
+    assert background_reader_entered.wait(timeout=1.0)
+
+    original_join = monitor._thread.join
+    join_calls = 0
+
+    def fake_join(timeout=None):
+        nonlocal join_calls
+        join_calls += 1
+        if join_calls == 1:
+            return
+        allow_background_error.set()
+        original_join(timeout=1.0)
+
+    original_sample_once = monitor.sample_once
+
+    def sample_once(*args, **kwargs):
+        if threading.current_thread() is not monitor._thread:
+            allow_background_error.set()
+        return original_sample_once(*args, **kwargs)
+
+    monkeypatch.setattr(monitor._thread, "join", fake_join)
+    monkeypatch.setattr(monitor, "sample_once", sample_once)
+
+    with pytest.raises(PassthroughError, match="late background stop requested"):
+        monitor.stop()
+
+    assert join_calls >= 2
+
+
 def test_parse_diskstats_and_compute_rates():
     before = "   8       0 sda 10 0 100 0 5 0 20 0 0 0 0 0 0 0 0 0 0\n"
     after = "   8       0 sda 20 0 4196 0 7 0 2068 0 0 0 0 0 0 0 0 0 0\n"

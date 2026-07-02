@@ -253,25 +253,44 @@ class ResourceMonitor:
             raise exc
         self.error_count += 1
 
+    def _raise_thread_exception(self):
+        if self._thread_exception is not None:
+            raise self._thread_exception
+
+    def _snapshot_state(self, *, block=True):
+        acquired = self._lock.acquire(blocking=block)
+        if not acquired:
+            return list(self.samples), list(self.gpu_samples), self.error_count
+        try:
+            return list(self.samples), list(self.gpu_samples), self.error_count
+        finally:
+            self._lock.release()
+
     def stop(self):
         if not self.enabled:
             return {"available": False, "sample_count": 0, "aggregate": {}}
 
         was_started = self._thread is not None
         self._stop.set()
+        thread_alive = False
         if self._thread is not None:
-            self._thread.join(timeout=max(self.interval_sec, 1.0) + 1.0)
+            join_timeout = max(self.interval_sec, 1.0) + 1.0
+            self._thread.join(timeout=join_timeout)
+            self._raise_thread_exception()
+            thread_alive = self._thread.is_alive()
+            if thread_alive:
+                self._thread.join(timeout=join_timeout)
+                self._raise_thread_exception()
+                thread_alive = self._thread.is_alive()
 
-        if self._thread_exception is not None:
-            raise self._thread_exception
-
-        if was_started and self._started_at is not None:
+        if was_started and self._started_at is not None and not thread_alive:
             self.sample_once()
+            self._raise_thread_exception()
 
-        with self._lock:
-            samples = list(self.samples)
-            gpu_samples = list(self.gpu_samples)
-            error_count = self.error_count
+        samples, gpu_samples, error_count = self._snapshot_state(
+            block=not thread_alive,
+        )
+        self._raise_thread_exception()
 
         summary = summarize_samples(
             samples,
