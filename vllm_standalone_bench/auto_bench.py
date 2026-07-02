@@ -588,13 +588,14 @@ def _validate_serving_profile_names_unique(
     serve_profiles: tuple[ServeProfile, ...],
     topology_profiles: tuple[TopologyProfile, ...],
 ) -> None:
-    serve_names = {profile.name for profile in serve_profiles}
-    topology_names = {profile.name for profile in topology_profiles}
-    duplicates = sorted(serve_names & topology_names)
+    all_names = [profile.name for profile in serve_profiles]
+    all_names.extend(profile.name for profile in topology_profiles)
+    duplicates = sorted({
+        name for name in all_names if all_names.count(name) > 1
+    })
     if duplicates:
         raise ConfigError(
-            "duplicate profile name across serve_profiles and topology_profiles: "
-            + ", ".join(duplicates)
+            "duplicate serving profile name: " + ", ".join(duplicates)
         )
 
 
@@ -813,12 +814,19 @@ def make_bench_container_name(case: BenchmarkCase) -> str:
     )
 
 
+def require_legacy_case(case: BenchmarkCase) -> ServeProfile:
+    if case.serve_profile is None or case.container_name is None:
+        raise ConfigError("legacy serve profile case required")
+    return case.serve_profile
+
+
 def _short_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
 def vllm_cache_key_inputs(config: AutoBenchConfig,
                           case: BenchmarkCase) -> dict[str, Any]:
+    serve_profile = require_legacy_case(case)
     return {
         "vllm_image_ref": config.run.images["vllm"],
         "model": {
@@ -828,9 +836,9 @@ def vllm_cache_key_inputs(config: AutoBenchConfig,
             "served_model_name": case.model.served_model_name,
         },
         "serve_profile": {
-            "name": case.serve_profile.name,
-            "gpus": case.serve_profile.gpus,
-            "args": list(case.serve_profile.args),
+            "name": serve_profile.name,
+            "gpus": serve_profile.gpus,
+            "args": list(serve_profile.args),
         },
     }
 
@@ -846,28 +854,27 @@ def _short_json_fingerprint(data: Mapping[str, Any]) -> str:
 
 
 def default_vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str:
+    serve_profile = require_legacy_case(case)
     fingerprint = _short_json_fingerprint(vllm_cache_key_inputs(config, case))
-    return f"{case.model.name}__{case.serve_profile.name}__{fingerprint}"
+    return f"{case.model.name}__{serve_profile.name}__{fingerprint}"
 
 
 def vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
-    if (
-        case.serve_profile is None
-        or case.serve_profile.engine != "vllm"
-        or not config.run.vllm_cache.enabled
-    ):
+    if not config.run.vllm_cache.enabled:
         return None
-    return case.serve_profile.cache_key or default_vllm_cache_key(config, case)
+    serve_profile = require_legacy_case(case)
+    if serve_profile.engine != "vllm":
+        return None
+    return serve_profile.cache_key or default_vllm_cache_key(config, case)
 
 
 def vllm_cache_key_source(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
-    if (
-        case.serve_profile is None
-        or case.serve_profile.engine != "vllm"
-        or not config.run.vllm_cache.enabled
-    ):
+    if not config.run.vllm_cache.enabled:
         return None
-    return "explicit" if case.serve_profile.cache_key else "default"
+    serve_profile = require_legacy_case(case)
+    if serve_profile.engine != "vllm":
+        return None
+    return "explicit" if serve_profile.cache_key else "default"
 
 
 def resolve_vllm_cache_dir(config: AutoBenchConfig, case: BenchmarkCase) -> Path | None:
@@ -955,6 +962,7 @@ def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[Be
 
 def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                            run_dir: Path) -> list[str]:
+    serve_profile = require_legacy_case(case)
     resolved_run_dir = Path(run_dir).resolve()
     cmd = [
         "docker", "run", "-d",
@@ -963,8 +971,8 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
-        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
-        "--gpus", case.serve_profile.gpus,
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
+        "--gpus", serve_profile.gpus,
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
     ]
@@ -992,20 +1000,22 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
     ])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
-    cmd.extend(case.serve_profile.args)
+    cmd.extend(serve_profile.args)
     return cmd
 
 
 def build_serve_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                             run_dir: Path) -> list[str]:
     """按 serve_profile.engine 分派服务启动命令。args 原样透传，不做参数翻译。"""
-    if case.serve_profile.engine == "sglang":
+    serve_profile = require_legacy_case(case)
+    if serve_profile.engine == "sglang":
         return _build_sglang_run_command(config, case, run_dir)
     return build_vllm_run_command(config, case, run_dir)
 
 
 def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                               run_dir: Path) -> list[str]:
+    serve_profile = require_legacy_case(case)
     resolved_run_dir = Path(run_dir).resolve()
     cmd = [
         "docker", "run", "-d",
@@ -1014,8 +1024,8 @@ def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
-        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
-        "--gpus", case.serve_profile.gpus,
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
+        "--gpus", serve_profile.gpus,
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
         "--entrypoint", "python3",
@@ -1034,7 +1044,7 @@ def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
     ])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
-    cmd.extend(case.serve_profile.args)
+    cmd.extend(serve_profile.args)
     return cmd
 
 
@@ -1045,6 +1055,7 @@ def _append_many(cmd: list[str], flag: str, values: tuple[int, ...]) -> None:
 
 def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                             bench_dir: Path) -> list[str]:
+    serve_profile = require_legacy_case(case)
     bench = case.bench_profile
     resolved_bench_dir = Path(bench_dir).resolve()
     resolved_run_dir = resolved_bench_dir.parents[2]
@@ -1055,7 +1066,7 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
-        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
         "--label", f"{CONTAINER_BENCH_PROFILE_LABEL}={case.bench_profile.name}",
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
@@ -1367,37 +1378,42 @@ def vllm_container_labels_match(labels: dict[str, str],
 def bench_container_labels_match(labels: dict[str, str],
                                  case: BenchmarkCase,
                                  run_dir: Path) -> bool:
+    serve_profile = require_legacy_case(case)
     return (
         vllm_container_labels_match(labels, case, run_dir)
         and labels.get(CONTAINER_MODEL_LABEL) == case.model.name
-        and labels.get(CONTAINER_SERVE_PROFILE_LABEL) == case.serve_profile.name
+        and labels.get(CONTAINER_SERVE_PROFILE_LABEL) == serve_profile.name
         and labels.get(CONTAINER_BENCH_PROFILE_LABEL) == case.bench_profile.name
     )
 
 
 def remove_existing_vllm_container_if_owned(runner: Runner, case: BenchmarkCase,
                                             run_dir: Path) -> None:
-    labels = inspect_container_labels(runner, case.container_name)
+    require_legacy_case(case)
+    container_name = case.container_name
+    labels = inspect_container_labels(runner, container_name)
     if labels is None:
         return
     if not vllm_container_labels_match(labels, case, run_dir):
         raise RuntimeError(
-            f"vLLM container exists but is not owned by this run: {case.container_name}"
+            f"vLLM container exists but is not owned by this run: {container_name}"
         )
-    runner.run(["docker", "rm", "-f", case.container_name], check=False)
+    runner.run(["docker", "rm", "-f", container_name], check=False)
 
 
 def stop_and_remove_vllm_container_if_owned(runner: Runner, case: BenchmarkCase,
                                            run_dir: Path, dry_run: bool) -> None:
+    require_legacy_case(case)
+    container_name = case.container_name
     if dry_run:
-        stop_and_remove_container(runner, case.container_name, dry_run=True)
+        stop_and_remove_container(runner, container_name, dry_run=True)
         return
-    labels = inspect_container_labels(runner, case.container_name)
+    labels = inspect_container_labels(runner, container_name)
     if labels is None:
         return
     if not vllm_container_labels_match(labels, case, run_dir):
         return
-    stop_and_remove_container(runner, case.container_name, dry_run=False)
+    stop_and_remove_container(runner, container_name, dry_run=False)
 
 
 def remove_existing_bench_container_if_owned(runner: Runner, case: BenchmarkCase,
@@ -1541,11 +1557,13 @@ sys.exit(1)
 
 
 def make_ready_probe_container_name(case: BenchmarkCase) -> str:
-    return f"bench-ready-{case.model.name}-{case.serve_profile.name}-{case.run_id}"
+    serve_profile = require_legacy_case(case)
+    return f"bench-ready-{case.model.name}-{serve_profile.name}-{case.run_id}"
 
 
 def build_ready_probe_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                                   run_dir: Path) -> list[str]:
+    require_legacy_case(case)
     resolved_run_dir = Path(run_dir).resolve()
     url = f"http://{case.container_name}:{config.run.container_port}/v1/models"
     return [
@@ -1613,13 +1631,15 @@ def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
 
 def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
                         case: BenchmarkCase, layout: CaseLayout) -> None:
+    require_legacy_case(case)
+    container_name = case.container_name
     layout.serve_dir.mkdir(parents=True, exist_ok=True)
-    logs = runner.run(["docker", "logs", "--timestamps", case.container_name], check=False)
+    logs = runner.run(["docker", "logs", "--timestamps", container_name], check=False)
     (layout.serve_dir / "vllm.log").write_text(
         logs.stdout + logs.stderr,
         encoding="utf-8",
     )
-    inspect = runner.run(["docker", "inspect", case.container_name], check=False)
+    inspect = runner.run(["docker", "inspect", container_name], check=False)
     (layout.serve_dir / "docker.inspect.json").write_text(inspect.stdout, encoding="utf-8")
     (layout.serve_dir / "serve_command.txt").write_text(
         " ".join(build_serve_run_command(config, case, layout.run_dir)),
@@ -2682,6 +2702,7 @@ def terminate_detached_child(process: Any, timeout_sec: float = 5.0) -> bool:
 def start_detached(config_path: Path | None, config: AutoBenchConfig, run_id: str,
                    command_name: str = "run") -> int:
     _safe_name(run_id, "run_id")
+    _reject_topology_profiles_until_runner_supported(config)
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
     if reject_active_run(run_dir):

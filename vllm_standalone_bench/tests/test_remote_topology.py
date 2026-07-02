@@ -108,3 +108,54 @@ def test_topology_profile_name_cannot_duplicate_serve_profile(tmp_path):
 
     with pytest.raises(ab.ConfigError, match="duplicate|profile name"):
         ab.load_config(write_config(tmp_path, data))
+
+
+def test_topology_profile_names_must_be_unique(tmp_path):
+    data = pd_topology_config(tmp_path)
+    duplicate = dict(data["topology_profiles"][0])
+    data["topology_profiles"].append(duplicate)
+
+    with pytest.raises(ab.ConfigError, match="duplicate"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_serve_and_topology_profiles_with_distinct_names_parse(tmp_path):
+    data = minimal_config(tmp_path)
+    data["topology_profiles"] = pd_topology_config(tmp_path / "topology")[
+        "topology_profiles"
+    ]
+
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert [profile.name for profile in config.serve_profiles] == ["bf16_default"]
+    assert [profile.name for profile in config.topology_profiles] == [
+        "sglang_pd_2p2d"
+    ]
+
+
+def test_password_env_requires_existing_env(tmp_path, monkeypatch):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["hosts"]["p1"]["auth"] = {
+        "type": "password_env",
+        "env": "MISSING_PD_PASSWORD",
+    }
+    monkeypatch.delenv("MISSING_PD_PASSWORD", raising=False)
+
+    with pytest.raises(ab.ConfigError, match="MISSING_PD_PASSWORD"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_password_env_resolved_config_keeps_env_name_not_value(tmp_path, monkeypatch):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["hosts"]["p1"]["auth"] = {
+        "type": "password_env",
+        "env": "P1_PASSWORD",
+    }
+    monkeypatch.setenv("P1_PASSWORD", "secret-env-value")
+
+    config = ab.load_config(write_config(tmp_path, data))
+    resolved = ab.config_to_dict(config)
+    rendered = json.dumps(resolved)
+
+    assert "secret-env-value" not in rendered
+    assert "P1_PASSWORD" in rendered

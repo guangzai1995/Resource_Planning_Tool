@@ -135,6 +135,32 @@ def test_topology_cases_are_not_runnable_before_topology_runner(tmp_path):
         ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
 
 
+def test_start_detached_rejects_topology_profiles_before_lock(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    config_path = write_config(tmp_path, pd_topology_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+
+    with pytest.raises(ab.ConfigError, match="topology_profiles.*not runnable"):
+        ab.start_detached(config_path, config, "run123")
+
+    assert not (run_dir / "state.json").exists()
+    assert not (run_dir / ".run.lock").exists()
+
+
+def test_legacy_command_helpers_reject_topology_case(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    with pytest.raises(ab.ConfigError, match="legacy"):
+        ab.build_serve_run_command(config, case, tmp_path / "run")
+    with pytest.raises(ab.ConfigError, match="legacy"):
+        ab.build_bench_run_command(config, case, tmp_path / "bench")
+
+
 def test_resource_monitor_defaults_enabled(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
 
