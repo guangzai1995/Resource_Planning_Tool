@@ -158,11 +158,23 @@ def _dataset_path(config: dict[str, Any]) -> str:
     return "(inline default sample)"
 
 
-def _print_dry_run(args: argparse.Namespace, config: dict[str, Any], config_path: Path) -> None:
+def _resolve_output_dir(path: str | Path) -> Path:
+    output_path = Path(path)
+    if output_path.is_absolute():
+        return output_path
+    return PACKAGE_ROOT / output_path
+
+
+def _print_dry_run(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    config_path: Path,
+    output_dir: Path,
+) -> None:
     print("DRY RUN")
     print(f"config path: {config_path}")
     print(f"dataset path: {_dataset_path(config)}")
-    print(f"output dir: {args.output_dir}")
+    print(f"output dir: {output_dir}")
     print(f"timeout_seconds={args.timeout_seconds:g}")
     if args.duration_seconds is not None:
         print(f"duration_seconds={args.duration_seconds:g}")
@@ -234,7 +246,7 @@ def _run_for_duration(
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures: set[concurrent.futures.Future[dict[str, Any]]] = set()
 
-        while time.perf_counter() < deadline and len(futures) < concurrency:
+        for _ in range(concurrency):
             futures.add(
                 executor.submit(
                     _run_one_request,
@@ -283,6 +295,10 @@ def _format_summary(metrics: dict[str, Any]) -> str:
 
 def _thresholds_violated(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
     violations: list[str] = []
+    if metrics.get("n_requests", 0) == 0:
+        violations.append("no requests completed")
+    elif metrics.get("success_rate", 0.0) == 0.0:
+        violations.append("all requests failed")
     if (
         args.max_error_rate is not None
         and metrics.get("error_rate", 0.0) > args.max_error_rate
@@ -304,6 +320,8 @@ def _thresholds_violated(metrics: dict[str, Any], args: argparse.Namespace) -> l
 def _should_fail_fast(metrics: dict[str, Any], args: argparse.Namespace) -> bool:
     if not args.fail_fast:
         return False
+    if metrics.get("n_requests", 0) == 0:
+        return True
     if metrics.get("success_rate", 0.0) == 0.0:
         return True
     return bool(
@@ -315,9 +333,10 @@ def _should_fail_fast(metrics: dict[str, Any], args: argparse.Namespace) -> bool
 def run(args: argparse.Namespace) -> int:
     config_path = resolve_package_path(args.config)
     config = _apply_dataset_override(load_config(config_path), args.dataset)
+    output_dir = _resolve_output_dir(args.output_dir)
 
     if args.dry_run:
-        _print_dry_run(args, config, config_path)
+        _print_dry_run(args, config, config_path, output_dir)
         return 0
 
     dataset = load_dataset(config.get("dataset"))
@@ -361,7 +380,7 @@ def run(args: argparse.Namespace) -> int:
             break
 
     write_reports(
-        args.output_dir,
+        output_dir,
         metrics_rows,
         request_rows,
         error_rows,

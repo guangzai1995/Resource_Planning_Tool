@@ -115,9 +115,65 @@ def test_auto_cli_dry_run_outputs_plan_for_each_concurrency():
     assert "config path:" in result.stdout
     assert "configs/openai_chat.json" in result.stdout
     assert "dataset path:" in result.stdout
-    assert "output dir: reports/latest" in result.stdout
+    assert f"output dir: {ROOT / 'reports/latest'}" in result.stdout
     assert "concurrency=1 request_count=3" in result.stdout
     assert "concurrency=4 request_count=12" in result.stdout
+
+
+def test_auto_cli_dry_run_resolves_relative_output_dir_to_package_root():
+    result = run_auto_cli("--dry-run", "--output-dir", "relative-reports")
+
+    assert result.returncode == 0, result.stderr
+    assert f"output dir: {ROOT / 'relative-reports'}" in result.stdout
+
+
+def test_auto_cli_all_failed_non_dry_run_returns_nonzero_and_writes_reports(tmp_path):
+    output_dir = tmp_path / "reports"
+
+    result = run_auto_cli(
+        "--config",
+        "configs/openai_asr.json",
+        "--concurrency",
+        "1",
+        "--epochs",
+        "1",
+        "--timeout-seconds",
+        "1",
+        "--output-dir",
+        str(output_dir),
+    )
+
+    assert result.returncode != 0
+    assert "success_rate=0.000" in result.stdout
+    assert "threshold_violation concurrency=1" in result.stderr
+    assert (output_dir / "summary.md").exists()
+    metrics = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics[0]["n_requests"] == 1
+    assert metrics[0]["n_failed"] == 1
+    request_lines = (output_dir / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(request_lines) == 1
+    assert json.loads(request_lines[0])["error_type"] == "file_not_found"
+
+
+def test_auto_cli_tiny_duration_submits_at_least_one_batch(tmp_path):
+    output_dir = tmp_path / "duration-reports"
+
+    result = run_auto_cli(
+        "--config",
+        "configs/openai_asr.json",
+        "--duration-seconds",
+        "1e-300",
+        "--timeout-seconds",
+        "1",
+        "--output-dir",
+        str(output_dir),
+    )
+
+    assert result.returncode != 0
+    assert "request_count=1" in result.stdout
+    metrics = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics[0]["n_requests"] >= 1
+    assert metrics[0]["n_failed"] >= 1
 
 
 def test_run_auto_shell_wrapper_forwards_to_auto_cli():
