@@ -10,10 +10,32 @@ from collections.abc import Collection, Sequence
 from typing import Any
 
 from remote_topology import RemoteHost
+from resource_monitor import NVIDIA_SMI_QUERY
 
 
 _REDACTED = "***"
 _SENSITIVE_ENV_TOKENS = ("API_KEY", "PASSWORD", "SECRET", "TOKEN")
+
+
+class RemoteResourceReaders:
+    def __init__(self, runner, host):
+        self.runner = runner
+        self.host = host
+
+    def proc_stat(self):
+        return self.runner.capture(self.host, ["cat", "/proc/stat"])
+
+    def meminfo(self):
+        return self.runner.capture(self.host, ["cat", "/proc/meminfo"])
+
+    def net_dev(self):
+        return self.runner.capture(self.host, ["cat", "/proc/net/dev"])
+
+    def diskstats(self):
+        return self.runner.capture(self.host, ["cat", "/proc/diskstats"])
+
+    def nvidia_smi(self):
+        return self.runner.capture(self.host, NVIDIA_SMI_QUERY)
 
 
 def _is_sensitive_value_flag(arg: str) -> bool:

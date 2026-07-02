@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import math
@@ -1336,6 +1337,20 @@ class FakeRunner:
             return ab.Completed(list(args), 0, "", "")
         if args[:3] == ["docker", "inspect", "--type=image"]:
             return ab.Completed(list(args), 0, "image\n", "")
+        if args[:3] == ["docker", "run", "--rm"] and any(
+            "run_bench_multi.py" in str(arg) for arg in args
+        ):
+            for mount in values_after(args, "-v"):
+                host_dir, separator, container_dir = mount.partition(":")
+                if separator and container_dir == "/results":
+                    result_csv = Path(host_dir) / "result.csv"
+                    result_csv.parent.mkdir(parents=True, exist_ok=True)
+                    result_csv.write_text(
+                        "model,throughput_tok_s\nm,12.5\n",
+                        encoding="utf-8-sig",
+                    )
+                    break
+            return ab.Completed(list(args), 0, "ok\n", "")
         return ab.Completed(list(args), 0, "ok\n", "")
 
 
@@ -1498,14 +1513,15 @@ class ForeignSameNameRemoteRunner(FakeRemoteDockerRunner):
 class FakeResourceMonitor:
     instances = []
 
-    def __init__(self, *, output_dir, interval_sec, enabled, backend):
+    def __init__(self, *, output_dir, interval_sec, enabled, backend, readers=None):
         self.output_dir = Path(output_dir)
         self.interval_sec = interval_sec
         self.enabled = enabled
         self.backend = backend
+        self.readers = readers
         self.started = False
         self.stopped = False
-        FakeResourceMonitor.instances.append(self)
+        type(self).instances.append(self)
 
     def start(self):
         self.started = True
@@ -1515,8 +1531,12 @@ class FakeResourceMonitor:
         summary = {
             "available": True,
             "sample_count": 1,
-            "aggregate": {"cpu_util_avg_pct": 12.5},
+            "aggregate": {
+                "cpu_util_avg_pct": 12.5,
+                "gpu_mem_used_max_mb": 1234.0,
+            },
         }
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "resource_summary.json").write_text(
             json.dumps(summary),
             encoding="utf-8",
@@ -1601,7 +1621,9 @@ def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatc
     remote = FakeRemoteDockerRunner()
     local = FakeRunner()
     ready_roles = []
+    FakeResourceMonitor.instances = []
     monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
     monkeypatch.setattr(
         ab,
         "wait_for_remote_ready",
@@ -1626,12 +1648,32 @@ def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatc
     ]
     assert ready_roles == ["p1", "p2", "d1", "d2", "router"]
     assert len(bench_run_commands(local.commands)) == 1
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    role_commands = case.topology_profile.build_commands(config, case, layout.run_dir)
+    monitors_by_role = {
+        monitor.output_dir.name: monitor
+        for monitor in FakeResourceMonitor.instances
+    }
+    assert set(monitors_by_role) == {"p1", "p2", "d1", "d2", "router"}
+    for role_name, monitor in monitors_by_role.items():
+        assert monitor.output_dir == layout.bench_dir / "resources" / role_name
+        assert monitor.started is True
+        assert monitor.stopped is True
+        assert monitor.readers.runner is remote
+        assert monitor.readers.host.name == role_commands[role_name].host_name
+    with (layout.bench_dir / "result.csv").open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["p1_resource_monitor_available"] == "true"
+    assert rows[0]["p1_cpu_util_avg_pct"] == "12.5"
+    assert rows[0]["router_gpu_mem_used_max_mb"] == "1234.0"
     assert any(
         cmd[1][:2] == ["docker", "stop"] and "router" in cmd[1][2]
         for cmd in remote.commands
     )
-    case = ab.expand_cases(config, run_id="run123")[0]
-    layout = ab.build_layout(config, "run123", case)
     assert (layout.bench_dir / "commands" / "p1.txt").read_text(
         encoding="utf-8"
     ).startswith("docker run -d")
@@ -1647,6 +1689,45 @@ def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatc
     assert "inline-secret" not in topology_text
     resolved = json.loads(topology_text)
     assert resolved["topology_profiles"][0]["hosts"]["p1"]["auth"]["password"] == "***"
+
+
+def test_topology_remote_resource_monitor_start_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    StartFailingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", StartFailingResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 0
+    assert len(bench_run_commands(local.commands)) == 1
+    assert len(StartFailingResourceMonitor.instances) == 5
+
+
+def test_topology_remote_resource_monitor_stop_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    StopFailingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", StopFailingResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 0
+    assert len(bench_run_commands(local.commands)) == 1
+    assert len(StopFailingResourceMonitor.instances) == 5
+    assert all(monitor.stopped for monitor in StopFailingResourceMonitor.instances)
 
 
 def test_topology_owned_stale_role_removed_before_start(tmp_path, monkeypatch):
@@ -1707,7 +1788,7 @@ def test_topology_foreign_same_name_role_fails_without_removal(tmp_path, monkeyp
     assert manifest["cases"][0]["status"] == "failed"
 
 
-def test_topology_run_does_not_start_local_resource_monitor(tmp_path, monkeypatch):
+def test_topology_run_does_not_append_legacy_local_resource_columns(tmp_path, monkeypatch):
     config = topology_config_with_image(tmp_path)
     remote = FakeRemoteDockerRunner()
     FakeResourceMonitor.instances = []
@@ -1718,7 +1799,16 @@ def test_topology_run_does_not_start_local_resource_monitor(tmp_path, monkeypatc
     result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
 
     assert result == 0
-    assert FakeResourceMonitor.instances == []
+    assert len(FakeResourceMonitor.instances) == 5
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    with (layout.bench_dir / "result.csv").open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert "resource_monitor_available" not in rows[0]
+    assert rows[0]["p1_resource_monitor_available"] == "true"
 
 
 def test_wait_for_remote_ready_uses_api_key_only_for_router(tmp_path, monkeypatch):
@@ -1875,6 +1965,10 @@ def test_run_controller_starts_and_stops_resource_monitor(tmp_path, monkeypatch)
     assert monitor.stopped is True
     assert monitor.interval_sec == 1.0
     assert monitor.backend == "nvidia-smi"
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    assert monitor.output_dir == layout.bench_dir
+    assert monitor.readers is None
     assert summaries[0][1]["aggregate"]["cpu_util_avg_pct"] == 12.5
 
 

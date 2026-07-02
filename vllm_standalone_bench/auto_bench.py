@@ -21,9 +21,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
-from remote_docker import RemoteDockerRunner, mask_command
+from remote_docker import RemoteDockerRunner, RemoteResourceReaders, mask_command
 from remote_topology import RemoteAuth, RoleCommand, TopologyProfile, parse_topology_profiles
-from resource_monitor import ResourceMonitor, append_summary_to_result_files
+from resource_monitor import (
+    ResourceMonitor,
+    append_prefixed_summaries_to_result_files,
+    append_summary_to_result_files,
+)
 
 logger = logging.getLogger("auto_bench")
 
@@ -2739,6 +2743,73 @@ def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, s
     return grouped
 
 
+def _start_topology_resource_monitors(
+    config: AutoBenchConfig,
+    remote_runner: RemoteDockerRunner,
+    case: BenchmarkCase,
+    layout: CaseLayout,
+    started_roles: Sequence[RoleCommand],
+) -> dict[str, Any]:
+    if not config.run.resource_monitor.enabled:
+        return {}
+
+    monitors: dict[str, Any] = {}
+    for role_command in started_roles:
+        role_name = role_command.role_name
+        try:
+            host = _topology_role_host(case, role_command)
+            monitor = ResourceMonitor(
+                output_dir=layout.bench_dir / "resources" / role_name,
+                interval_sec=config.run.resource_monitor.interval_sec,
+                enabled=True,
+                backend=config.run.resource_monitor.backend,
+                readers=RemoteResourceReaders(remote_runner, host),
+            )
+            monitor.start()
+        except (StopRequested, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            logger.warning(
+                "remote resource monitor start failed for %s: %s",
+                role_name,
+                exc,
+            )
+            continue
+        monitors[role_name] = monitor
+    return monitors
+
+
+def _stop_topology_resource_monitors(
+    monitors: Mapping[str, Any],
+    layout: CaseLayout,
+) -> None:
+    summaries = {}
+    for role_name, monitor in monitors.items():
+        try:
+            summary = monitor.stop()
+        except (StopRequested, KeyboardInterrupt):
+            raise
+        except Exception as exc:
+            logger.warning(
+                "remote resource monitor stop failed for %s: %s",
+                role_name,
+                exc,
+            )
+            continue
+        if summary is not None:
+            summaries[role_name] = summary
+
+    if not summaries:
+        return
+
+    try:
+        append_prefixed_summaries_to_result_files(layout.bench_dir, summaries)
+    except (StopRequested, KeyboardInterrupt):
+        raise
+    except Exception as exc:
+        logger.warning("remote resource monitor result merge failed: %s", exc)
+
+
 def run_topology_group(config: AutoBenchConfig, run_id: str,
                        local_runner: Runner,
                        remote_runner: RemoteDockerRunner,
@@ -2808,14 +2879,33 @@ def run_topology_group(config: AutoBenchConfig, run_id: str,
                     manifest=manifest,
                 ),
             )
-            status, error = _run_bench_case(
+            resource_monitors = _start_topology_resource_monitors(
                 config,
-                local_runner,
+                remote_runner,
                 case,
                 layout,
-                dry_run=False,
-                monitor_resources=False,
+                started_roles,
             )
+            bench_interrupted: BaseException | None = None
+            try:
+                try:
+                    status, error = _run_bench_case(
+                        config,
+                        local_runner,
+                        case,
+                        layout,
+                        dry_run=False,
+                        monitor_resources=False,
+                    )
+                except (StopRequested, KeyboardInterrupt) as exc:
+                    bench_interrupted = exc
+                    raise
+            finally:
+                try:
+                    _stop_topology_resource_monitors(resource_monitors, layout)
+                except (StopRequested, KeyboardInterrupt):
+                    if bench_interrupted is None:
+                        raise
             if status != "passed":
                 group_exit_code = 1
             manifest.record(case, layout, status, error=error)

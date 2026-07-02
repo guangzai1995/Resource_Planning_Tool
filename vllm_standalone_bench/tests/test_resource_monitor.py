@@ -548,6 +548,27 @@ def test_append_summary_to_result_csv_adds_resource_columns(tmp_path):
     assert rows[0]["gpu_util_max_pct"] == "99.0"
 
 
+def test_append_prefixed_summaries_to_result_csv(tmp_path):
+    result_csv = tmp_path / "result.csv"
+    result_csv.write_text("model,throughput_tok_s\nm,12.5\n", encoding="utf-8-sig")
+    summary = {
+        "available": True,
+        "sample_count": 2,
+        "aggregate": {"cpu_util_avg_pct": 50.0, "gpu_mem_used_max_mb": 1234.0},
+    }
+
+    rm.append_prefixed_summaries_to_result_files(
+        tmp_path,
+        {"p1": summary, "router": summary},
+    )
+
+    with result_csv.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["p1_resource_monitor_available"] == "true"
+    assert rows[0]["p1_cpu_util_avg_pct"] == "50.0"
+    assert rows[0]["router_gpu_mem_used_max_mb"] == "1234.0"
+
+
 def test_append_summary_to_result_xlsx_adds_chinese_resource_headers(tmp_path):
     import openpyxl
 

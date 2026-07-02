@@ -621,6 +621,19 @@ def flatten_summary_for_result(summary):
     return values
 
 
+def prefixed_resource_columns(prefix):
+    return [f"{prefix}_{column}" for column in RESOURCE_RESULT_COLUMNS]
+
+
+def flatten_prefixed_summaries(summaries):
+    values = {}
+    for prefix, summary in summaries.items():
+        flattened = flatten_summary_for_result(summary)
+        for column in RESOURCE_RESULT_COLUMNS:
+            values[f"{prefix}_{column}"] = flattened.get(column, "")
+    return values
+
+
 def append_summary_to_result_files(output_dir, summary):
     output_dir = Path(output_dir)
     values = flatten_summary_for_result(summary)
@@ -634,7 +647,27 @@ def append_summary_to_result_files(output_dir, summary):
         append_summary_to_xlsx(xlsx_path, values)
 
 
+def append_prefixed_summaries_to_result_files(output_dir, summaries):
+    output_dir = Path(output_dir)
+    values = flatten_prefixed_summaries(summaries)
+    if not values:
+        return
+
+    columns = list(values)
+    csv_path = output_dir / "result.csv"
+    if csv_path.exists():
+        append_values_to_csv(csv_path, values, columns)
+
+    xlsx_path = output_dir / "result.xlsx"
+    if xlsx_path.exists():
+        append_values_to_xlsx(xlsx_path, values, columns)
+
+
 def append_summary_to_csv(path, values):
+    append_values_to_csv(path, values, RESOURCE_RESULT_COLUMNS)
+
+
+def append_values_to_csv(path, values, columns):
     path = Path(path)
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -642,12 +675,12 @@ def append_summary_to_csv(path, values):
         rows = list(reader)
 
     merged_fieldnames = fieldnames + [
-        column for column in RESOURCE_RESULT_COLUMNS
+        column for column in columns
         if column not in fieldnames
     ]
     for row in rows:
-        for column in RESOURCE_RESULT_COLUMNS:
-            row[column] = values.get(column, "")
+        for column in columns:
+            row[column] = _result_value(values.get(column, ""))
 
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=merged_fieldnames)
@@ -656,6 +689,15 @@ def append_summary_to_csv(path, values):
 
 
 def append_summary_to_xlsx(path, values):
+    append_values_to_xlsx(
+        path,
+        values,
+        RESOURCE_RESULT_COLUMNS,
+        column_labels=RESOURCE_RESULT_COLUMN_LABELS,
+    )
+
+
+def append_values_to_xlsx(path, values, columns, column_labels=None):
     try:
         import openpyxl
     except ImportError:
@@ -671,7 +713,7 @@ def append_summary_to_xlsx(path, values):
     }
 
     next_column = worksheet.max_column + 1
-    for column_name in RESOURCE_RESULT_COLUMNS:
+    for column_name in columns:
         column = column_by_name.get(column_name)
         if column is None:
             column = next_column
@@ -679,19 +721,24 @@ def append_summary_to_xlsx(path, values):
             column_by_name[column_name] = column
             worksheet.cell(row=1, column=column, value=column_name)
         if worksheet.max_row >= 2:
+            label = (
+                column_labels.get(column_name, column_name)
+                if column_labels is not None
+                else column_name
+            )
             worksheet.cell(
                 row=2,
                 column=column,
-                value=RESOURCE_RESULT_COLUMN_LABELS[column_name],
+                value=label,
             )
 
     data_start_row = 3 if worksheet.max_row >= 2 else 2
     for row in range(data_start_row, worksheet.max_row + 1):
-        for column_name in RESOURCE_RESULT_COLUMNS:
+        for column_name in columns:
             worksheet.cell(
                 row=row,
                 column=column_by_name[column_name],
-                value=values.get(column_name, ""),
+                value=_result_value(values.get(column_name, "")),
             )
 
     workbook.save(path)
