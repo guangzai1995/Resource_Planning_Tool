@@ -105,6 +105,8 @@ def test_run_asr_bench_executes_builtin_audio_dataset_command(tmp_path):
     env = os.environ.copy()
     env.update({
         "PYTHON_BIN": str(fake_python),
+        "AUDIO_DURATION_S": "60",
+        "AUDIO_SILENCE_MS": "750",
         "DRY_RUN": "false",
         "PARALLEL_NUMS": "1",
         "EPOCHS": "1",
@@ -129,3 +131,8 @@ def test_run_asr_bench_executes_builtin_audio_dataset_command(tmp_path):
     assert args[args.index("--backend") + 1] == "openai-audio"
     assert args[args.index("--dataset-name") + 1] == "custom_audio"
     assert args[args.index("--dataset-path") + 1] == str(dataset_path)
+    assert args[args.index("--audio-duration-s") + 1] == "60"
+    assert args[args.index("--audio-silence-ms") + 1] == "750"
+    generated_audio_dir = Path(args[args.index("--generated-audio-dir") + 1])
+    assert generated_audio_dir.parent == SCRIPTS_DIR / "results"
+    assert generated_audio_dir.name.startswith("asr_dynamic_audio_")

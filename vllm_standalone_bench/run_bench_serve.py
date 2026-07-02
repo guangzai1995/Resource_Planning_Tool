@@ -53,6 +53,7 @@ import sys
 import os
 import types
 import gc
+import math
 import re
 import argparse
 import logging
@@ -290,6 +291,12 @@ def add_dataset_parser(parser: argparse.ArgumentParser) -> None:
 
     # ── 其他 dataset output_len（serve.py main 会尝试赋值这些 attr）──────────
     g.add_argument('--custom-output-len', type=int, default=None)
+    g.add_argument('--audio-duration-s', type=float, default=None,
+                   help='custom_audio: 运行时拼接源音频，生成每条请求的目标音频时长（秒）')
+    g.add_argument('--audio-silence-ms', type=int, default=500,
+                   help='custom_audio: 拼接片段之间插入的静音长度（毫秒，默认 500）')
+    g.add_argument('--generated-audio-dir', type=str, default=None,
+                   help='custom_audio: 运行时拼接音频和 manifest 的输出目录')
     g.add_argument('--hf-output-len', type=int, default=None)
     g.add_argument('--hf-split', type=str, default=None)
     g.add_argument('--hf-subset', type=str, default=None)
@@ -535,6 +542,214 @@ def _load_sharegpt_requests(args: argparse.Namespace,
     return requests
 
 
+def _resolve_custom_audio_path(row: dict[str, Any], base_dir: Path) -> Path:
+    audio_path = Path(row['audio'])
+    if not audio_path.is_absolute():
+        audio_path = base_dir / audio_path
+    return audio_path
+
+
+def _dynamic_audio_output_dir(args: argparse.Namespace, dataset_path: Path) -> Path:
+    configured = getattr(args, 'generated_audio_dir', None)
+    if configured:
+        return Path(configured)
+    duration = str(getattr(args, 'audio_duration_s', 'dynamic')).replace('.', 'p')
+    return Path(os.environ.get('TMPDIR', '/tmp')) / (
+        f"vllm_asr_dynamic_audio_{dataset_path.stem}_{duration}_"
+        f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    )
+
+
+def _coprime_stride(row_count: int) -> int:
+    if row_count <= 1:
+        return 1
+    for candidate in (37, 31, 29, 23, 19, 17, 13, 11, 7, 5, 3, 1):
+        if math.gcd(candidate, row_count) == 1:
+            return candidate
+    return 1
+
+
+def _dynamic_audio_indices(row_count: int, request_index: int,
+                           seed: int) -> list[int]:
+    indices = list(range(row_count))
+    rng = random.Random(seed + request_index * 1_000_003)
+    rng.shuffle(indices)
+
+    # The first segment is rotated across requests so vLLM/media caches do not
+    # see the same audio prefix for the common 256-sample benchmark case.
+    first_index = (request_index * _coprime_stride(row_count)) % row_count
+    first_pos = indices.index(first_index)
+    indices[0], indices[first_pos] = indices[first_pos], indices[0]
+    return indices
+
+
+def _write_dynamic_audio_sample(
+    *,
+    request_index: int,
+    rows: list[dict[str, Any]],
+    base_dir: Path,
+    target_duration_s: float,
+    silence_ms: int,
+    generated_dir: Path,
+    seed: int,
+    audio_cache: dict[Path, tuple[Any, int]],
+) -> dict[str, Any]:
+    import numpy as np
+    import soundfile
+
+    if target_duration_s <= 0:
+        raise ValueError('--audio-duration-s 必须大于 0')
+    if silence_ms < 0:
+        raise ValueError('--audio-silence-ms 必须大于等于 0')
+
+    order = _dynamic_audio_indices(len(rows), request_index, seed)
+    chunks: list[Any] = []
+    source_audio: list[str] = []
+    source_refs: list[str] = []
+    sample_rate: int | None = None
+    total_frames = 0
+    target_frames: int | None = None
+    silence_frames: int | None = None
+    first_row: dict[str, Any] | None = None
+    cursor = 0
+
+    while target_frames is None or total_frames < target_frames:
+        row = rows[order[cursor % len(order)]]
+        cursor += 1
+        audio_path = _resolve_custom_audio_path(row, base_dir)
+        if audio_path not in audio_cache:
+            data, sr = soundfile.read(audio_path, dtype='float32', always_2d=True)
+            audio_cache[audio_path] = (data, int(sr))
+        data, sr = audio_cache[audio_path]
+        if len(data) == 0:
+            continue
+
+        if sample_rate is None:
+            sample_rate = sr
+            target_frames = max(1, int(round(target_duration_s * sample_rate)))
+            silence_frames = int(round(silence_ms * sample_rate / 1000.0))
+        elif sr != sample_rate:
+            raise ValueError(
+                f'动态 ASR 音频拼接要求采样率一致: {audio_path}={sr}, '
+                f'expected={sample_rate}'
+            )
+
+        if chunks and silence_frames and silence_frames > 0:
+            chunks.append(np.zeros((silence_frames, data.shape[1]), dtype=np.float32))
+            total_frames += silence_frames
+
+        chunks.append(data)
+        total_frames += len(data)
+        source_audio.append(str(audio_path))
+        if row.get('reference'):
+            source_refs.append(str(row['reference']))
+        if first_row is None:
+            first_row = row
+
+        if cursor > len(rows) * 128 and total_frames <= 0:
+            raise ValueError('动态 ASR 音频拼接失败：源音频为空')
+
+    if not chunks or sample_rate is None or target_frames is None:
+        raise ValueError('动态 ASR 音频拼接失败：没有可用源音频')
+
+    combined = np.concatenate(chunks, axis=0)
+    if len(combined) < target_frames:
+        pad = np.zeros((target_frames - len(combined), combined.shape[1]),
+                       dtype=np.float32)
+        combined = np.concatenate([combined, pad], axis=0)
+    combined = combined[:target_frames]
+    if combined.shape[1] == 1:
+        combined = combined[:, 0]
+
+    duration_tag = str(target_duration_s).replace('.', 'p')
+    filename = (
+        f"asr_dynamic_{duration_tag}s_seed{seed}_{request_index:05d}.flac"
+    )
+    output_path = generated_dir / filename
+    soundfile.write(output_path, combined, sample_rate, format='FLAC')
+
+    prompt = (
+        (first_row or {}).get('prompt')
+        or 'Transcribe the audio in English.'
+    )
+    row_output_tokens = (first_row or {}).get('output_tokens') or 0
+    return {
+        'prompt': prompt,
+        'prompt_len': int((first_row or {}).get('prompt_len') or 0),
+        'audio': output_path.name,
+        'output_tokens': int(row_output_tokens),
+        'reference': ' '.join(source_refs),
+        'duration_s': round(target_frames / sample_rate, 6),
+        'source_audio': source_audio,
+        '_absolute_audio_path': output_path,
+    }
+
+
+def _load_dynamic_custom_audio_requests(
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+    dataset_path: Path,
+    base_dir: Path,
+    out_len: int,
+) -> list[SampleRequest]:
+    generated_dir = _dynamic_audio_output_dir(args, dataset_path)
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    target_duration_s = float(getattr(args, 'audio_duration_s'))
+    silence_ms = int(getattr(args, 'audio_silence_ms', 500))
+    seed = int(getattr(args, 'seed', 0) or 0)
+    audio_cache: dict[Path, tuple[Any, int]] = {}
+    generated_rows: list[dict[str, Any]] = []
+    requests: list[SampleRequest] = []
+
+    for i in range(args.num_prompts):
+        generated_row = _write_dynamic_audio_sample(
+            request_index=i,
+            rows=rows,
+            base_dir=base_dir,
+            target_duration_s=target_duration_s,
+            silence_ms=silence_ms,
+            generated_dir=generated_dir,
+            seed=seed,
+            audio_cache=audio_cache,
+        )
+        audio_path = Path(generated_row.pop('_absolute_audio_path'))
+        generated_rows.append(generated_row)
+        expected_output_len = int(
+            getattr(args, 'custom_output_len', None)
+            or generated_row.get('output_tokens')
+            or out_len
+        )
+        requests.append(SampleRequest(
+            prompt=generated_row.get('prompt') or 'Transcribe the audio in English.',
+            prompt_len=int(generated_row.get('prompt_len') or 0),
+            expected_output_len=expected_output_len,
+            multi_modal_data={'audio_path': str(audio_path)},
+            request_id=f'bench-audio-{uuid.uuid4().hex[:8]}-{i}',
+        ))
+
+    generated_dataset = generated_dir / 'asr_dynamic.jsonl'
+    with generated_dataset.open('w', encoding='utf-8') as f:
+        for row in generated_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+    manifest = {
+        'source_dataset_path': str(dataset_path),
+        'generated_dataset_path': str(generated_dataset),
+        'target_duration_s': target_duration_s,
+        'silence_ms': silence_ms,
+        'sample_count': len(generated_rows),
+        'seed': seed,
+        'duration_s_min': min(row['duration_s'] for row in generated_rows),
+        'duration_s_max': max(row['duration_s'] for row in generated_rows),
+        'audio_files': [row['audio'] for row in generated_rows],
+    }
+    (generated_dir / 'manifest.json').write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    return requests
+
+
 def _load_custom_audio_requests(args: argparse.Namespace,
                                 tokenizer) -> list[SampleRequest]:
     if not args.dataset_path:
@@ -568,12 +783,19 @@ def _load_custom_audio_requests(args: argparse.Namespace,
         or getattr(args, 'random_output_len', 128)
         or 128
     )
+    if getattr(args, 'audio_duration_s', None) is not None:
+        return _load_dynamic_custom_audio_requests(
+            args=args,
+            rows=rows,
+            dataset_path=dataset_path,
+            base_dir=base_dir,
+            out_len=out_len,
+        )
+
     requests: list[SampleRequest] = []
     for i in range(args.num_prompts):
         row = rows[i % len(rows)]
-        audio_path = Path(row['audio'])
-        if not audio_path.is_absolute():
-            audio_path = base_dir / audio_path
+        audio_path = _resolve_custom_audio_path(row, base_dir)
         expected_output_len = int(
             getattr(args, 'custom_output_len', None)
             or row.get('output_tokens')
