@@ -901,6 +901,37 @@ def test_plan_resume_cases_supports_topology_key(tmp_path):
     assert unknown == []
 
 
+def test_plan_resume_cases_migrates_legacy_topology_row(tmp_path):
+    from test_remote_topology import pd_topology_config, write_config as write_topology_config
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "cases": [{
+            "model": "qwen2_5_1_5b",
+            "serve_profile": "sglang_pd_2p2d",
+            "bench_profile": "smoke",
+            "status": "passed",
+            "extra": {"source": "legacy-topology"},
+        }],
+    }
+
+    initial, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert pending == ()
+    assert unknown == []
+    assert len(initial.cases) == 1
+    row = initial.cases[0]
+    assert row["serve_profile"] is None
+    assert row["topology_profile"] == "sglang_pd_2p2d"
+    assert row["extra"] == {"source": "legacy-topology"}
+
+
 def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
     data = two_bench_config(tmp_path)
     third_profile = dict(data["bench_profiles"][0])
@@ -955,7 +986,20 @@ def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
                 "status": "passed",
             }],
         },
-        "manifest case row is missing model/serve_profile/bench_profile",
+        "manifest case row must include model, bench_profile, and exactly one of serve_profile/topology_profile",
+    ),
+    (
+        {
+            "run_id": "run123",
+            "cases": [{
+                "model": "qwen2_5_1_5b",
+                "serve_profile": "bf16_default",
+                "topology_profile": "sglang_pd_2p2d",
+                "bench_profile": "smoke",
+                "status": "passed",
+            }],
+        },
+        "manifest case row must include model, bench_profile, and exactly one of serve_profile/topology_profile",
     ),
     ({"run_id": "other", "cases": []}, "manifest run_id mismatch"),
 ])

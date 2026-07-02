@@ -143,6 +143,46 @@ def test_aggregate_duplicate_engine_profiles_use_serving_names(tmp_path):
     assert "sglang__throughput_tok_s" not in rows[0]
 
 
+def test_aggregate_label_collision_falls_back_to_serving_names(tmp_path):
+    config = _fake_config()
+    config.serve_profiles = [
+        SimpleNamespace(name="vllm_bf16", engine="vllm", gpus="all", args=()),
+        SimpleNamespace(name="sglang_bf16", engine="sglang", gpus="all", args=()),
+    ]
+    config.topology_profiles = [
+        SimpleNamespace(name="vllm", engine="sglang"),
+    ]
+    run_dir = tmp_path / "run1"
+    _write_result_csv(
+        run_dir / "qwen" / "vllm_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=11,
+        tput=100,
+        hitrate=80.0,
+    )
+    _write_result_csv(
+        run_dir / "qwen" / "sglang_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=22,
+        tput=200,
+        hitrate=40.0,
+    )
+    _write_result_csv(
+        run_dir / "qwen" / "vllm" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=33,
+        tput=300,
+        hitrate=20.0,
+    )
+
+    out = bc.aggregate_compare(config, run_dir)
+
+    rows = list(csv.DictReader(out.open(encoding="utf-8-sig")))
+    assert rows[0]["vllm_bf16__throughput_tok_s"] == "100"
+    assert rows[0]["sglang_bf16__throughput_tok_s"] == "200"
+    assert rows[0]["vllm__throughput_tok_s"] == "300"
+
+
 def test_aggregate_no_results_returns_none(tmp_path):
     config = _fake_config()
 

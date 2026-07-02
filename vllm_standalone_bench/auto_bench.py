@@ -57,6 +57,10 @@ class ConfigError(ValueError):
 
 SUPPORTED_ENGINES = ("vllm", "sglang")
 CaseKey = tuple[str, str | None, str | None, str]
+MANIFEST_CASE_KEY_ERROR = (
+    "manifest case row must include model, bench_profile, and exactly one of "
+    "serve_profile/topology_profile"
+)
 
 
 class StopRequested(Exception):
@@ -2661,6 +2665,21 @@ def _manifest_row_key(row: Mapping[str, Any]) -> CaseKey | None:
     return None
 
 
+def _legacy_topology_manifest_row_key(row: Mapping[str, Any]) -> CaseKey | None:
+    model = row.get("model")
+    serve_profile = row.get("serve_profile")
+    topology_profile = row.get("topology_profile")
+    bench_profile = row.get("bench_profile")
+    if (
+        isinstance(model, str)
+        and isinstance(serve_profile, str)
+        and topology_profile is None
+        and isinstance(bench_profile, str)
+    ):
+        return (model, None, serve_profile, bench_profile)
+    return None
+
+
 def _copy_manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
     copied: dict[str, Any] = {}
     for key, value in row.items():
@@ -2694,15 +2713,18 @@ def plan_resume_cases(
             raise ConfigError("manifest cases must contain objects")
         key = _manifest_row_key(row)
         if key is None:
-            raise ConfigError("manifest case row is missing model/serve_profile/bench_profile")
+            raise ConfigError(MANIFEST_CASE_KEY_ERROR)
         if key not in full_keys:
-            unknown_keys.append(key)
-            continue
+            fallback_key = _legacy_topology_manifest_row_key(row)
+            if fallback_key is None or fallback_key not in full_keys:
+                unknown_keys.append(key)
+                continue
+            key = fallback_key
         if row.get("status") == "passed":
             passed_keys.add(key)
             copied = _copy_manifest_row(row)
-            copied.setdefault("serve_profile", key[1])
-            copied.setdefault("topology_profile", key[2])
+            copied["serve_profile"] = key[1]
+            copied["topology_profile"] = key[2]
             passed_rows.append(copied)
 
     initial_manifest = Manifest(run_id=run_id, total=len(cases), cases=passed_rows)

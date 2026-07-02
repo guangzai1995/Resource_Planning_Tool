@@ -43,14 +43,20 @@ def _serving_dimensions(config: Any) -> list[ServingDimension]:
     engine_counts: dict[str, int] = {}
     for _, engine, _ in profiles:
         engine_counts[engine] = engine_counts.get(engine, 0) + 1
+    labels = [
+        name if engine_counts[engine] > 1 else engine
+        for name, engine, _ in profiles
+    ]
+    if len(set(labels)) != len(labels):
+        labels = [name for name, _, _ in profiles]
     return [
         ServingDimension(
             name=name,
             engine=engine,
             field=field,
-            label=name if engine_counts[engine] > 1 else engine,
+            label=label,
         )
-        for name, engine, field in profiles
+        for (name, engine, field), label in zip(profiles, labels)
     ]
 
 
