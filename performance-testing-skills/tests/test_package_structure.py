@@ -50,12 +50,12 @@ def test_automated_skill_prefers_package_script_usage():
     text = (
         ROOT / "skills/automated-performance-testing/SKILL.md"
     ).read_text(encoding="utf-8")
-    assert "## Preferred script usage" in text
+    assert "## 推荐脚本用法" in text
     assert (
         "python3 scripts/perf_auto.py --config configs/openai_chat.json --dry-run"
         in text
     )
-    assert "ad-hoc" in text
+    assert "临时手写请求循环" in text
 
 
 def test_readme_documents_portable_package_usage():
@@ -126,5 +126,5 @@ def test_docs_clarify_p90_threshold_does_not_fail_fast():
         ROOT / "skills/automated-performance-testing/SKILL.md"
     ).read_text(encoding="utf-8").lower()
 
-    for text in [readme, automated_skill]:
-        assert "p90 threshold does not trigger fail-fast" in text
+    assert "p90 threshold does not trigger fail-fast" in readme
+    assert "p90 阈值不会触发 fail-fast" in automated_skill
