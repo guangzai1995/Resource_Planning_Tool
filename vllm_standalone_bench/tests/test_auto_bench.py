@@ -607,7 +607,11 @@ def test_plan_resume_cases_keeps_passed_and_selects_pending(tmp_path):
 
 
 def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
-    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    data = two_bench_config(tmp_path)
+    third_profile = dict(data["bench_profiles"][0])
+    third_profile["name"] = "smoke3"
+    data["bench_profiles"].append(third_profile)
+    config, run_dir = write_resolved_config_for_resume(tmp_path, data)
     cases = ab.expand_cases(config, run_id="run123")
     manifest_data = {
         "run_id": "run123",
@@ -618,6 +622,14 @@ def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
                 "serve_profile": cases[0].serve_profile.name,
                 "bench_profile": cases[0].bench_profile.name,
                 "status": "failed",
+                "csv": "old.csv",
+                "xlsx": "old.xlsx",
+            },
+            {
+                "model": cases[1].model.name,
+                "serve_profile": cases[1].serve_profile.name,
+                "bench_profile": cases[1].bench_profile.name,
+                "status": "skipped",
                 "csv": "old.csv",
                 "xlsx": "old.xlsx",
             }
@@ -632,7 +644,7 @@ def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
 
     assert unknown == []
     assert initial_manifest.cases == []
-    assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2"]
+    assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2", "smoke3"]
 
 
 def test_plan_resume_cases_reports_manifest_rows_not_in_config(tmp_path):
