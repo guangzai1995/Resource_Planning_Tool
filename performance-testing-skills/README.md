@@ -1,83 +1,83 @@
-# Performance Testing Skills
+# 性能测试 Skills
 
-`performance-testing-skills` is an independent portable package for manual and automated performance testing of model APIs. It does not depend on this repository: copy this directory to any machine or project, keep its internal paths together, and run the scripts from the package root.
+`performance-testing-skills` 是一个独立可携带的模型 API 性能测试工具包，也是一个 independent portable package。它 does not depend on this repository；可以 copy 到任意机器或任意项目目录中使用，只要保持包内目录结构不变，并从包根目录执行脚本即可。
 
-The package does not start, stop, deploy, or manage the target service. Bring up the API yourself, then use these scripts to validate request shape, run smoke checks, and measure performance under the exact test conditions you choose.
+本工具包不负责启动、停止、部署或管理目标服务。请先自行启动 API 服务，再用这里的脚本验证请求格式、执行 smoke 检查，并在你明确选择的测试条件下测量性能。
 
-## Directory Layout
+## 目录结构
 
 ```text
 performance-testing-skills/
-  skills/      Codex or Claude skill instructions for manual and automated testing
-  configs/     Example JSON configs for each supported protocol
-  datasets/    Example text JSONL prompts and audio manifest JSONL rows
-  scripts/     CLI entry points, shell wrappers, and shared Python helpers
-  reports/     Default report output location, usually reports/latest
-  tests/       Package structure, dry-run, client, metrics, and local HTTP tests
+  skills/      Codex 或 Claude 可读取的手动测试、自动压测 skill 说明
+  configs/     每种支持协议的 JSON 配置示例
+  datasets/    文本 JSONL prompt 示例和音频 manifest JSONL 示例
+  scripts/     CLI 入口、shell wrapper 和共享 Python helper
+  reports/     默认报告输出目录，通常为 reports/latest
+  tests/       包结构、dry-run、client、metrics 和本地 HTTP 测试
 ```
 
-## Supported Protocols
+## 支持协议
 
-- `openai_chat`: POST to `<base_url>/chat/completions`
-- `openai_completion`: POST to `<base_url>/completions`
-- `openai_asr`: multipart POST to `<base_url>/audio/transcriptions`
-- `generic_http`: direct HTTP request using `method`, `url`, `headers`, and `body_template`
+- `openai_chat`：POST 到 `<base_url>/chat/completions`
+- `openai_completion`：POST 到 `<base_url>/completions`
+- `openai_asr`：multipart POST 到 `<base_url>/audio/transcriptions`
+- `generic_http`：使用 `method`、`url`、`headers` 和 `body_template` 直接构造 HTTP 请求
 
-## Quick Start
+## 快速开始
 
-Run these commands from the package root after copying the package or checking out the repository.
+复制工具包或 checkout 仓库后，请从包根目录执行以下命令。
 
-Manual dry-run builds the request and prints curl without network traffic:
+手动 dry-run：只构造请求并打印 curl，不发送网络流量。
 
 ```bash
 ./scripts/run_manual.sh --config configs/openai_chat.json --dry-run --input "hello dry run"
 ```
 
-Manual curl mode prints only the equivalent curl command:
+手动 curl 模式：只打印等价 curl 命令。
 
 ```bash
 ./scripts/run_manual.sh --config configs/openai_chat.json --mode curl --input "hello curl"
 ```
 
-Automated dry-run prints the benchmark plan without sending traffic:
+自动压测 dry-run：打印压测计划，不发送请求。
 
 ```bash
 ./scripts/run_auto.sh --config configs/openai_chat.json --dry-run --concurrency 1,2 --epochs 2
 ```
 
-Automated run sends requests and writes reports:
+自动压测执行：发送请求并写出报告。
 
 ```bash
 ./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2 --epochs 2 --output-dir reports/latest
 ```
 
-The same CLIs can be called directly if you prefer Python entry points:
+如果你更希望直接调用 Python 入口，也可以这样执行：
 
 ```bash
 python3 scripts/perf_manual.py --config configs/openai_chat.json --dry-run
 python3 scripts/perf_auto.py --config configs/openai_chat.json --dry-run
 ```
 
-## Configuration
+## 配置说明
 
-Each config is a JSON object. Relative paths are resolved from the package root.
+每个配置文件都是一个 JSON 对象。相对路径统一按包根目录解析。
 
-- `protocol`: one of `openai_chat`, `openai_completion`, `openai_asr`, or `generic_http`.
-- `base_url`: base API URL for OpenAI-compatible protocols. The scripts append the endpoint path.
-- `model`: model name sent in OpenAI-compatible request bodies and ASR multipart fields.
-- `headers`: HTTP headers. Values such as `"Bearer ${API_KEY}"` are expanded from environment variables.
-- `request`: optional protocol-specific fields merged into the generated OpenAI-compatible body or multipart form.
-- `dataset`: object with `type` and `path`, for example `text_prompts` or `audio_manifest`.
-- `body_template`: `generic_http` JSON body template. It is not environment-expanded. Its `${prompt}` and `${max_tokens}` values are sample placeholders filled from the dataset row, not shell environment variables.
+- `protocol`：协议类型，取值为 `openai_chat`、`openai_completion`、`openai_asr` 或 `generic_http`。
+- `base_url`：OpenAI-compatible 协议的 API 基础 URL，脚本会自动拼接 endpoint path。
+- `model`：OpenAI-compatible 请求体或 ASR multipart 字段中的模型名。
+- `headers`：HTTP headers。类似 `"Bearer ${API_KEY}"` 的值会从环境变量展开。
+- `request`：可选的协议专属字段，会合并到生成的 OpenAI-compatible body 或 multipart form 中。
+- `dataset`：包含 `type` 和 `path` 的对象，例如 `text_prompts` 或 `audio_manifest`。
+- `body_template`：`generic_http` 的 JSON body 模板。它不会做环境变量展开；其中 `${prompt}` 和 `${max_tokens}` 是样本占位符，会由 dataset 行填充，不是 shell 环境变量。
 
-Example environment variable usage:
+环境变量示例：
 
 ```bash
 export API_KEY="..."
 ./scripts/run_manual.sh --config configs/openai_chat.json --dry-run
 ```
 
-For `generic_http`, a template like this:
+对于 `generic_http`，如下模板：
 
 ```json
 {
@@ -86,51 +86,51 @@ For `generic_http`, a template like this:
 }
 ```
 
-uses `prompt` and `expected_output_len` from each dataset sample.
+会使用每条 dataset 样本中的 `prompt` 和 `expected_output_len`。
 
-## Datasets
+## 数据集
 
-Text datasets are JSONL files. Each line is one sample:
+文本数据集是 JSONL 文件，每行是一条样本：
 
 ```jsonl
 {"prompt": "Write a short introduction to API benchmarking.", "expected_output_len": 128, "metadata": {"case": "intro"}}
 ```
 
-Common fields:
+常用字段：
 
-- `prompt`: text input for chat, completion, or generic HTTP templates.
-- `expected_output_len`: used as the default `${max_tokens}` value for `generic_http`.
-- `metadata`: optional caller-defined details retained for traceability.
+- `prompt`：chat、completion 或 generic HTTP 模板使用的文本输入。
+- `expected_output_len`：作为 `generic_http` 中 `${max_tokens}` 的默认值。
+- `metadata`：可选的调用方自定义信息，用于追踪样本来源或场景。
 
-Audio manifest datasets are JSONL files for ASR:
+ASR 音频 manifest 也是 JSONL 文件：
 
 ```jsonl
 {"audio": "datasets/audio/sample.wav", "prompt": "Transcribe the audio.", "reference": "example transcript", "duration_s": 12.3}
 ```
 
-Common fields:
+常用字段：
 
-- `audio`: audio file path used as the multipart `file` upload.
-- `prompt`: optional ASR prompt.
-- `reference`: optional expected transcript for manual comparison.
-- `duration_s`: optional audio duration recorded into request metrics.
+- `audio`：作为 multipart `file` 上传的音频文件路径。
+- `prompt`：可选 ASR prompt。
+- `reference`：可选的期望转写结果，便于人工对比。
+- `duration_s`：可选音频时长，会记录到请求指标中；失败请求不会计入 ASR RTFX。
 
-## Manual Testing
+## 手动接口测试
 
-Use manual testing before automated load testing to validate endpoint shape, authentication, ASR uploads, and curl reproduction.
+自动压测前建议先做手动接口测试，用来验证 endpoint 形状、鉴权、ASR 上传格式和 curl 复现方式。
 
-Parameters:
+参数：
 
-- `--config`: config JSON path. Defaults to `configs/openai_chat.json`.
-- `--mode request|curl`: `request` sends or dry-runs a request; `curl` prints only curl. Defaults to `request`.
-- `--input`: text prompt override for the first dataset sample.
-- `--audio-file`: ASR audio path override for the first manifest sample.
-- `--request-count`: number of requests to send in request mode. Defaults to `1`.
-- `--print-curl`: print curl before sending requests.
-- `--save-response`: write response JSON to a file.
-- `--dry-run`: construct and print the request without network traffic.
+- `--config`：配置 JSON 路径，默认 `configs/openai_chat.json`。
+- `--mode request|curl`：`request` 会发送或 dry-run 请求；`curl` 只打印 curl。默认 `request`。
+- `--input`：覆盖第一条 dataset 样本的文本 prompt。
+- `--audio-file`：覆盖第一条 ASR manifest 样本的音频路径。
+- `--request-count`：request 模式下发送的请求数，默认 `1`。
+- `--print-curl`：发送请求前打印 curl。
+- `--save-response`：将响应 JSON 写入文件。
+- `--dry-run`：只构造并打印请求，不发送网络流量。
 
-Recommended commands for Codex or Claude:
+推荐给 Codex 或 Claude 调用的命令：
 
 ```bash
 ./scripts/run_manual.sh --config configs/openai_chat.json --dry-run --input "smoke test"
@@ -138,24 +138,24 @@ Recommended commands for Codex or Claude:
 ./scripts/run_manual.sh --config configs/openai_asr.json --audio-file path/to/audio.wav --print-curl --save-response reports/manual-asr.json
 ```
 
-## Automated Testing
+## 自动性能测试
 
-Use automated testing after a manual smoke succeeds.
+手动 smoke 通过后，再使用自动性能测试。
 
-Parameters:
+参数：
 
-- `--config`: config JSON path. Defaults to `configs/openai_chat.json`.
-- `--dataset`: dataset path override for the config.
-- `--concurrency`: comma or space separated concurrency values, for example `1,2,4` or `1 2 4`.
-- `--epochs`: requests per worker for each concurrency value when `--duration-seconds` is not set.
-- `--duration-seconds`: optional time-based load duration per concurrency tier. Duration mode keeps submitting replacement requests until the timer expires; total request count is known only after the run and should be read from `metrics.json`, `metrics.csv`, or `summary.md`.
-- `--max-error-rate`: optional threshold from `0` to `1`.
-- `--max-p90-latency-ms`: optional p90 latency threshold in milliseconds.
-- `--fail-fast`: stop after the first tier with zero completed requests, 100% request failure, or a `--max-error-rate` violation. The p90 threshold does not trigger fail-fast; a `--max-p90-latency-ms` violation is recorded and makes the command exit non-zero after the sweep completes.
-- `--output-dir`: report directory. Defaults to `reports/latest`.
-- `--dry-run`: print the plan without network traffic.
+- `--config`：配置 JSON 路径，默认 `configs/openai_chat.json`。
+- `--dataset`：覆盖配置中的 dataset 路径。
+- `--concurrency`：并发列表，支持逗号或空格分隔，例如 `1,2,4` 或 `1 2 4`。
+- `--epochs`：未设置 `--duration-seconds` 时，每个并发 worker 的请求数。
+- `--duration-seconds`：可选的按时间压测模式；每个并发档会持续提交替换请求直到计时结束。总请求数只有运行后才能确定，请以 `metrics.json`、`metrics.csv` 或 `summary.md` 为准。
+- `--max-error-rate`：可选错误率阈值，范围 `0` 到 `1`。
+- `--max-p90-latency-ms`：可选 p90 延迟阈值，单位毫秒。
+- `--fail-fast`：当某档 0 请求完成、100% 请求失败，或违反 `--max-error-rate` 时提前停止后续并发档。p90 threshold does not trigger fail-fast；违反 `--max-p90-latency-ms` 会被记录，并在 sweep 完成后让命令以非 0 退出。
+- `--output-dir`：报告输出目录，默认 `reports/latest`。
+- `--dry-run`：只打印计划，不发送网络流量。
 
-Recommended commands for Codex or Claude:
+推荐给 Codex 或 Claude 调用的命令：
 
 ```bash
 ./scripts/run_auto.sh --config configs/openai_chat.json --dry-run --concurrency 1,2 --epochs 2
@@ -164,35 +164,35 @@ Recommended commands for Codex or Claude:
 ./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2,4 --duration-seconds 30 --output-dir reports/sweep
 ```
 
-Suggested flow:
+建议流程：
 
-1. Run manual dry-run and curl checks.
-2. Run automated dry-run to verify the benchmark plan.
-3. Run a small smoke tier such as `--concurrency 1 --epochs 1`.
-4. Run the formal sweep with the planned concurrency, epochs or duration, thresholds, and output directory. In duration mode, reports are the source of truth for total request counts.
+1. 先运行手动 dry-run 和 curl 检查。
+2. 再运行自动压测 dry-run，确认压测计划。
+3. 先跑一个小 smoke 档，例如 `--concurrency 1 --epochs 1`。
+4. 最后按计划执行正式 sweep，指定并发、epochs 或 duration、阈值和输出目录。duration 模式下，报告才是总请求数的事实来源。
 
-## Reports
+## 报告输出
 
-Automated runs write these files under `--output-dir`:
+自动压测会在 `--output-dir` 下写出这些文件：
 
-- `summary.md`: human-readable conclusion, stable concurrency, peak throughput tier, overload tier, and metric table.
-- `metrics.json`: aggregate metrics per concurrency tier.
-- `metrics.csv`: the same aggregate metrics in CSV form.
-- `requests.jsonl`: one normalized request result per line.
-- `errors.jsonl`: only failed request rows.
+- `summary.md`：人类可读的结论、稳定并发、峰值吞吐并发档、过载起点和指标表。
+- `metrics.json`：每个并发档的聚合指标。
+- `metrics.csv`：同一份聚合指标的 CSV 版本。
+- `requests.jsonl`：每个请求一行的标准化结果。
+- `errors.jsonl`：只包含失败请求行。
 
-Read reports in this order:
+建议阅读顺序：
 
-1. Open `summary.md` for the conclusion and stable/peak/overload tiers.
-2. Check `metrics.json` or `metrics.csv` for success rate, error rate, latency percentiles, throughput, and request counts.
-3. Inspect `errors.jsonl` for repeated `auth_error`, `bad_request`, `not_found`, `file_not_found`, or timeout patterns.
-4. Use `requests.jsonl` when you need per-request latency or response summaries.
+1. 先看 `summary.md`，确认结论、stable/peak/overload 并发档。
+2. 再看 `metrics.json` 或 `metrics.csv`，关注成功率、错误率、延迟分位数、吞吐和请求数。
+3. 查看 `errors.jsonl`，定位重复出现的 `auth_error`、`bad_request`、`not_found`、`file_not_found` 或 timeout。
+4. 需要逐请求延迟或响应摘要时，再看 `requests.jsonl`。
 
-A 100% request failure result is not a performance bottleneck. If every request fails, fix the interface first: check `base_url`, endpoint path, credentials, model name, request body, ASR file paths, and target service availability. Do not interpret all-failed throughput or latency as service capacity.
+100% request failure 不是性能瓶颈。如果所有请求都失败，应先修接口：检查 `base_url`、endpoint path、凭据、模型名、请求体、ASR 文件路径和目标服务可用性。不要把全失败场景下的吞吐或延迟解释为服务容量。
 
-## Notes
+## 注意事项
 
-- Do not treat authentication, authorization, bad request, missing file, or route errors as performance bottlenecks.
-- Always run a manual smoke check before automated load testing.
-- The package measures the target you point it at; it does not manage target service startup, shutdown, warmup, deployment, or scaling.
-- Do not extrapolate beyond the tested model, hardware, dataset, concurrency, duration, request body, and service configuration.
+- 不要把鉴权失败、授权失败、bad request、文件缺失或路由错误当作性能瓶颈。
+- 自动压测前始终先运行手动 smoke 检查。
+- 本工具包只测量你指向的目标服务；不负责目标服务启动、停止、预热、部署或扩缩容。
+- 不要把结论外推到未测试的模型、硬件、数据集、并发、持续时间、请求体或服务配置。
