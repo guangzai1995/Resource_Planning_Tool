@@ -1,11 +1,43 @@
 import json
 from pathlib import Path
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class OpenAIChatHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        json.loads(body.decode("utf-8"))
+
+        if self.path != "/v1/chat/completions":
+            encoded = b"not found"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+
+        response = {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+        }
+        encoded = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, format, *args):
+        return
 
 
 def run_manual_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -153,6 +185,73 @@ def test_auto_cli_all_failed_non_dry_run_returns_nonzero_and_writes_reports(tmp_
     request_lines = (output_dir / "requests.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(request_lines) == 1
     assert json.loads(request_lines[0])["error_type"] == "file_not_found"
+    error_lines = (output_dir / "errors.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(error_lines) == 1
+    assert json.loads(error_lines[0])["error_type"] == "file_not_found"
+
+
+def test_perf_auto_writes_reports_with_local_server(tmp_path):
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text(
+        json.dumps({"prompt": "hello local", "expected_output_len": 8}) + "\n",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "reports"
+    server = HTTPServer(("127.0.0.1", 0), OpenAIChatHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "protocol": "openai_chat",
+                    "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                    "model": "local-test-model",
+                    "dataset": {
+                        "type": "text_prompts",
+                        "path": str(dataset_path),
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = run_auto_cli(
+            "--config",
+            str(config_path),
+            "--concurrency",
+            "1,2",
+            "--epochs",
+            "2",
+            "--output-dir",
+            str(output_dir),
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+    assert result.returncode == 0, result.stderr
+    assert "concurrency=1 request_count=2" in result.stdout
+    assert "concurrency=2 request_count=4" in result.stdout
+
+    for report_name in [
+        "summary.md",
+        "metrics.json",
+        "metrics.csv",
+        "requests.jsonl",
+        "errors.jsonl",
+    ]:
+        assert (output_dir / report_name).exists()
+
+    metrics = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert len(metrics) == 2
+    request_lines = (output_dir / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(request_lines) == 6
+    assert (output_dir / "errors.jsonl").read_text(encoding="utf-8") == ""
 
 
 def test_auto_cli_tiny_duration_submits_at_least_one_batch(tmp_path):
