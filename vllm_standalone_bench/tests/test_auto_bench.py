@@ -761,6 +761,25 @@ def test_manifest_records_relative_artifact_paths(tmp_path):
     assert data["run_id"] == "run123"
     assert data["status"] == "completed"
     assert data["cases"][0]["csv"] == "qwen2_5_1_5b/bf16_default/smoke/result.csv"
+    assert data["cases"][0]["serve_profile"] == "bf16_default"
+    assert data["cases"][0]["topology_profile"] is None
+
+
+def test_topology_manifest_records_null_serve_profile(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config, write_config as write_topology_config
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: FakeRemoteDockerRunner())
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *args, **kwargs: True)
+
+    ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8")
+    )
+    row = manifest["cases"][0]
+    assert row["serve_profile"] is None
+    assert row["topology_profile"] == "sglang_pd_2p2d"
 
 
 def test_manifest_interrupted_wins_over_incomplete_cases(tmp_path):
@@ -848,10 +867,38 @@ def test_plan_resume_cases_keeps_passed_and_selects_pending(tmp_path):
 
     assert unknown == []
     assert [row["bench_profile"] for row in initial_manifest.cases] == ["smoke"]
+    assert initial_manifest.cases[0]["topology_profile"] is None
     assert initial_manifest.cases[0]["status"] == "passed"
     assert initial_manifest.cases[0]["extra"] == {"source": "old"}
     assert [case.bench_profile.name for case in pending] == ["smoke2"]
     assert initial_manifest.total == 2
+
+
+def test_plan_resume_cases_supports_topology_key(tmp_path):
+    from test_remote_topology import pd_topology_config, write_config as write_topology_config
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "cases": [{
+            "model": "qwen2_5_1_5b",
+            "serve_profile": None,
+            "topology_profile": "sglang_pd_2p2d",
+            "bench_profile": "smoke",
+            "status": "passed",
+        }],
+    }
+
+    initial, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert len(initial.cases) == 1
+    assert pending == ()
+    assert unknown == []
 
 
 def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
@@ -950,7 +997,37 @@ def test_plan_resume_cases_reports_manifest_rows_not_in_config(tmp_path):
 
     assert initial_manifest.cases == []
     assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2"]
-    assert unknown == [("old_model", "old_serve", "old_bench")]
+    assert unknown == [("old_model", "old_serve", None, "old_bench")]
+
+
+def test_plan_resume_cases_reports_unknown_topology_rows(tmp_path):
+    from test_remote_topology import pd_topology_config, write_config as write_topology_config
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "status": "interrupted",
+        "cases": [
+            {
+                "model": "qwen2_5_1_5b",
+                "serve_profile": None,
+                "topology_profile": "old_topology",
+                "bench_profile": "smoke",
+                "status": "passed",
+            }
+        ],
+    }
+
+    initial_manifest, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert initial_manifest.cases == []
+    assert pending == cases
+    assert unknown == [("qwen2_5_1_5b", None, "old_topology", "smoke")]
 
 
 def write_resume_state(run_dir, status="interrupted"):
@@ -971,7 +1048,10 @@ def write_resume_manifest(run_dir, cases, config, statuses):
         layout = ab.build_layout(config, run_dir.name, case)
         rows.append({
             "model": case.model.name,
-            "serve_profile": case.serve_profile.name,
+            "serve_profile": case.serve_profile.name if case.serve_profile else None,
+            "topology_profile": (
+                case.topology_profile.name if case.topology_profile else None
+            ),
             "bench_profile": case.bench_profile.name,
             "status": status,
             "csv": str((layout.bench_dir / "result.csv").relative_to(layout.run_dir)),
@@ -1092,7 +1172,7 @@ def test_load_resume_context_returns_unknown_manifest_cases(tmp_path):
 
     context = ab.load_resume_context(tmp_path / "results", "run123")
 
-    assert context.unknown_manifest_cases == (("old_model", "old_serve", "old_bench"),)
+    assert context.unknown_manifest_cases == (("old_model", "old_serve", None, "old_bench"),)
 
 
 def test_controller_command_matches_resume_child(tmp_path):
@@ -3218,6 +3298,47 @@ def test_status_reads_state_file(tmp_path, capsys):
     assert "m/s/b" in captured.out
     assert "pid: 12345" in captured.out
     assert "manifest: completed_with_failures cases=3" in captured.out
+
+
+def test_status_reads_topology_current(tmp_path, capsys):
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": {
+            "model": "m",
+            "serve_profile": None,
+            "topology_profile": "topo",
+            "bench_profile": "b",
+        },
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+
+    exit_code = ab.print_status(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "m/topo/b" in captured.out
+
+
+def test_current_bench_log_path_uses_topology_current(tmp_path):
+    run_dir = tmp_path / "results" / "run123"
+    log_path = run_dir / "m" / "topo" / "b" / "bench.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("bench log\n", encoding="utf-8")
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": {
+            "model": "m",
+            "serve_profile": None,
+            "topology_profile": "topo",
+            "bench_profile": "b",
+        },
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+
+    assert ab.current_bench_log_path(run_dir) == log_path
 
 
 def test_status_corrupt_state_returns_error(tmp_path, capsys):

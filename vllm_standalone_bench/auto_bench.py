@@ -56,6 +56,7 @@ class ConfigError(ValueError):
 
 
 SUPPORTED_ENGINES = ("vllm", "sglang")
+CaseKey = tuple[str, str | None, str | None, str]
 
 
 class StopRequested(Exception):
@@ -1240,7 +1241,10 @@ class Manifest:
                error: str | None = None) -> None:
         row: dict[str, Any] = {
             "model": case.model.name,
-            "serve_profile": case.serving_name,
+            "serve_profile": case.serve_profile.name if case.serve_profile else None,
+            "topology_profile": (
+                case.topology_profile.name if case.topology_profile else None
+            ),
             "bench_profile": case.bench_profile.name,
             "status": status,
             "csv": str((layout.bench_dir / "result.csv").relative_to(layout.run_dir)),
@@ -2173,7 +2177,7 @@ class ResumeContext:
     run_dir: Path
     initial_manifest: Manifest
     pending_cases: tuple[BenchmarkCase, ...]
-    unknown_manifest_cases: tuple[tuple[str, str, str], ...]
+    unknown_manifest_cases: tuple[CaseKey, ...]
 
 
 def run_lock_path(run_dir: Path) -> Path:
@@ -2561,10 +2565,13 @@ def dry_run_config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
     return payload
 
 
-def _case_ref(case: BenchmarkCase) -> dict[str, str]:
+def _case_ref(case: BenchmarkCase) -> dict[str, str | None]:
     return {
         "model": case.model.name,
-        "serve_profile": case.serving_name,
+        "serve_profile": case.serve_profile.name if case.serve_profile else None,
+        "topology_profile": (
+            case.topology_profile.name if case.topology_profile else None
+        ),
         "bench_profile": case.bench_profile.name,
     }
 
@@ -2622,24 +2629,36 @@ def write_terminal_state(run_dir: Path, run_id: str, manifest: Manifest,
     write_state(run_dir, state)
 
 
-def _case_key(case: BenchmarkCase) -> tuple[str, str, str]:
-    return (case.model.name, case.serving_name, case.bench_profile.name)
+def _case_key(case: BenchmarkCase) -> CaseKey:
+    return (
+        case.model.name,
+        case.serve_profile.name if case.serve_profile else None,
+        case.topology_profile.name if case.topology_profile else None,
+        case.bench_profile.name,
+    )
 
 
-def _manifest_case_keys(manifest: Manifest) -> set[tuple[str, str, str]]:
-    return {
-        (str(row["model"]), str(row["serve_profile"]), str(row["bench_profile"]))
-        for row in manifest.cases
-    }
+def _manifest_case_keys(manifest: Manifest) -> set[CaseKey]:
+    keys: set[CaseKey] = set()
+    for row in manifest.cases:
+        key = _manifest_row_key(row)
+        if key is not None:
+            keys.add(key)
+    return keys
 
 
-def _manifest_row_key(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
+def _manifest_row_key(row: Mapping[str, Any]) -> CaseKey | None:
     model = row.get("model")
     serve_profile = row.get("serve_profile")
+    topology_profile = row.get("topology_profile")
     bench_profile = row.get("bench_profile")
-    if not all(isinstance(value, str) for value in (model, serve_profile, bench_profile)):
+    if not isinstance(model, str) or not isinstance(bench_profile, str):
         return None
-    return (model, serve_profile, bench_profile)
+    if isinstance(serve_profile, str) and topology_profile is None:
+        return (model, serve_profile, None, bench_profile)
+    if serve_profile is None and isinstance(topology_profile, str):
+        return (model, None, topology_profile, bench_profile)
+    return None
 
 
 def _copy_manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -2656,7 +2675,7 @@ def plan_resume_cases(
     run_id: str,
     cases: tuple[BenchmarkCase, ...],
     manifest_data: Mapping[str, Any],
-) -> tuple[Manifest, tuple[BenchmarkCase, ...], list[tuple[str, str, str]]]:
+) -> tuple[Manifest, tuple[BenchmarkCase, ...], list[CaseKey]]:
     rows = manifest_data.get("cases")
     if not isinstance(rows, list):
         raise ConfigError("manifest cases must be a list")
@@ -2667,8 +2686,8 @@ def plan_resume_cases(
 
     full_keys = {_case_key(case) for case in cases}
     passed_rows: list[dict[str, Any]] = []
-    passed_keys: set[tuple[str, str, str]] = set()
-    unknown_keys: list[tuple[str, str, str]] = []
+    passed_keys: set[CaseKey] = set()
+    unknown_keys: list[CaseKey] = []
 
     for row in rows:
         if not isinstance(row, dict):
@@ -2681,7 +2700,10 @@ def plan_resume_cases(
             continue
         if row.get("status") == "passed":
             passed_keys.add(key)
-            passed_rows.append(_copy_manifest_row(row))
+            copied = _copy_manifest_row(row)
+            copied.setdefault("serve_profile", key[1])
+            copied.setdefault("topology_profile", key[2])
+            passed_rows.append(copied)
 
     initial_manifest = Manifest(run_id=run_id, total=len(cases), cases=passed_rows)
     pending = tuple(case for case in cases if _case_key(case) not in passed_keys)
@@ -3489,9 +3511,10 @@ def start_detached(config_path: Path | None, config: AutoBenchConfig, run_id: st
 def _format_current(current: Any) -> str:
     if not isinstance(current, dict):
         return "-"
+    serving_name = current.get("serve_profile") or current.get("topology_profile")
     return "/".join([
         str(current.get("model", "-")),
-        str(current.get("serve_profile", "-")),
+        str(serving_name or "-"),
         str(current.get("bench_profile", "-")),
     ])
 
@@ -3614,11 +3637,13 @@ def current_bench_log_path(run_dir: Path) -> Path | None:
     if not isinstance(current, dict):
         return None
     model = _safe_log_component(current.get("model"))
-    serve_profile = _safe_log_component(current.get("serve_profile"))
+    serving_name = _safe_log_component(
+        current.get("serve_profile") or current.get("topology_profile")
+    )
     bench_profile = _safe_log_component(current.get("bench_profile"))
-    if not all([model, serve_profile, bench_profile]):
+    if not all([model, serving_name, bench_profile]):
         return None
-    log_path = run_dir / model / serve_profile / bench_profile / "bench.log"
+    log_path = run_dir / model / serving_name / bench_profile / "bench.log"
     return log_path if log_path.exists() else None
 
 

@@ -1,7 +1,8 @@
 """多引擎结果对比聚合。
 
-读取各 serve_profile 的 result.csv，按 (bench_profile, input_len, output_len,
-parallel_num) 对齐多引擎，产出 compare.csv / compare.xlsx 与图表。
+读取各 serve_profile/topology_profile 的 result.csv，按
+(bench_profile, input_len, output_len, parallel_num) 对齐多引擎，产出
+compare.csv / compare.xlsx 与图表。
 
 铁律：原始 result.csv 只读，本模块永不修改或删除它们。
 """
@@ -10,7 +11,7 @@ from __future__ import annotations
 import csv
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +24,34 @@ _PLOT_YLABEL = {
 }
 
 
-def _engine_by_serve_profile(config: Any) -> dict[str, str]:
-    return {profile.name: profile.engine for profile in config.serve_profiles}
+class ServingDimension(NamedTuple):
+    name: str
+    engine: str
+    field: str
+    label: str
+
+
+def _serving_profiles(config: Any) -> Iterable[tuple[str, str, str]]:
+    for profile in config.serve_profiles:
+        yield profile.name, profile.engine, "serve_profile"
+    for profile in getattr(config, "topology_profiles", ()):
+        yield profile.name, profile.engine, "topology_profile"
+
+
+def _serving_dimensions(config: Any) -> list[ServingDimension]:
+    profiles = list(_serving_profiles(config))
+    engine_counts: dict[str, int] = {}
+    for _, engine, _ in profiles:
+        engine_counts[engine] = engine_counts.get(engine, 0) + 1
+    return [
+        ServingDimension(
+            name=name,
+            engine=engine,
+            field=field,
+            label=name if engine_counts[engine] > 1 else engine,
+        )
+        for name, engine, field in profiles
+    ]
 
 
 def _read_result_rows(path: Path, bench_profile: str) -> list[dict[str, str]]:
@@ -39,10 +66,10 @@ def _collect_aligned(
     config: Any, run_dir: Path
 ) -> dict[tuple, dict[str, dict[str, str]]]:
     aligned: dict[tuple, dict[str, dict[str, str]]] = {}
-    for serve_name, engine in _engine_by_serve_profile(config).items():
+    for serving in _serving_dimensions(config):
         for model in config.models:
             for bench in config.bench_profiles:
-                csv_path = run_dir / model.name / serve_name / bench.name / "result.csv"
+                csv_path = run_dir / model.name / serving.name / bench.name / "result.csv"
                 if not csv_path.exists():
                     logger.warning("对比缺失结果文件，跳过：%s", csv_path)
                     continue
@@ -53,33 +80,34 @@ def _collect_aligned(
                         int(row["output_len"]),
                         int(row["parallel_num"]),
                     )
-                    aligned.setdefault(key, {})[engine] = row
+                    aligned.setdefault(key, {})[serving.label] = row
     return aligned
 
 
-def _ordered_engines(config: Any) -> list[str]:
-    """参与对比的全部引擎，顺序由 config.serve_profiles 定义（去重）。
+def _ordered_labels(config: Any) -> list[str]:
+    """参与对比的列前缀，顺序由 serve/topology 配置定义。
 
-    使用配置全集而非 aligned 中实际出现的引擎，确保缺失引擎的列以 N/A 填充，
-    且列顺序稳定（不随数据增减而抖动）。
+    当每个 engine 只出现一次时，列前缀保持旧格式（engine 名）。同一 engine
+    出现多次时，使用 serving profile/topology profile 名称作为列前缀以避免覆盖。
+    使用配置全集而非 aligned 中实际出现的列，确保缺失结果以 N/A 填充。
     """
     seen: list[str] = []
-    for profile in config.serve_profiles:
-        if profile.engine not in seen:
-            seen.append(profile.engine)
+    for serving in _serving_dimensions(config):
+        if serving.label not in seen:
+            seen.append(serving.label)
     return seen
 
 
-def _compare_fieldnames(engines: list[str]) -> list[str]:
+def _compare_fieldnames(labels: list[str]) -> list[str]:
     cols = ["bench_profile", "input_len", "output_len", "parallel_num"]
-    for engine in engines:
+    for label in labels:
         for metric in COMPARE_METRICS:
-            cols.append(f"{engine}__{metric}")
+            cols.append(f"{label}__{metric}")
     return cols
 
 
 def _build_compare_rows(
-    aligned: dict[tuple, dict[str, dict[str, str]]], engines: list[str]
+    aligned: dict[tuple, dict[str, dict[str, str]]], labels: list[str]
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for key in sorted(aligned):
@@ -90,30 +118,30 @@ def _build_compare_rows(
             "output_len": out_len,
             "parallel_num": parallel,
         }
-        engine_map = aligned[key]
-        for engine in engines:
-            present = engine in engine_map
+        label_map = aligned[key]
+        for label in labels:
+            present = label in label_map
             for metric in COMPARE_METRICS:
-                col = f"{engine}__{metric}"
-                row[col] = engine_map[engine].get(metric, "") if present else "N/A"
+                col = f"{label}__{metric}"
+                row[col] = label_map[label].get(metric, "") if present else "N/A"
         rows.append(row)
     return rows
 
 
 def _write_compare_csv(
-    rows: list[dict[str, Any]], engines: list[str], path: Path
+    rows: list[dict[str, Any]], labels: list[str], path: Path
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(
-            handle, fieldnames=_compare_fieldnames(engines), extrasaction="ignore"
+            handle, fieldnames=_compare_fieldnames(labels), extrasaction="ignore"
         )
         writer.writeheader()
         writer.writerows(rows)
 
 
 def _write_compare_xlsx(
-    rows: list[dict[str, Any]], engines: list[str], path: Path
+    rows: list[dict[str, Any]], labels: list[str], path: Path
 ) -> None:
     try:
         from openpyxl import Workbook
@@ -123,7 +151,7 @@ def _write_compare_xlsx(
     wb = Workbook()
     ws = wb.active
     ws.title = "compare"
-    fieldnames = _compare_fieldnames(engines)
+    fieldnames = _compare_fieldnames(labels)
     ws.append(fieldnames)
     for row in rows:
         ws.append([row.get(col, "") for col in fieldnames])
@@ -143,7 +171,6 @@ def _to_float(value: str | None) -> float:
 def _plot(
     run_dir: Path,
     aligned: dict[tuple, dict[str, dict[str, str]]],
-    engines: list[str],
 ) -> None:
     try:
         import matplotlib
@@ -161,13 +188,13 @@ def _plot(
     plots_dir.mkdir(parents=True, exist_ok=True)
     # 按 (bench_profile, input_len, output_len) 聚点
     grouped: dict[tuple, dict[str, list[tuple[int, float]]]] = {}
-    for key, engine_map in aligned.items():
+    for key, label_map in aligned.items():
         bench_profile, in_len, out_len, parallel = key
         gkey = (bench_profile, in_len, out_len)
         series = grouped.setdefault(gkey, {})
-        for engine, row in engine_map.items():
+        for label, row in label_map.items():
             for metric in PLOT_METRICS:
-                series.setdefault(f"{engine}__{metric}", []).append(
+                series.setdefault(f"{label}__{metric}", []).append(
                     (parallel, _to_float(row.get(metric)))
                 )
     for gkey, series in grouped.items():
@@ -180,8 +207,8 @@ def _plot(
                 points_sorted = sorted(points, key=lambda p: p[0])
                 xs = [p[0] for p in points_sorted]
                 ys = [p[1] for p in points_sorted]
-                engine = label.split("__", 1)[0]
-                plt.plot(xs, ys, marker="o", label=engine)
+                serving_label = label.split("__", 1)[0]
+                plt.plot(xs, ys, marker="o", label=serving_label)
             plt.xlabel("并发数 (parallel_num)")
             plt.ylabel(_PLOT_YLABEL[metric])
             plt.title(f"{bench_profile} in={in_len} out={out_len} · {metric}")
@@ -199,11 +226,11 @@ def aggregate_compare(config: Any, run_dir: Path) -> Path | None:
     if not aligned:
         logger.info("无可对比结果，跳过聚合")
         return None
-    engines = _ordered_engines(config)
-    rows = _build_compare_rows(aligned, engines)
+    labels = _ordered_labels(config)
+    rows = _build_compare_rows(aligned, labels)
     compare_csv = run_dir / "compare.csv"
-    _write_compare_csv(rows, engines, compare_csv)
-    _write_compare_xlsx(rows, engines, run_dir / "compare.xlsx")
-    _plot(run_dir, aligned, engines)
-    logger.info("对比聚合完成：%s（引擎：%s）", compare_csv, engines)
+    _write_compare_csv(rows, labels, compare_csv)
+    _write_compare_xlsx(rows, labels, run_dir / "compare.xlsx")
+    _plot(run_dir, aligned)
+    logger.info("对比聚合完成：%s（列前缀：%s）", compare_csv, labels)
     return compare_csv
