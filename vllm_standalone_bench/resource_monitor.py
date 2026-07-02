@@ -1,6 +1,13 @@
 import csv
+import json
 import math
+import subprocess
+import threading
+import time
+from dataclasses import dataclass
 from io import StringIO
+from pathlib import Path
+from typing import Any, Callable, Mapping
 
 
 NVIDIA_SMI_QUERY = [
@@ -10,6 +17,197 @@ NVIDIA_SMI_QUERY = [
 ]
 
 _MB = 1024.0 * 1024.0
+_SECTOR_BYTES = 512.0
+
+SAMPLE_HEADERS = [
+    "timestamp", "elapsed_s",
+    "cpu_util_pct",
+    "mem_total_mb", "mem_used_mb", "mem_available_mb", "mem_used_pct",
+    "net_rx_mb_s", "net_tx_mb_s",
+    "disk_read_mb_s", "disk_write_mb_s",
+    "gpu_count", "gpu_util_avg_pct", "gpu_util_max_pct",
+    "gpu_mem_used_avg_mb", "gpu_mem_used_max_mb", "gpu_mem_total_mb",
+    "gpu_mem_used_max_pct", "gpu_power_avg_w", "gpu_power_max_w",
+    "gpu_temp_max_c",
+]
+
+RESOURCE_RESULT_COLUMNS = [
+    "resource_monitor_available", "resource_sample_count",
+    "cpu_util_avg_pct", "cpu_util_p95_pct", "cpu_util_max_pct",
+    "mem_used_avg_mb", "mem_used_p95_mb", "mem_used_max_mb", "mem_used_max_pct",
+    "net_rx_avg_mb_s", "net_rx_max_mb_s", "net_tx_avg_mb_s", "net_tx_max_mb_s",
+    "disk_read_avg_mb_s", "disk_read_max_mb_s",
+    "disk_write_avg_mb_s", "disk_write_max_mb_s",
+    "gpu_count", "gpu_util_avg_pct", "gpu_util_p95_pct", "gpu_util_max_pct",
+    "gpu_mem_used_avg_mb", "gpu_mem_used_p95_mb", "gpu_mem_used_max_mb",
+    "gpu_mem_total_mb", "gpu_mem_used_max_pct",
+    "gpu_power_avg_w", "gpu_power_p95_w", "gpu_power_max_w",
+    "gpu_temp_max_c",
+]
+
+
+@dataclass(frozen=True)
+class ResourceReaders:
+    proc_stat: Callable[[], str]
+    meminfo: Callable[[], str]
+    net_dev: Callable[[], str]
+    diskstats: Callable[[], str]
+    nvidia_smi: Callable[[], str]
+
+
+def default_readers():
+    return ResourceReaders(
+        proc_stat=lambda: Path("/proc/stat").read_text(encoding="utf-8"),
+        meminfo=lambda: Path("/proc/meminfo").read_text(encoding="utf-8"),
+        net_dev=lambda: Path("/proc/net/dev").read_text(encoding="utf-8"),
+        diskstats=lambda: Path("/proc/diskstats").read_text(encoding="utf-8"),
+        nvidia_smi=lambda: subprocess.run(
+            NVIDIA_SMI_QUERY,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout,
+    )
+
+
+class ResourceMonitor:
+    def __init__(
+        self,
+        *,
+        output_dir,
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=None,
+    ):
+        self.output_dir = Path(output_dir)
+        self.interval_sec = float(interval_sec)
+        self.enabled = enabled
+        self.backend = backend
+        self.readers = readers or default_readers()
+        self.samples = []
+        self.gpu_samples = []
+        self.error_count = 0
+        self._started_at = None
+        self._last_sample_at = None
+        self._previous_cpu = None
+        self._previous_net = None
+        self._previous_disk = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+    def start(self):
+        if not self.enabled:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self.sample_once()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="resource-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self.interval_sec):
+            self.sample_once()
+
+    def sample_once(self, now=None):
+        if not self.enabled:
+            return
+
+        timestamp = time.time() if now is None else now
+        with self._lock:
+            if self._started_at is None:
+                self._started_at = timestamp
+            elapsed_since_previous = (
+                self.interval_sec
+                if self._last_sample_at is None
+                else timestamp - self._last_sample_at
+            )
+            sample = {
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
+                "elapsed_s": _round(timestamp - self._started_at),
+            }
+            self._sample_system(sample, elapsed_since_previous)
+            self._sample_gpu(sample)
+            self.samples.append(sample)
+            self._last_sample_at = timestamp
+
+    def _sample_system(self, sample, elapsed_s):
+        try:
+            current_cpu = parse_proc_stat(self.readers.proc_stat())
+            sample["cpu_util_pct"] = (
+                cpu_utilization_pct(self._previous_cpu, current_cpu)
+                if self._previous_cpu is not None
+                else None
+            )
+            self._previous_cpu = current_cpu
+        except Exception:
+            self.error_count += 1
+
+        try:
+            sample.update(parse_meminfo(self.readers.meminfo()))
+        except Exception:
+            self.error_count += 1
+
+        try:
+            current_net = parse_net_dev(self.readers.net_dev())
+            sample.update(
+                network_rates_mb_s(self._previous_net, current_net, elapsed_s=elapsed_s)
+                if self._previous_net is not None
+                else {"net_rx_mb_s": None, "net_tx_mb_s": None}
+            )
+            self._previous_net = current_net
+        except Exception:
+            self.error_count += 1
+
+        try:
+            current_disk = parse_diskstats(self.readers.diskstats())
+            sample.update(
+                disk_rates_mb_s(self._previous_disk, current_disk, elapsed_s=elapsed_s)
+                if self._previous_disk is not None
+                else {"disk_read_mb_s": None, "disk_write_mb_s": None}
+            )
+            self._previous_disk = current_disk
+        except Exception:
+            self.error_count += 1
+
+    def _sample_gpu(self, sample):
+        if self.backend != "nvidia-smi":
+            apply_gpu_aggregate(sample, [])
+            return
+
+        try:
+            gpus = parse_nvidia_smi_csv(self.readers.nvidia_smi())
+        except Exception:
+            self.error_count += 1
+            gpus = []
+
+        self.gpu_samples.extend(gpus)
+        apply_gpu_aggregate(sample, gpus)
+
+    def stop(self):
+        if not self.enabled:
+            return {"available": False, "sample_count": 0, "aggregate": {}}
+
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(self.interval_sec, 1.0) + 1.0)
+
+        summary = summarize_samples(
+            self.samples,
+            gpu_details=summarize_gpus(self.gpu_samples),
+            error_count=self.error_count,
+            interval_sec=self.interval_sec,
+            backend=self.backend,
+        )
+        write_samples_csv(self.output_dir / "resource_samples.csv", self.samples)
+        write_summary_json(self.output_dir / "resource_summary.json", summary)
+        return summary
 
 
 def parse_proc_stat(text):
@@ -108,6 +306,56 @@ def network_rates_mb_s(previous, current, *, elapsed_s):
     }
 
 
+def parse_diskstats(text):
+    devices = {}
+    main_read_sectors = 0
+    main_write_sectors = 0
+    all_read_sectors = 0
+    all_write_sectors = 0
+    saw_main_device = False
+
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+
+        name = parts[2]
+        if name.startswith("loop") or name.startswith("ram"):
+            continue
+
+        read_sectors = int(parts[5])
+        write_sectors = int(parts[9])
+        devices[name] = {
+            "read_sectors": read_sectors,
+            "write_sectors": write_sectors,
+        }
+        all_read_sectors += read_sectors
+        all_write_sectors += write_sectors
+
+        if not _is_partition_device(name):
+            saw_main_device = True
+            main_read_sectors += read_sectors
+            main_write_sectors += write_sectors
+
+    return {
+        "read_sectors": main_read_sectors if saw_main_device else all_read_sectors,
+        "write_sectors": main_write_sectors if saw_main_device else all_write_sectors,
+        "devices": devices,
+    }
+
+
+def disk_rates_mb_s(previous, current, *, elapsed_s):
+    if elapsed_s <= 0:
+        return {"disk_read_mb_s": None, "disk_write_mb_s": None}
+
+    read_delta = max(0, current["read_sectors"] - previous["read_sectors"])
+    write_delta = max(0, current["write_sectors"] - previous["write_sectors"])
+    return {
+        "disk_read_mb_s": read_delta * _SECTOR_BYTES / _MB / elapsed_s,
+        "disk_write_mb_s": write_delta * _SECTOR_BYTES / _MB / elapsed_s,
+    }
+
+
 def parse_nvidia_smi_csv(text):
     gpus = []
     for row in csv.reader(StringIO(text)):
@@ -137,6 +385,54 @@ def parse_nvidia_smi_csv(text):
         })
 
     return gpus
+
+
+def apply_gpu_aggregate(sample, gpus):
+    gpus = list(gpus)
+    sample["gpu_count"] = len(gpus)
+    sample["gpu_util_avg_pct"] = _average(_gpu_values(gpus, "gpu_util_pct"))
+    sample["gpu_util_max_pct"] = _maximum(_gpu_values(gpus, "gpu_util_pct"))
+    sample["gpu_mem_used_avg_mb"] = _average(_gpu_values(gpus, "gpu_mem_used_mb"))
+    sample["gpu_mem_used_max_mb"] = _maximum(_gpu_values(gpus, "gpu_mem_used_mb"))
+    sample["gpu_mem_total_mb"] = _maximum(_gpu_values(gpus, "gpu_mem_total_mb"))
+    sample["gpu_mem_used_max_pct"] = _maximum(_gpu_values(gpus, "gpu_mem_used_pct"))
+    sample["gpu_power_avg_w"] = _average(_gpu_values(gpus, "gpu_power_w"))
+    sample["gpu_power_max_w"] = _maximum(_gpu_values(gpus, "gpu_power_w"))
+    sample["gpu_temp_max_c"] = _maximum(_gpu_values(gpus, "gpu_temperature_c"))
+    sample["gpu_temperature_c"] = sample["gpu_temp_max_c"]
+
+
+def summarize_gpus(gpu_samples):
+    grouped = {}
+    for gpu in gpu_samples:
+        grouped.setdefault(gpu["gpu_index"], []).append(gpu)
+
+    summaries = []
+    for gpu_index in sorted(grouped):
+        samples = grouped[gpu_index]
+        first = samples[0]
+        summaries.append({
+            "gpu_index": gpu_index,
+            "gpu_name": first.get("gpu_name"),
+            "gpu_uuid": first.get("gpu_uuid"),
+            "sample_count": len(samples),
+            "gpu_util_avg_pct": _average(_gpu_values(samples, "gpu_util_pct")),
+            "gpu_util_p95_pct": _p95(_gpu_values(samples, "gpu_util_pct")),
+            "gpu_util_max_pct": _maximum(_gpu_values(samples, "gpu_util_pct")),
+            "gpu_mem_used_avg_mb": _average(_gpu_values(samples, "gpu_mem_used_mb")),
+            "gpu_mem_used_p95_mb": _p95(_gpu_values(samples, "gpu_mem_used_mb")),
+            "gpu_mem_used_max_mb": _maximum(_gpu_values(samples, "gpu_mem_used_mb")),
+            "gpu_mem_total_mb": _maximum(_gpu_values(samples, "gpu_mem_total_mb")),
+            "gpu_mem_used_max_pct": _maximum(_gpu_values(samples, "gpu_mem_used_pct")),
+            "gpu_power_avg_w": _average(_gpu_values(samples, "gpu_power_w")),
+            "gpu_power_p95_w": _p95(_gpu_values(samples, "gpu_power_w")),
+            "gpu_power_max_w": _maximum(_gpu_values(samples, "gpu_power_w")),
+            "gpu_temp_avg_c": _average(_gpu_values(samples, "gpu_temperature_c")),
+            "gpu_temp_p95_c": _p95(_gpu_values(samples, "gpu_temperature_c")),
+            "gpu_temp_max_c": _maximum(_gpu_values(samples, "gpu_temperature_c")),
+        })
+
+    return summaries
 
 
 def summarize_samples(
@@ -200,6 +496,146 @@ def summarize_samples(
         "aggregate": aggregate,
         "gpus": gpu_details,
     }
+
+
+def write_samples_csv(path, samples):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=SAMPLE_HEADERS,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        for sample in samples:
+            writer.writerow({key: sample.get(key) for key in SAMPLE_HEADERS})
+
+
+def write_summary_json(path, summary):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def flatten_summary_for_result(summary):
+    aggregate = summary.get("aggregate", {})
+    values = {}
+    for column in RESOURCE_RESULT_COLUMNS:
+        if column == "resource_monitor_available":
+            values[column] = _result_value(summary.get("available", False))
+        elif column == "resource_sample_count":
+            values[column] = _result_value(summary.get("sample_count", 0))
+        else:
+            values[column] = _result_value(aggregate.get(column))
+    return values
+
+
+def append_summary_to_result_files(output_dir, summary):
+    output_dir = Path(output_dir)
+    values = flatten_summary_for_result(summary)
+
+    csv_path = output_dir / "result.csv"
+    if csv_path.exists():
+        append_summary_to_csv(csv_path, values)
+
+    xlsx_path = output_dir / "result.xlsx"
+    if xlsx_path.exists():
+        try:
+            append_summary_to_xlsx(xlsx_path, values)
+        except Exception:
+            pass
+
+
+def append_summary_to_csv(path, values):
+    path = Path(path)
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    merged_fieldnames = fieldnames + [
+        column for column in RESOURCE_RESULT_COLUMNS
+        if column not in fieldnames
+    ]
+    for row in rows:
+        for column in RESOURCE_RESULT_COLUMNS:
+            row[column] = values.get(column, "")
+
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=merged_fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def append_summary_to_xlsx(path, values):
+    try:
+        import openpyxl
+    except ImportError:
+        return
+
+    path = Path(path)
+    workbook = openpyxl.load_workbook(path)
+    worksheet = workbook.active
+    column_by_name = {
+        worksheet.cell(row=1, column=column).value: column
+        for column in range(1, worksheet.max_column + 1)
+        if worksheet.cell(row=1, column=column).value is not None
+    }
+
+    next_column = worksheet.max_column + 1
+    for column_name in RESOURCE_RESULT_COLUMNS:
+        column = column_by_name.get(column_name)
+        if column is None:
+            column = next_column
+            next_column += 1
+            column_by_name[column_name] = column
+            worksheet.cell(row=1, column=column, value=column_name)
+            if worksheet.max_row >= 2:
+                worksheet.cell(row=2, column=column, value=column_name)
+
+    data_start_row = 3 if worksheet.max_row >= 2 else 2
+    for row in range(data_start_row, worksheet.max_row + 1):
+        for column_name in RESOURCE_RESULT_COLUMNS:
+            worksheet.cell(
+                row=row,
+                column=column_by_name[column_name],
+                value=values.get(column_name, ""),
+            )
+
+    workbook.save(path)
+
+
+def _is_partition_device(name):
+    if name.startswith("dm-") or name.startswith("md"):
+        return False
+    if name.startswith("nvme") or name.startswith("mmcblk"):
+        head, sep, tail = name.rpartition("p")
+        return bool(head and sep and tail.isdigit())
+    return name[-1:].isdigit()
+
+
+def _gpu_values(gpus, key):
+    return [
+        float(gpu[key])
+        for gpu in gpus
+        if gpu.get(key) is not None
+    ]
+
+
+def _result_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    return value
+
+
+def _round(value):
+    return round(value, 6)
 
 
 def _parse_float(value):

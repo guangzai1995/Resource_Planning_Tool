@@ -1,3 +1,7 @@
+import csv
+import json
+from pathlib import Path
+
 import pytest
 
 import resource_monitor as rm
@@ -231,3 +235,112 @@ def test_summarize_samples_reports_unavailable_when_empty():
     assert summary["system_available"] is False
     assert summary["gpu_available"] is False
     assert summary["sample_count"] == 0
+
+
+def test_resource_monitor_writes_samples_and_summary(tmp_path):
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=lambda: "cpu  100 0 50 850 0 0 0 0 0 0\n",
+            meminfo=lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+            net_dev=lambda: "",
+            diskstats=lambda: "",
+            nvidia_smi=lambda: "0, NVIDIA H200, GPU-0, 50, 1000, 2000, 300, 70\n",
+        ),
+    )
+
+    monitor.sample_once(now=100.0)
+    summary = monitor.stop()
+
+    assert (tmp_path / "resource_samples.csv").is_file()
+    assert (tmp_path / "resource_summary.json").is_file()
+    loaded = json.loads((tmp_path / "resource_summary.json").read_text(encoding="utf-8"))
+    assert loaded["available"] is True
+    assert loaded["gpu_available"] is True
+    assert summary["aggregate"]["gpu_count"] == 1
+
+
+def test_resource_monitor_degrades_when_nvidia_smi_missing(tmp_path):
+    def missing_gpu():
+        raise FileNotFoundError("nvidia-smi")
+
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=lambda: "cpu  100 0 50 850 0 0 0 0 0 0\n",
+            meminfo=lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+            net_dev=lambda: "",
+            diskstats=lambda: "",
+            nvidia_smi=missing_gpu,
+        ),
+    )
+
+    monitor.sample_once(now=100.0)
+    summary = monitor.stop()
+
+    assert summary["available"] is True
+    assert summary["system_available"] is True
+    assert summary["gpu_available"] is False
+    assert summary["error_count"] >= 1
+
+
+def test_parse_diskstats_and_compute_rates():
+    before = "   8       0 sda 10 0 100 0 5 0 20 0 0 0 0 0 0 0 0 0 0\n"
+    after = "   8       0 sda 20 0 4196 0 7 0 2068 0 0 0 0 0 0 0 0 0 0\n"
+
+    rates = rm.disk_rates_mb_s(
+        rm.parse_diskstats(before),
+        rm.parse_diskstats(after),
+        elapsed_s=2.0,
+    )
+
+    assert rates["disk_read_mb_s"] == pytest.approx(1.0)
+    assert rates["disk_write_mb_s"] == pytest.approx(0.5)
+
+
+def test_append_summary_to_result_csv_adds_resource_columns(tmp_path):
+    result_csv = tmp_path / "result.csv"
+    result_csv.write_text("model,throughput_tok_s\nm,12.5\n", encoding="utf-8-sig")
+    summary = {
+        "available": True,
+        "sample_count": 2,
+        "aggregate": {
+            "cpu_util_avg_pct": 50.0,
+            "gpu_count": 1,
+            "gpu_util_max_pct": 99.0,
+        },
+    }
+
+    rm.append_summary_to_result_files(tmp_path, summary)
+
+    with result_csv.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["model"] == "m"
+    assert rows[0]["resource_monitor_available"] == "true"
+    assert rows[0]["resource_sample_count"] == "2"
+    assert rows[0]["cpu_util_avg_pct"] == "50.0"
+    assert rows[0]["gpu_util_max_pct"] == "99.0"
+
+
+def test_resource_monitor_disabled_writes_nothing(tmp_path):
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=1.0,
+        enabled=False,
+        backend="nvidia-smi",
+    )
+
+    monitor.start()
+    monitor.sample_once(now=100.0)
+    summary = monitor.stop()
+
+    assert summary["available"] is False
+    assert summary["sample_count"] == 0
+    assert not (tmp_path / "resource_samples.csv").exists()
+    assert not (tmp_path / "resource_summary.json").exists()
