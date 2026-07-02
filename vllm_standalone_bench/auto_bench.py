@@ -2329,7 +2329,16 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         try:
                             try:
                                 if monitor is not None:
-                                    monitor.start()
+                                    try:
+                                        monitor.start()
+                                    except (StopRequested, KeyboardInterrupt):
+                                        raise
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "resource monitor start failed: %s",
+                                            exc,
+                                        )
+                                        monitor = None
                                 with (layout.bench_dir / "bench.log").open(
                                     "w",
                                     encoding="utf-8",

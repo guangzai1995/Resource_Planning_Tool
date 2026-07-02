@@ -1184,6 +1184,17 @@ class FakeResourceMonitor:
         return summary
 
 
+class StartFailingResourceMonitor(FakeResourceMonitor):
+    def start(self):
+        raise RuntimeError("start failed")
+
+
+class StopFailingResourceMonitor(FakeResourceMonitor):
+    def stop(self):
+        self.stopped = True
+        raise RuntimeError("stop failed")
+
+
 def command_index(commands, prefix):
     for index, command in enumerate(commands):
         if command[:len(prefix)] == prefix:
@@ -1307,6 +1318,64 @@ def test_run_controller_does_not_start_resource_monitor_when_disabled(tmp_path, 
 
     assert result == 0
     assert FakeResourceMonitor.instances == []
+
+
+def test_run_controller_resource_monitor_start_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+    StartFailingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", StartFailingResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 0
+    assert len(bench_run_commands(runner.commands)) == 1
+    assert "resource monitor start failed" in caplog.text
+
+
+def test_run_controller_resource_monitor_stop_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    StopFailingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", StopFailingResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert "resource monitor stop failed" in caplog.text
+
+
+def test_run_controller_resource_monitor_result_merge_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    def fail_merge(*args, **kwargs):
+        raise RuntimeError("merge failed")
+
+    monkeypatch.setattr(ab, "append_summary_to_result_files", fail_merge)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert "resource monitor result merge failed" in caplog.text
 
 
 def test_network_create_command_has_ownership_labels(tmp_path):
