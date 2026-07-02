@@ -86,7 +86,16 @@ Skills 位于 `.Codex/skills/` 目录，每个 skill 有独立的 `SKILL.md` 文
    ```
    基线就失败要先报告、获明确许可后再继续，避免把已有问题算到新改动头上。
 
-4. **设计 → 实现** — 复杂功能先 `brainstorming` 再 `writing-plans`；写代码用 `test-driven-development`（先写测试）；调试用 `systematic-debugging`。
+4. **设计 → 质询 → 计划 → 实现** — 新功能、复杂改动、架构调整和流程规范变更，先用 `brainstorming` 产出并 commit 设计规格（spec），再用 `grill-me` 对设计做质询和补强；规格经用户确认后，再用 `writing-plans` 拆解实现计划。小 bug 修复、纯格式文档或无设计分支的简单规范补丁，可跳过 `grill-me`，但仍要说明跳过理由。
+
+   `grill-me` 只追问无法从仓库、文档或命令输出中自行确认的关键分支；能本地查证的事实必须先查证，避免把可验证事实交给用户判断。
+
+   推荐顺序：
+   ```text
+   brainstorming → spec → grill-me → spec 修订/确认 → writing-plans → 执行
+   ```
+
+   写代码用 `test-driven-development`（先写测试）；调试用 `systematic-debugging`。
 
 5. **验证先于完成** — 声称完成前用 `verification-before-completion`：必须实际运行命令、确认输出，用证据支撑结论。
 
@@ -102,9 +111,10 @@ Skills 位于 `.Codex/skills/` 目录，每个 skill 有独立的 `SKILL.md` 文
 
 | 场景 | 流程 |
 |---|---|
-| 新功能 | worktree → `brainstorming` → `writing-plans` → `test-driven-development` → `verification-before-completion` → `finishing-a-development-branch` |
+| 新功能 / 复杂改动 | worktree → `brainstorming` → spec → `grill-me` → spec 确认 → `writing-plans` → `test-driven-development` → `verification-before-completion` → `finishing-a-development-branch` |
 | 小 bug 修复 | worktree → `systematic-debugging` → `test-driven-development` → `verification-before-completion` → `finishing-a-development-branch` |
-| 纯文档 / 规范 | worktree → 阅读相关规范 → 改文档 → `git diff --check` → commit → 合并 |
+| 架构 / 流程规范变更 | worktree → `brainstorming` → spec → `grill-me` → spec 确认 → `writing-plans` 或直接文档补丁 → `git diff --check` → commit → 合并 |
+| 纯格式文档 / 简单规范补丁 | worktree → 阅读相关规范 → 改文档（说明跳过 `grill-me` 的理由）→ `git diff --check` → commit → 合并 |
 
 ## 红线
 
