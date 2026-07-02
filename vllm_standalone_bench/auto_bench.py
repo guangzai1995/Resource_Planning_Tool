@@ -2103,6 +2103,29 @@ def config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
     return payload
 
 
+def _mask_dry_run_resolved_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        masked: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "api_key" and item is not None:
+                masked[key] = "***"
+            else:
+                masked[key] = _mask_dry_run_resolved_value(item)
+        return masked
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            return mask_command_for_display(value)
+        return [_mask_dry_run_resolved_value(item) for item in value]
+    return value
+
+
+def dry_run_config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
+    payload = _mask_dry_run_resolved_value(config_to_dict(config))
+    if not isinstance(payload, dict):
+        raise ConfigError("dry-run resolved config must be an object")
+    return payload
+
+
 def _case_ref(case: BenchmarkCase) -> dict[str, str]:
     return {
         "model": case.model.name,
@@ -2296,7 +2319,10 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
     run_dir = config.run.results_dir / run_id
     has_legacy_cases = any(case.serve_profile is not None for case in cases)
     network_owned = config.run.create_network and has_legacy_cases
-    write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
+    write_json_atomic(
+        run_dir / "config.resolved.json",
+        dry_run_config_to_dict(config),
+    )
     try:
         if network_owned:
             print_cmd(build_network_create_command(config, run_id))

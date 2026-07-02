@@ -231,6 +231,13 @@ def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, c
     assert "router-secret" not in out
     assert "local-bench-key" not in out
     assert "secret-p1-password" not in rendered_resolved
+    assert "router-secret" not in rendered_resolved
+    assert "local-bench-key" not in rendered_resolved
+    assert resolved["run"]["api_key"] == "***"
+    assert resolved["topology_profiles"][0]["frontend"]["args"] == [
+        "--api-key",
+        "***",
+    ]
     assert (
         resolved["topology_profiles"][0]["hosts"]["p1"]["auth"].get("password")
         == "***"
