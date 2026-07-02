@@ -1,7 +1,7 @@
 """多引擎结果对比聚合。
 
 读取各 serve_profile/topology_profile 的 result.csv，按
-(bench_profile, input_len, output_len, parallel_num) 对齐多引擎，产出
+(model, bench_profile, input_len, output_len, parallel_num) 对齐多引擎，产出
 compare.csv / compare.xlsx 与图表。
 
 铁律：原始 result.csv 只读，本模块永不修改或删除它们。
@@ -81,6 +81,7 @@ def _collect_aligned(
                     continue
                 for row in _read_result_rows(csv_path, bench.name):
                     key = (
+                        model.name,
                         bench.name,
                         int(row["input_len"]),
                         int(row["output_len"]),
@@ -105,7 +106,7 @@ def _ordered_labels(config: Any) -> list[str]:
 
 
 def _compare_fieldnames(labels: list[str]) -> list[str]:
-    cols = ["bench_profile", "input_len", "output_len", "parallel_num"]
+    cols = ["model", "bench_profile", "input_len", "output_len", "parallel_num"]
     for label in labels:
         for metric in COMPARE_METRICS:
             cols.append(f"{label}__{metric}")
@@ -117,8 +118,9 @@ def _build_compare_rows(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for key in sorted(aligned):
-        bench_profile, in_len, out_len, parallel = key
+        model, bench_profile, in_len, out_len, parallel = key
         row: dict[str, Any] = {
+            "model": model,
             "bench_profile": bench_profile,
             "input_len": in_len,
             "output_len": out_len,
@@ -174,6 +176,10 @@ def _to_float(value: str | None) -> float:
         return float("nan")
 
 
+def _plot_file_part(value: str) -> str:
+    return value.replace("/", "_").replace("\\", "_")
+
+
 def _plot(
     run_dir: Path,
     aligned: dict[tuple, dict[str, dict[str, str]]],
@@ -192,11 +198,12 @@ def _plot(
     )
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
-    # 按 (bench_profile, input_len, output_len) 聚点
+    include_model = len({key[0] for key in aligned}) > 1
+    # 按 (model, bench_profile, input_len, output_len) 聚点
     grouped: dict[tuple, dict[str, list[tuple[int, float]]]] = {}
     for key, label_map in aligned.items():
-        bench_profile, in_len, out_len, parallel = key
-        gkey = (bench_profile, in_len, out_len)
+        model, bench_profile, in_len, out_len, parallel = key
+        gkey = (model, bench_profile, in_len, out_len)
         series = grouped.setdefault(gkey, {})
         for label, row in label_map.items():
             for metric in PLOT_METRICS:
@@ -204,7 +211,7 @@ def _plot(
                     (parallel, _to_float(row.get(metric)))
                 )
     for gkey, series in grouped.items():
-        bench_profile, in_len, out_len = gkey
+        model, bench_profile, in_len, out_len = gkey
         for metric in PLOT_METRICS:
             plt.figure(figsize=(7, 4))
             for label, points in sorted(series.items()):
@@ -217,11 +224,17 @@ def _plot(
                 plt.plot(xs, ys, marker="o", label=serving_label)
             plt.xlabel("并发数 (parallel_num)")
             plt.ylabel(_PLOT_YLABEL[metric])
-            plt.title(f"{bench_profile} in={in_len} out={out_len} · {metric}")
+            model_prefix = f"{model} · " if include_model else ""
+            plt.title(
+                f"{model_prefix}{bench_profile} in={in_len} out={out_len} · {metric}"
+            )
             plt.legend()
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
-            plt.savefig(plots_dir / f"{bench_profile}__{in_len}x{out_len}__{metric}.png")
+            filename = f"{bench_profile}__{in_len}x{out_len}__{metric}.png"
+            if include_model:
+                filename = f"{_plot_file_part(model)}__{filename}"
+            plt.savefig(plots_dir / filename)
             plt.close()
 
 

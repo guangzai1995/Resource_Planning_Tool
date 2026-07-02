@@ -83,6 +83,54 @@ def test_aggregate_missing_engine_fills_na(tmp_path):
     assert rows[0]["sglang__throughput_tok_s"] == "N/A"
 
 
+def test_aggregate_keeps_models_with_same_compare_dimensions(tmp_path):
+    config = _fake_config()
+    config.serve_profiles = [
+        SimpleNamespace(name="vllm_bf16", engine="vllm", gpus="all", args=()),
+    ]
+    config.models = [
+        SimpleNamespace(name="qwen_a"),
+        SimpleNamespace(name="qwen_b"),
+    ]
+    run_dir = tmp_path / "run1"
+    _write_result_csv(
+        run_dir / "qwen_a" / "vllm_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=11,
+        tput=100,
+        hitrate=80.0,
+    )
+    _write_result_csv(
+        run_dir / "qwen_b" / "vllm_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=22,
+        tput=200,
+        hitrate=40.0,
+    )
+
+    out = bc.aggregate_compare(config, run_dir)
+
+    with out.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    assert len(rows) == 2
+    assert reader.fieldnames[:5] == [
+        "model",
+        "bench_profile",
+        "input_len",
+        "output_len",
+        "parallel_num",
+    ]
+    by_model = {row["model"]: row for row in rows}
+    assert by_model["qwen_a"]["vllm__throughput_tok_s"] == "100"
+    assert by_model["qwen_a"]["vllm__ttft_p50_ms"] == "11"
+    assert by_model["qwen_b"]["vllm__throughput_tok_s"] == "200"
+    assert by_model["qwen_b"]["vllm__ttft_p50_ms"] == "22"
+    plot_names = {path.name for path in (run_dir / "plots").glob("*.png")}
+    assert "qwen_a__smoke__64x32__throughput_tok_s.png" in plot_names
+    assert "qwen_b__smoke__64x32__throughput_tok_s.png" in plot_names
+
+
 def test_aggregate_reads_topology_profile_results(tmp_path):
     config = _fake_config()
     config.topology_profiles = [
