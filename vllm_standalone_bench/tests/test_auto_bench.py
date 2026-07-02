@@ -708,12 +708,15 @@ def test_plan_resume_cases_reports_manifest_rows_not_in_config(tmp_path):
 
 
 def write_resume_state(run_dir, status="interrupted"):
-    ab.write_state(run_dir, {
+    state = {
         "run_id": run_dir.name,
         "status": status,
         "current": None,
         "counts": {"passed": 1, "failed": 0, "skipped": 0, "running": 0, "total": 2},
-    })
+    }
+    if status is None:
+        del state["status"]
+    ab.write_state(run_dir, state)
 
 
 def write_resume_manifest(run_dir, cases, config, statuses):
@@ -774,6 +777,76 @@ def test_load_resume_context_completed_with_no_pending_is_empty(tmp_path):
 
     assert context.pending_cases == ()
     assert [row["status"] for row in context.initial_manifest.cases] == ["passed", "passed"]
+
+
+@pytest.mark.parametrize("status", [None, "complete", 123])
+def test_load_resume_context_rejects_unknown_state_even_without_pending(tmp_path, status):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status=status)
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+
+    with pytest.raises(ab.ConfigError, match="run status cannot be resumed"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+def test_load_resume_context_rejects_completed_with_pending(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status="completed")
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+
+    with pytest.raises(ab.ConfigError, match="run status cannot be resumed: completed"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+def test_load_resume_context_rejects_state_run_id_mismatch(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    state["run_id"] = "other"
+    ab.write_json_atomic(run_dir / "state.json", state)
+
+    with pytest.raises(ab.ConfigError, match="state run_id mismatch"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+@pytest.mark.parametrize(("filename", "label"), [
+    ("state.json", "state"),
+    ("manifest.json", "manifest"),
+])
+def test_load_resume_context_rejects_non_object_state_or_manifest(tmp_path, filename, label):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+    (run_dir / filename).write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ab.ConfigError, match=f"{label} must be a JSON object"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+def test_load_resume_context_returns_unknown_manifest_cases(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cases"].append({
+        "model": "old_model",
+        "serve_profile": "old_serve",
+        "bench_profile": "old_bench",
+        "status": "passed",
+        "csv": "old.csv",
+        "xlsx": "old.xlsx",
+    })
+    ab.write_json_atomic(run_dir / "manifest.json", manifest)
+
+    context = ab.load_resume_context(tmp_path / "results", "run123")
+
+    assert context.unknown_manifest_cases == (("old_model", "old_serve", "old_bench"),)
 
 
 class FakeRunner:

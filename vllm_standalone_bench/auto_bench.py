@@ -1880,7 +1880,11 @@ def load_resume_context(results_dir: Path, run_id: str) -> ResumeContext:
         cases=cases,
         manifest_data=manifest_data,
     )
-    if status not in RESUMABLE_RUN_STATUSES and pending:
+    if status == "completed" and not pending:
+        pass
+    elif status in RESUMABLE_RUN_STATUSES:
+        pass
+    else:
         raise ConfigError(f"run status cannot be resumed: {status}")
     return ResumeContext(
         config=config,
