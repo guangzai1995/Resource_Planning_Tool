@@ -237,6 +237,42 @@ def test_summarize_samples_reports_unavailable_when_empty():
     assert summary["sample_count"] == 0
 
 
+def test_summarize_samples_uses_case_level_gpu_sample_fields():
+    samples = [
+        {
+            "gpu_util_avg_pct": 30.0,
+            "gpu_mem_used_avg_mb": 1000.0,
+            "gpu_mem_used_max_mb": 1500.0,
+            "gpu_mem_total_mb": 8000.0,
+            "gpu_mem_used_max_pct": 18.75,
+            "gpu_power_avg_w": 200.0,
+            "gpu_power_max_w": 250.0,
+            "gpu_temp_max_c": 60.0,
+        },
+        {
+            "gpu_util_avg_pct": 60.0,
+            "gpu_mem_used_avg_mb": 2000.0,
+            "gpu_mem_used_max_mb": 2500.0,
+            "gpu_mem_total_mb": 8000.0,
+            "gpu_mem_used_max_pct": 31.25,
+            "gpu_power_avg_w": 300.0,
+            "gpu_power_max_w": 350.0,
+            "gpu_temp_max_c": 70.0,
+        },
+    ]
+
+    summary = rm.summarize_samples(samples, gpu_details=[{"gpu_index": 0}])
+
+    aggregate = summary["aggregate"]
+    assert aggregate["gpu_mem_used_avg_mb"] == pytest.approx(1500.0)
+    assert aggregate["gpu_mem_used_p95_mb"] == pytest.approx(2000.0)
+    assert aggregate["gpu_mem_used_max_mb"] == pytest.approx(2500.0)
+    assert aggregate["gpu_mem_used_max_pct"] == pytest.approx(31.25)
+    assert aggregate["gpu_power_avg_w"] == pytest.approx(250.0)
+    assert aggregate["gpu_power_p95_w"] == pytest.approx(300.0)
+    assert aggregate["gpu_power_max_w"] == pytest.approx(350.0)
+
+
 def test_resource_monitor_writes_samples_and_summary(tmp_path):
     monitor = rm.ResourceMonitor(
         output_dir=tmp_path,
@@ -290,6 +326,34 @@ def test_resource_monitor_degrades_when_nvidia_smi_missing(tmp_path):
     assert summary["error_count"] >= 1
 
 
+def test_resource_monitor_reports_unavailable_when_all_readers_fail(tmp_path):
+    def fail():
+        raise OSError("unavailable")
+
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=fail,
+            meminfo=fail,
+            net_dev=fail,
+            diskstats=fail,
+            nvidia_smi=fail,
+        ),
+    )
+
+    monitor.sample_once(now=100.0)
+    summary = monitor.stop()
+
+    assert summary["available"] is False
+    assert summary["system_available"] is False
+    assert summary["gpu_available"] is False
+    assert summary["sample_count"] == 1
+    assert summary["error_count"] > 0
+
+
 def test_parse_diskstats_and_compute_rates():
     before = "   8       0 sda 10 0 100 0 5 0 20 0 0 0 0 0 0 0 0 0 0\n"
     after = "   8       0 sda 20 0 4196 0 7 0 2068 0 0 0 0 0 0 0 0 0 0\n"
@@ -326,6 +390,54 @@ def test_append_summary_to_result_csv_adds_resource_columns(tmp_path):
     assert rows[0]["resource_sample_count"] == "2"
     assert rows[0]["cpu_util_avg_pct"] == "50.0"
     assert rows[0]["gpu_util_max_pct"] == "99.0"
+
+
+def test_append_summary_to_result_xlsx_adds_chinese_resource_headers(tmp_path):
+    import openpyxl
+
+    result_xlsx = tmp_path / "result.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.cell(row=1, column=1, value="model")
+    worksheet.cell(row=1, column=2, value="throughput_tok_s")
+    worksheet.cell(row=2, column=1, value="模型")
+    worksheet.cell(row=2, column=2, value="吞吐")
+    worksheet.cell(row=3, column=1, value="m")
+    worksheet.cell(row=3, column=2, value=12.5)
+    workbook.save(result_xlsx)
+
+    summary = {
+        "available": True,
+        "sample_count": 2,
+        "aggregate": {
+            "cpu_util_avg_pct": 50.0,
+            "gpu_count": 1,
+            "gpu_util_max_pct": 99.0,
+        },
+    }
+
+    rm.append_summary_to_result_files(tmp_path, summary)
+
+    loaded = openpyxl.load_workbook(result_xlsx)
+    sheet = loaded.active
+    columns = {
+        sheet.cell(row=1, column=column).value: column
+        for column in range(1, sheet.max_column + 1)
+    }
+    available_column = columns["resource_monitor_available"]
+    sample_count_column = columns["resource_sample_count"]
+    cpu_avg_column = columns["cpu_util_avg_pct"]
+
+    assert sheet.cell(row=2, column=available_column).value == "资源监控可用"
+    assert sheet.cell(row=2, column=sample_count_column).value == "资源采样数"
+    assert sheet.cell(row=2, column=cpu_avg_column).value == "CPU平均使用率(%)"
+    for column_name in rm.RESOURCE_RESULT_COLUMNS:
+        column = columns[column_name]
+        assert sheet.cell(row=2, column=column).value
+        assert sheet.cell(row=2, column=column).value != column_name
+    assert sheet.cell(row=3, column=available_column).value == "true"
+    assert sheet.cell(row=3, column=sample_count_column).value == 2
+    assert sheet.cell(row=3, column=cpu_avg_column).value == 50.0
 
 
 def test_resource_monitor_disabled_writes_nothing(tmp_path):

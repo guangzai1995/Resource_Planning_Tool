@@ -45,6 +45,46 @@ RESOURCE_RESULT_COLUMNS = [
     "gpu_temp_max_c",
 ]
 
+RESOURCE_RESULT_COLUMN_LABELS = {
+    "resource_monitor_available": "资源监控可用",
+    "resource_sample_count": "资源采样数",
+    "cpu_util_avg_pct": "CPU平均使用率(%)",
+    "cpu_util_p95_pct": "CPU P95使用率(%)",
+    "cpu_util_max_pct": "CPU最大使用率(%)",
+    "mem_used_avg_mb": "内存平均使用量(MB)",
+    "mem_used_p95_mb": "内存P95使用量(MB)",
+    "mem_used_max_mb": "内存最大使用量(MB)",
+    "mem_used_max_pct": "内存最大使用率(%)",
+    "net_rx_avg_mb_s": "网络平均接收(MB/s)",
+    "net_rx_max_mb_s": "网络最大接收(MB/s)",
+    "net_tx_avg_mb_s": "网络平均发送(MB/s)",
+    "net_tx_max_mb_s": "网络最大发送(MB/s)",
+    "disk_read_avg_mb_s": "磁盘平均读取(MB/s)",
+    "disk_read_max_mb_s": "磁盘最大读取(MB/s)",
+    "disk_write_avg_mb_s": "磁盘平均写入(MB/s)",
+    "disk_write_max_mb_s": "磁盘最大写入(MB/s)",
+    "gpu_count": "GPU数量",
+    "gpu_util_avg_pct": "GPU平均使用率(%)",
+    "gpu_util_p95_pct": "GPU P95使用率(%)",
+    "gpu_util_max_pct": "GPU最大使用率(%)",
+    "gpu_mem_used_avg_mb": "GPU显存平均使用量(MB)",
+    "gpu_mem_used_p95_mb": "GPU显存P95使用量(MB)",
+    "gpu_mem_used_max_mb": "GPU显存最大使用量(MB)",
+    "gpu_mem_total_mb": "GPU总显存(MB)",
+    "gpu_mem_used_max_pct": "GPU显存最大使用率(%)",
+    "gpu_power_avg_w": "GPU平均功耗(W)",
+    "gpu_power_p95_w": "GPU P95功耗(W)",
+    "gpu_power_max_w": "GPU最大功耗(W)",
+    "gpu_temp_max_c": "GPU最高温度(C)",
+}
+
+_SYSTEM_SAMPLE_KEYS = [
+    "cpu_util_pct",
+    "mem_total_mb", "mem_used_mb", "mem_available_mb", "mem_used_pct",
+    "net_rx_mb_s", "net_tx_mb_s",
+    "disk_read_mb_s", "disk_write_mb_s",
+]
+
 
 @dataclass(frozen=True)
 class ResourceReaders:
@@ -459,31 +499,60 @@ def summarize_samples(
             "disk_write_p95_mb_s",
             "disk_write_max_mb_s",
         ),
-        ("gpu_util_avg_pct", "gpu_util_avg_pct", "gpu_util_p95_pct", "gpu_util_max_pct"),
-        (
-            "gpu_mem_used_mb",
-            "gpu_mem_used_avg_mb",
-            "gpu_mem_used_p95_mb",
-            "gpu_mem_used_max_mb",
-        ),
-        ("gpu_power_w", "gpu_power_avg_w", "gpu_power_p95_w", "gpu_power_max_w"),
-        (
-            "gpu_temperature_c",
-            "gpu_temp_avg_c",
-            "gpu_temp_p95_c",
-            "gpu_temp_max_c",
-        ),
     ):
         values = _sample_values(samples, sample_key)
         aggregate[avg_key] = _average(values)
         aggregate[p95_key] = _p95(values)
         aggregate[max_key] = _maximum(values)
 
+    _aggregate_split_sample_values(
+        aggregate,
+        samples,
+        avg_sample_key="gpu_util_avg_pct",
+        max_sample_key="gpu_util_max_pct",
+        fallback_key="gpu_util_avg_pct",
+        avg_key="gpu_util_avg_pct",
+        p95_key="gpu_util_p95_pct",
+        max_key="gpu_util_max_pct",
+    )
+    _aggregate_split_sample_values(
+        aggregate,
+        samples,
+        avg_sample_key="gpu_mem_used_avg_mb",
+        max_sample_key="gpu_mem_used_max_mb",
+        fallback_key="gpu_mem_used_mb",
+        avg_key="gpu_mem_used_avg_mb",
+        p95_key="gpu_mem_used_p95_mb",
+        max_key="gpu_mem_used_max_mb",
+    )
+    _aggregate_split_sample_values(
+        aggregate,
+        samples,
+        avg_sample_key="gpu_power_avg_w",
+        max_sample_key="gpu_power_max_w",
+        fallback_key="gpu_power_w",
+        avg_key="gpu_power_avg_w",
+        p95_key="gpu_power_p95_w",
+        max_key="gpu_power_max_w",
+    )
+    _aggregate_split_sample_values(
+        aggregate,
+        samples,
+        avg_sample_key="gpu_temp_max_c",
+        max_sample_key="gpu_temp_max_c",
+        fallback_key="gpu_temperature_c",
+        avg_key="gpu_temp_avg_c",
+        p95_key="gpu_temp_p95_c",
+        max_key="gpu_temp_max_c",
+    )
+
     aggregate["gpu_count"] = len(gpu_details)
     aggregate["gpu_mem_total_mb"] = _maximum(_sample_values(samples, "gpu_mem_total_mb"))
-    aggregate["gpu_mem_used_max_pct"] = _maximum(_sample_values(samples, "gpu_mem_used_pct"))
+    aggregate["gpu_mem_used_max_pct"] = _maximum(
+        _sample_values_or_fallback(samples, "gpu_mem_used_max_pct", "gpu_mem_used_pct")
+    )
 
-    system_available = sample_count > 0
+    system_available = _has_system_sample(samples)
     gpu_available = bool(gpu_details)
     return {
         "available": system_available or gpu_available,
@@ -594,8 +663,12 @@ def append_summary_to_xlsx(path, values):
             next_column += 1
             column_by_name[column_name] = column
             worksheet.cell(row=1, column=column, value=column_name)
-            if worksheet.max_row >= 2:
-                worksheet.cell(row=2, column=column, value=column_name)
+        if worksheet.max_row >= 2:
+            worksheet.cell(
+                row=2,
+                column=column,
+                value=RESOURCE_RESULT_COLUMN_LABELS[column_name],
+            )
 
     data_start_row = 3 if worksheet.max_row >= 2 else 2
     for row in range(data_start_row, worksheet.max_row + 1):
@@ -624,6 +697,39 @@ def _gpu_values(gpus, key):
         for gpu in gpus
         if gpu.get(key) is not None
     ]
+
+
+def _aggregate_split_sample_values(
+    aggregate,
+    samples,
+    *,
+    avg_sample_key,
+    max_sample_key,
+    fallback_key,
+    avg_key,
+    p95_key,
+    max_key,
+):
+    avg_values = _sample_values_or_fallback(samples, avg_sample_key, fallback_key)
+    max_values = _sample_values_or_fallback(samples, max_sample_key, fallback_key)
+    aggregate[avg_key] = _average(avg_values)
+    aggregate[p95_key] = _p95(avg_values)
+    aggregate[max_key] = _maximum(max_values)
+
+
+def _sample_values_or_fallback(samples, primary_key, fallback_key):
+    values = _sample_values(samples, primary_key)
+    if values:
+        return values
+    return _sample_values(samples, fallback_key)
+
+
+def _has_system_sample(samples):
+    return any(
+        sample.get(key) is not None
+        for sample in samples
+        for key in _SYSTEM_SAMPLE_KEYS
+    )
 
 
 def _result_value(value):
