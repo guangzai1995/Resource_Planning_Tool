@@ -165,6 +165,17 @@ python3 vllm_standalone_bench/auto_bench.py run \
 
 dry-run 会写入 `vllm_standalone_bench/results/docs_dry_run/config.resolved.json` 作为 resolved config preview，但不会写 manifest、state 或 benchmark 结果文件。
 
+远程 SGLang PD topology 示例也可以先用 dry-run 检查：
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.sglang_pd_remote.example.json \
+  --run-id pd_remote_dry_run_001 \
+  --dry-run
+```
+
+示例中的 `192.0.2.x` 是 RFC 5737 文档地址，只适合 dry-run/示例；实际运行前需要替换 host 地址、镜像名、远程模型路径和 SSH auth。
+
 准备好 vLLM 镜像、bench-runner 镜像和完整模型后，运行真实 smoke：
 
 ```bash

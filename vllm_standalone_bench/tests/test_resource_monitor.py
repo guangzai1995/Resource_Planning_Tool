@@ -1,5 +1,6 @@
 import csv
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -495,6 +496,156 @@ def test_resource_monitor_reports_unavailable_when_all_readers_fail(tmp_path):
     assert summary["error_count"] > 0
 
 
+@pytest.mark.parametrize(
+    "failing_reader",
+    ["proc_stat", "meminfo", "net_dev", "diskstats", "nvidia_smi"],
+)
+def test_resource_monitor_passthrough_exceptions_are_not_swallowed(
+    tmp_path,
+    failing_reader,
+):
+    class PassthroughError(Exception):
+        pass
+
+    def fail():
+        raise PassthroughError("stop requested")
+
+    reader_values = {
+        "proc_stat": lambda: "cpu  100 0 50 850 0 0 0 0 0 0\n",
+        "meminfo": lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+        "net_dev": lambda: "",
+        "diskstats": lambda: "",
+        "nvidia_smi": lambda: "",
+    }
+    reader_values[failing_reader] = fail
+    readers = rm.ResourceReaders(**reader_values)
+    degraded_monitor = rm.ResourceMonitor(
+        output_dir=tmp_path / "degraded",
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=readers,
+    )
+
+    degraded_monitor.sample_once(now=100.0)
+
+    assert degraded_monitor.error_count >= 1
+
+    passthrough_monitor = rm.ResourceMonitor(
+        output_dir=tmp_path / "passthrough",
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=readers,
+        passthrough_exceptions=(PassthroughError,),
+    )
+
+    with pytest.raises(PassthroughError, match="stop requested"):
+        passthrough_monitor.sample_once(now=100.0)
+
+
+def test_resource_monitor_stop_reraises_background_passthrough_exception(tmp_path):
+    class PassthroughError(Exception):
+        pass
+
+    sample_attempts = 0
+    background_sample_started = threading.Event()
+
+    def proc_stat():
+        nonlocal sample_attempts
+        sample_attempts += 1
+        if sample_attempts == 2:
+            background_sample_started.set()
+            raise PassthroughError("background stop requested")
+        return "cpu  100 0 50 850 0 0 0 0 0 0\n"
+
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=0.01,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=proc_stat,
+            meminfo=lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+            net_dev=lambda: "",
+            diskstats=lambda: "",
+            nvidia_smi=lambda: "",
+        ),
+        passthrough_exceptions=(PassthroughError,),
+    )
+
+    monitor.start()
+    assert background_sample_started.wait(timeout=1.0)
+
+    with pytest.raises(PassthroughError, match="background stop requested"):
+        monitor.stop()
+
+
+def test_resource_monitor_stop_reraises_late_background_passthrough_exception(
+    tmp_path,
+    monkeypatch,
+):
+    class PassthroughError(Exception):
+        pass
+
+    sample_attempts = 0
+    background_reader_entered = threading.Event()
+    allow_background_error = threading.Event()
+
+    def proc_stat():
+        nonlocal sample_attempts
+        sample_attempts += 1
+        if sample_attempts == 2:
+            background_reader_entered.set()
+            assert allow_background_error.wait(timeout=1.0)
+            raise PassthroughError("late background stop requested")
+        return "cpu  100 0 50 850 0 0 0 0 0 0\n"
+
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=0.01,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=proc_stat,
+            meminfo=lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+            net_dev=lambda: "",
+            diskstats=lambda: "",
+            nvidia_smi=lambda: "",
+        ),
+        passthrough_exceptions=(PassthroughError,),
+    )
+
+    monitor.start()
+    assert background_reader_entered.wait(timeout=1.0)
+
+    original_join = monitor._thread.join
+    join_calls = 0
+
+    def fake_join(timeout=None):
+        nonlocal join_calls
+        join_calls += 1
+        if join_calls == 1:
+            return
+        allow_background_error.set()
+        original_join(timeout=1.0)
+
+    original_sample_once = monitor.sample_once
+
+    def sample_once(*args, **kwargs):
+        if threading.current_thread() is not monitor._thread:
+            allow_background_error.set()
+        return original_sample_once(*args, **kwargs)
+
+    monkeypatch.setattr(monitor._thread, "join", fake_join)
+    monkeypatch.setattr(monitor, "sample_once", sample_once)
+
+    with pytest.raises(PassthroughError, match="late background stop requested"):
+        monitor.stop()
+
+    assert join_calls >= 2
+
+
 def test_parse_diskstats_and_compute_rates():
     before = "   8       0 sda 10 0 100 0 5 0 20 0 0 0 0 0 0 0 0 0 0\n"
     after = "   8       0 sda 20 0 4196 0 7 0 2068 0 0 0 0 0 0 0 0 0 0\n"
@@ -546,6 +697,73 @@ def test_append_summary_to_result_csv_adds_resource_columns(tmp_path):
     assert rows[0]["resource_sample_count"] == "2"
     assert rows[0]["cpu_util_avg_pct"] == "50.0"
     assert rows[0]["gpu_util_max_pct"] == "99.0"
+
+
+def test_append_prefixed_summaries_to_result_csv(tmp_path):
+    result_csv = tmp_path / "result.csv"
+    result_csv.write_text("model,throughput_tok_s\nm,12.5\n", encoding="utf-8-sig")
+    summary = {
+        "available": True,
+        "sample_count": 2,
+        "aggregate": {"cpu_util_avg_pct": 50.0, "gpu_mem_used_max_mb": 1234.0},
+    }
+
+    rm.append_prefixed_summaries_to_result_files(
+        tmp_path,
+        {"p1": summary, "router": summary},
+    )
+
+    with result_csv.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["p1_resource_monitor_available"] == "true"
+    assert rows[0]["p1_cpu_util_avg_pct"] == "50.0"
+    assert rows[0]["router_gpu_mem_used_max_mb"] == "1234.0"
+
+
+def test_append_prefixed_summaries_to_result_xlsx(tmp_path):
+    import openpyxl
+
+    result_xlsx = tmp_path / "result.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.cell(row=1, column=1, value="model")
+    worksheet.cell(row=1, column=2, value="throughput_tok_s")
+    worksheet.cell(row=2, column=1, value="模型")
+    worksheet.cell(row=2, column=2, value="吞吐")
+    worksheet.cell(row=3, column=1, value="m")
+    worksheet.cell(row=3, column=2, value=12.5)
+    workbook.save(result_xlsx)
+    summary = {
+        "available": True,
+        "sample_count": 2,
+        "aggregate": {"cpu_util_avg_pct": 50.0, "gpu_mem_used_max_mb": 1234.0},
+    }
+
+    rm.append_prefixed_summaries_to_result_files(
+        tmp_path,
+        {"p1": summary, "router": summary},
+    )
+
+    loaded = openpyxl.load_workbook(result_xlsx)
+    sheet = loaded.active
+    columns = {
+        sheet.cell(row=1, column=column).value: column
+        for column in range(1, sheet.max_column + 1)
+    }
+    assert sheet.cell(row=1, column=columns["model"]).value == "model"
+    assert sheet.cell(row=2, column=columns["model"]).value == "模型"
+    assert sheet.cell(row=3, column=columns["model"]).value == "m"
+    assert sheet.cell(row=3, column=columns["throughput_tok_s"]).value == 12.5
+
+    p1_available = columns["p1_resource_monitor_available"]
+    p1_cpu_avg = columns["p1_cpu_util_avg_pct"]
+    router_gpu_mem = columns["router_gpu_mem_used_max_mb"]
+    assert sheet.cell(row=2, column=p1_available).value == "p1_resource_monitor_available"
+    assert sheet.cell(row=2, column=p1_cpu_avg).value == "p1_cpu_util_avg_pct"
+    assert sheet.cell(row=2, column=router_gpu_mem).value == "router_gpu_mem_used_max_mb"
+    assert sheet.cell(row=3, column=p1_available).value == "true"
+    assert sheet.cell(row=3, column=p1_cpu_avg).value == 50.0
+    assert sheet.cell(row=3, column=router_gpu_mem).value == 1234.0
 
 
 def test_append_summary_to_result_xlsx_adds_chinese_resource_headers(tmp_path):

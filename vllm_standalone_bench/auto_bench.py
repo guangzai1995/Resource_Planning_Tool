@@ -9,6 +9,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -20,7 +21,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
-from resource_monitor import ResourceMonitor, append_summary_to_result_files
+from remote_docker import RemoteDockerRunner, RemoteResourceReaders, mask_command
+from remote_topology import RemoteAuth, RoleCommand, TopologyProfile, parse_topology_profiles
+from resource_monitor import (
+    ResourceMonitor,
+    append_prefixed_summaries_to_result_files,
+    append_summary_to_result_files,
+)
 
 logger = logging.getLogger("auto_bench")
 
@@ -33,11 +40,21 @@ BUILTIN_ASR_DATASET_PATH = (
 )
 SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat", "openai-audio"})
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
+RESUME_CONFIG_FILE = ".config.resume.json"
+REDACTED_SECRET_PLACEHOLDERS = frozenset({
+    "***",
+    "********",
+    "<redacted>",
+    "redacted",
+})
 NETWORK_MANAGED_LABEL = "vllm_auto_bench.managed"
 NETWORK_RUN_ID_LABEL = "vllm_auto_bench.run_id"
 CONTAINER_RUN_DIR_LABEL = "vllm_auto_bench.run_dir"
 CONTAINER_MODEL_LABEL = "vllm_auto_bench.model"
 CONTAINER_SERVE_PROFILE_LABEL = "vllm_auto_bench.serve_profile"
+CONTAINER_TOPOLOGY_PROFILE_LABEL = "vllm_auto_bench.topology_profile"
+CONTAINER_TOPOLOGY_ROLE_LABEL = "vllm_auto_bench.role"
+CONTAINER_TOPOLOGY_ROLE_NAME_LABEL = "vllm_auto_bench.role_name"
 CONTAINER_BENCH_PROFILE_LABEL = "vllm_auto_bench.bench_profile"
 
 
@@ -46,6 +63,11 @@ class ConfigError(ValueError):
 
 
 SUPPORTED_ENGINES = ("vllm", "sglang")
+CaseKey = tuple[str, str | None, str | None, str]
+MANIFEST_CASE_KEY_ERROR = (
+    "manifest case row must include model, bench_profile, and exactly one of "
+    "serve_profile/topology_profile"
+)
 
 
 class StopRequested(Exception):
@@ -154,16 +176,32 @@ class AutoBenchConfig:
     models: tuple[ModelConfig, ...]
     serve_profiles: tuple[ServeProfile, ...]
     bench_profiles: tuple[BenchProfile, ...]
+    topology_profiles: tuple[TopologyProfile, ...] = ()
 
 
 @dataclass(frozen=True)
 class BenchmarkCase:
     model: ModelConfig
-    serve_profile: ServeProfile
     bench_profile: BenchProfile
     run_id: str
-    container_name: str
     api_model_name: str
+    serve_profile: ServeProfile | None = None
+    topology_profile: TopologyProfile | None = None
+    container_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.serve_profile is None) == (self.topology_profile is None):
+            raise ConfigError(
+                "BenchmarkCase requires exactly one of serve_profile or topology_profile"
+            )
+
+    @property
+    def serving_name(self) -> str:
+        if self.serve_profile is not None:
+            return self.serve_profile.name
+        if self.topology_profile is not None:
+            return self.topology_profile.name
+        raise ConfigError("BenchmarkCase is missing serving profile information")
 
 
 @dataclass(frozen=True)
@@ -472,8 +510,6 @@ def _parse_engine_images(
         images = dict(raw)
     if vllm_image is not None:
         images.setdefault("vllm", vllm_image)
-    if not images:
-        raise ConfigError("run.images (or run.vllm_image) must define at least one engine image")
     return types.MappingProxyType(images)
 
 
@@ -526,6 +562,8 @@ def _parse_models(data: dict[str, Any], mounts: MountConfig) -> tuple[ModelConfi
 
 def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
     raw_profiles = data.get("serve_profiles")
+    if raw_profiles is None:
+        return ()
     if not isinstance(raw_profiles, list) or not raw_profiles:
         raise ConfigError("serve_profiles must be a non-empty list")
 
@@ -554,6 +592,30 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
             ),
         ))
     return tuple(parsed)
+
+
+def _parse_topology_profiles(data: dict[str, Any]) -> tuple[TopologyProfile, ...]:
+    return parse_topology_profiles(
+        data,
+        error=ConfigError,
+        safe_name=_safe_name,
+        supported_engines=SUPPORTED_ENGINES,
+    )
+
+
+def _validate_serving_profile_names_unique(
+    serve_profiles: tuple[ServeProfile, ...],
+    topology_profiles: tuple[TopologyProfile, ...],
+) -> None:
+    all_names = [profile.name for profile in serve_profiles]
+    all_names.extend(profile.name for profile in topology_profiles)
+    duplicates = sorted({
+        name for name in all_names if all_names.count(name) > 1
+    })
+    if duplicates:
+        raise ConfigError(
+            "duplicate serving profile name: " + ", ".join(duplicates)
+        )
 
 
 def _validate_serve_args(args: Sequence[str], path: str) -> None:
@@ -704,8 +766,19 @@ def load_config(path: str | Path) -> AutoBenchConfig:
     mounts = _parse_mounts(config_data, config_path.parent)
     models = _parse_models(config_data, mounts)
     serve_profiles = _parse_serve_profiles(config_data)
+    topology_profiles = _parse_topology_profiles(config_data)
+    if not serve_profiles and not topology_profiles:
+        raise ConfigError("serve_profiles or topology_profiles must be configured")
+    _validate_serving_profile_names_unique(serve_profiles, topology_profiles)
     bench_profiles = _parse_bench_profiles(config_data)
-    config = AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    config = AutoBenchConfig(
+        run,
+        mounts,
+        models,
+        serve_profiles,
+        bench_profiles,
+        topology_profiles,
+    )
     _validate_asr_dataset_mounts(config)
     _validate_images_cover_engines(config)
     return config
@@ -755,9 +828,21 @@ def make_container_name(model: ModelConfig, serve_profile: ServeProfile, run_id:
 
 def make_bench_container_name(case: BenchmarkCase) -> str:
     return (
-        f"bench-runner-{case.model.name}-{case.serve_profile.name}-"
+        f"bench-runner-{case.model.name}-{case.serving_name}-"
         f"{case.bench_profile.name}-{_safe_name(case.run_id, 'run_id')}"
     )
+
+
+def require_legacy_case(case: BenchmarkCase) -> ServeProfile:
+    if case.serve_profile is None or case.container_name is None:
+        raise ConfigError("legacy serve profile case required")
+    return case.serve_profile
+
+
+def require_topology_case(case: BenchmarkCase) -> TopologyProfile:
+    if case.topology_profile is None:
+        raise ConfigError("topology profile case required")
+    return case.topology_profile
 
 
 def _short_hash(value: str) -> str:
@@ -766,6 +851,7 @@ def _short_hash(value: str) -> str:
 
 def vllm_cache_key_inputs(config: AutoBenchConfig,
                           case: BenchmarkCase) -> dict[str, Any]:
+    serve_profile = require_legacy_case(case)
     return {
         "vllm_image_ref": config.run.images["vllm"],
         "model": {
@@ -775,9 +861,9 @@ def vllm_cache_key_inputs(config: AutoBenchConfig,
             "served_model_name": case.model.served_model_name,
         },
         "serve_profile": {
-            "name": case.serve_profile.name,
-            "gpus": case.serve_profile.gpus,
-            "args": list(case.serve_profile.args),
+            "name": serve_profile.name,
+            "gpus": serve_profile.gpus,
+            "args": list(serve_profile.args),
         },
     }
 
@@ -793,20 +879,27 @@ def _short_json_fingerprint(data: Mapping[str, Any]) -> str:
 
 
 def default_vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str:
+    serve_profile = require_legacy_case(case)
     fingerprint = _short_json_fingerprint(vllm_cache_key_inputs(config, case))
-    return f"{case.model.name}__{case.serve_profile.name}__{fingerprint}"
+    return f"{case.model.name}__{serve_profile.name}__{fingerprint}"
 
 
 def vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
-    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+    if not config.run.vllm_cache.enabled:
         return None
-    return case.serve_profile.cache_key or default_vllm_cache_key(config, case)
+    serve_profile = require_legacy_case(case)
+    if serve_profile.engine != "vllm":
+        return None
+    return serve_profile.cache_key or default_vllm_cache_key(config, case)
 
 
 def vllm_cache_key_source(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
-    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+    if not config.run.vllm_cache.enabled:
         return None
-    return "explicit" if case.serve_profile.cache_key else "default"
+    serve_profile = require_legacy_case(case)
+    if serve_profile.engine != "vllm":
+        return None
+    return "explicit" if serve_profile.cache_key else "default"
 
 
 def resolve_vllm_cache_dir(config: AutoBenchConfig, case: BenchmarkCase) -> Path | None:
@@ -873,17 +966,28 @@ def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[Be
             for bench_profile in config.bench_profiles:
                 cases.append(BenchmarkCase(
                     model=model,
-                    serve_profile=serve_profile,
                     bench_profile=bench_profile,
                     run_id=resolved_run_id,
-                    container_name=make_container_name(model, serve_profile, resolved_run_id),
                     api_model_name=model.served_model_name or model.name,
+                    serve_profile=serve_profile,
+                    container_name=make_container_name(model, serve_profile, resolved_run_id),
+                ))
+        for topology_profile in config.topology_profiles:
+            for bench_profile in config.bench_profiles:
+                cases.append(BenchmarkCase(
+                    model=model,
+                    bench_profile=bench_profile,
+                    run_id=resolved_run_id,
+                    api_model_name=model.served_model_name or model.name,
+                    topology_profile=topology_profile,
+                    container_name=None,
                 ))
     return tuple(cases)
 
 
 def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                            run_dir: Path) -> list[str]:
+    serve_profile = require_legacy_case(case)
     resolved_run_dir = Path(run_dir).resolve()
     cmd = [
         "docker", "run", "-d",
@@ -892,8 +996,8 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
-        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
-        "--gpus", case.serve_profile.gpus,
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
+        "--gpus", serve_profile.gpus,
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
     ]
@@ -921,20 +1025,22 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
     ])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
-    cmd.extend(case.serve_profile.args)
+    cmd.extend(serve_profile.args)
     return cmd
 
 
 def build_serve_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                             run_dir: Path) -> list[str]:
     """按 serve_profile.engine 分派服务启动命令。args 原样透传，不做参数翻译。"""
-    if case.serve_profile.engine == "sglang":
+    serve_profile = require_legacy_case(case)
+    if serve_profile.engine == "sglang":
         return _build_sglang_run_command(config, case, run_dir)
     return build_vllm_run_command(config, case, run_dir)
 
 
 def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                               run_dir: Path) -> list[str]:
+    serve_profile = require_legacy_case(case)
     resolved_run_dir = Path(run_dir).resolve()
     cmd = [
         "docker", "run", "-d",
@@ -943,8 +1049,8 @@ def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
-        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
-        "--gpus", case.serve_profile.gpus,
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
+        "--gpus", serve_profile.gpus,
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
         "--entrypoint", "python3",
@@ -963,7 +1069,7 @@ def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
     ])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
-    cmd.extend(case.serve_profile.args)
+    cmd.extend(serve_profile.args)
     return cmd
 
 
@@ -972,11 +1078,29 @@ def _append_many(cmd: list[str], flag: str, values: tuple[int, ...]) -> None:
     cmd.extend(str(value) for value in values)
 
 
+def case_endpoint_base_url(config: AutoBenchConfig, case: BenchmarkCase) -> str:
+    if case.topology_profile is not None:
+        topology = case.topology_profile
+        host = topology.hosts.get(topology.frontend.host)
+        if host is None:
+            raise ConfigError(
+                f"topology frontend host is missing: {topology.frontend.host}"
+            )
+        return f"http://{host.address}:{topology.frontend.port}/v1"
+    require_legacy_case(case)
+    return f"http://{case.container_name}:{config.run.container_port}/v1"
+
+
 def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                             bench_dir: Path) -> list[str]:
     bench = case.bench_profile
     resolved_bench_dir = Path(bench_dir).resolve()
     resolved_run_dir = resolved_bench_dir.parents[2]
+    profile_label = (
+        f"{CONTAINER_TOPOLOGY_PROFILE_LABEL}={case.topology_profile.name}"
+        if case.topology_profile is not None
+        else f"{CONTAINER_SERVE_PROFILE_LABEL}={require_legacy_case(case).name}"
+    )
     cmd = [
         "docker", "run", "--rm",
         "--name", make_bench_container_name(case),
@@ -984,7 +1108,7 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
-        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
+        "--label", profile_label,
         "--label", f"{CONTAINER_BENCH_PROFILE_LABEL}={case.bench_profile.name}",
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
@@ -995,7 +1119,7 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "-v", f"{resolved_bench_dir}:/results",
         config.run.bench_image,
         "python", "/opt/vllm_standalone_bench/run_bench_multi.py",
-        "--base-url", f"http://{case.container_name}:{config.run.container_port}/v1",
+        "--base-url", case_endpoint_base_url(config, case),
         "--model", case.api_model_name,
         "--served-model-name", case.api_model_name,
         "--backend", bench.backend,
@@ -1079,7 +1203,7 @@ def validate_local_paths(config: AutoBenchConfig) -> None:
 
 def build_layout(config: AutoBenchConfig, run_id: str, case: BenchmarkCase) -> CaseLayout:
     run_dir = config.run.results_dir / run_id
-    serve_dir = run_dir / case.model.name / case.serve_profile.name
+    serve_dir = run_dir / case.model.name / case.serving_name
     bench_dir = serve_dir / case.bench_profile.name
     return CaseLayout(run_dir=run_dir, serve_dir=serve_dir, bench_dir=bench_dir)
 
@@ -1096,6 +1220,34 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         )
         tmp_path.replace(path)
     except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        raise
+
+
+def write_private_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(
+        f"{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    fd: int | None = None
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+        tmp_path.replace(path)
+        os.chmod(path, 0o600)
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             tmp_path.unlink()
         except FileNotFoundError:
@@ -1128,7 +1280,10 @@ class Manifest:
                error: str | None = None) -> None:
         row: dict[str, Any] = {
             "model": case.model.name,
-            "serve_profile": case.serve_profile.name,
+            "serve_profile": case.serve_profile.name if case.serve_profile else None,
+            "topology_profile": (
+                case.topology_profile.name if case.topology_profile else None
+            ),
             "bench_profile": case.bench_profile.name,
             "status": status,
             "csv": str((layout.bench_dir / "result.csv").relative_to(layout.run_dir)),
@@ -1296,37 +1451,49 @@ def vllm_container_labels_match(labels: dict[str, str],
 def bench_container_labels_match(labels: dict[str, str],
                                  case: BenchmarkCase,
                                  run_dir: Path) -> bool:
+    if case.topology_profile is not None:
+        profile_matches = (
+            labels.get(CONTAINER_TOPOLOGY_PROFILE_LABEL) == case.topology_profile.name
+        )
+    else:
+        profile_matches = (
+            labels.get(CONTAINER_SERVE_PROFILE_LABEL) == require_legacy_case(case).name
+        )
     return (
         vllm_container_labels_match(labels, case, run_dir)
         and labels.get(CONTAINER_MODEL_LABEL) == case.model.name
-        and labels.get(CONTAINER_SERVE_PROFILE_LABEL) == case.serve_profile.name
+        and profile_matches
         and labels.get(CONTAINER_BENCH_PROFILE_LABEL) == case.bench_profile.name
     )
 
 
 def remove_existing_vllm_container_if_owned(runner: Runner, case: BenchmarkCase,
                                             run_dir: Path) -> None:
-    labels = inspect_container_labels(runner, case.container_name)
+    require_legacy_case(case)
+    container_name = case.container_name
+    labels = inspect_container_labels(runner, container_name)
     if labels is None:
         return
     if not vllm_container_labels_match(labels, case, run_dir):
         raise RuntimeError(
-            f"vLLM container exists but is not owned by this run: {case.container_name}"
+            f"vLLM container exists but is not owned by this run: {container_name}"
         )
-    runner.run(["docker", "rm", "-f", case.container_name], check=False)
+    runner.run(["docker", "rm", "-f", container_name], check=False)
 
 
 def stop_and_remove_vllm_container_if_owned(runner: Runner, case: BenchmarkCase,
                                            run_dir: Path, dry_run: bool) -> None:
+    require_legacy_case(case)
+    container_name = case.container_name
     if dry_run:
-        stop_and_remove_container(runner, case.container_name, dry_run=True)
+        stop_and_remove_container(runner, container_name, dry_run=True)
         return
-    labels = inspect_container_labels(runner, case.container_name)
+    labels = inspect_container_labels(runner, container_name)
     if labels is None:
         return
     if not vllm_container_labels_match(labels, case, run_dir):
         return
-    stop_and_remove_container(runner, case.container_name, dry_run=False)
+    stop_and_remove_container(runner, container_name, dry_run=False)
 
 
 def remove_existing_bench_container_if_owned(runner: Runner, case: BenchmarkCase,
@@ -1413,8 +1580,14 @@ def cleanup_network(config: AutoBenchConfig, runner: Runner,
     return stop_requested
 
 
-def print_cmd(cmd: list[str]) -> None:
-    print("+ " + " ".join(cmd))
+def mask_command_for_display(cmd: Sequence[str]) -> list[str]:
+    from remote_docker import mask_command
+
+    return mask_command(cmd)
+
+
+def print_cmd(cmd: Sequence[str]) -> None:
+    print("+ " + " ".join(mask_command_for_display(cmd)))
 
 
 def install_signal_handlers() -> None:
@@ -1470,11 +1643,13 @@ sys.exit(1)
 
 
 def make_ready_probe_container_name(case: BenchmarkCase) -> str:
-    return f"bench-ready-{case.model.name}-{case.serve_profile.name}-{case.run_id}"
+    serve_profile = require_legacy_case(case)
+    return f"bench-ready-{case.model.name}-{serve_profile.name}-{case.run_id}"
 
 
 def build_ready_probe_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                                   run_dir: Path) -> list[str]:
+    require_legacy_case(case)
     resolved_run_dir = Path(run_dir).resolve()
     url = f"http://{case.container_name}:{config.run.container_port}/v1/models"
     return [
@@ -1540,18 +1715,123 @@ def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
             pass
 
 
+def _run_bench_case(config: AutoBenchConfig, runner: Runner,
+                    case: BenchmarkCase, layout: CaseLayout,
+                    dry_run: bool,
+                    monitor_resources: bool = True) -> tuple[str, str | None]:
+    bench_cmd = build_bench_run_command(config, case, layout.bench_dir)
+    if dry_run:
+        print_cmd(bench_cmd)
+        return "passed", None
+
+    if not remove_existing_bench_container_if_owned(
+        runner,
+        case,
+        layout.run_dir,
+    ):
+        raise RuntimeError(
+            "benchmark container exists but is not owned by this run: "
+            f"{make_bench_container_name(case)}"
+        )
+
+    bench_interrupted: BaseException | None = None
+    monitor = (
+        ResourceMonitor(
+            output_dir=layout.bench_dir,
+            interval_sec=config.run.resource_monitor.interval_sec,
+            enabled=True,
+            backend=config.run.resource_monitor.backend,
+            passthrough_exceptions=(StopRequested,),
+        )
+        if config.run.resource_monitor.enabled
+        and monitor_resources
+        else None
+    )
+    try:
+        try:
+            if monitor is not None:
+                try:
+                    monitor.start()
+                except (StopRequested, KeyboardInterrupt):
+                    raise
+                except Exception as exc:
+                    logger.warning("resource monitor start failed: %s", exc)
+                    monitor = None
+            with (layout.bench_dir / "bench.log").open(
+                "w",
+                encoding="utf-8",
+            ) as log:
+                result = runner.run(
+                    bench_cmd,
+                    check=False,
+                    capture=False,
+                    stdout=log,
+                    stderr=log,
+                )
+        except (StopRequested, KeyboardInterrupt) as exc:
+            bench_interrupted = exc
+            raise
+        finally:
+            if monitor is not None:
+                resource_summary = None
+                try:
+                    resource_summary = monitor.stop()
+                except (StopRequested, KeyboardInterrupt):
+                    if bench_interrupted is None:
+                        raise
+                except Exception as exc:
+                    logger.warning("resource monitor stop failed: %s", exc)
+                if resource_summary is not None:
+                    try:
+                        append_summary_to_result_files(
+                            layout.bench_dir,
+                            resource_summary,
+                        )
+                    except (StopRequested, KeyboardInterrupt):
+                        if bench_interrupted is None:
+                            raise
+                    except Exception as exc:
+                        logger.warning(
+                            "resource monitor result merge failed: %s",
+                            exc,
+                        )
+    finally:
+        try:
+            cleanup_bench_container_if_owned(
+                runner,
+                case,
+                layout.run_dir,
+            )
+        except (StopRequested, KeyboardInterrupt):
+            if bench_interrupted is None:
+                raise
+        except Exception:
+            pass
+
+    status = "passed" if result.returncode == 0 else "failed"
+    error = None if result.returncode == 0 else f"benchmark exited {result.returncode}"
+    return status, error
+
+
 def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
                         case: BenchmarkCase, layout: CaseLayout) -> None:
+    require_legacy_case(case)
+    container_name = case.container_name
+    serve_command = build_serve_run_command(config, case, layout.run_dir)
+    secrets_to_redact = _legacy_secret_values(config, serve_command)
     layout.serve_dir.mkdir(parents=True, exist_ok=True)
-    logs = runner.run(["docker", "logs", "--timestamps", case.container_name], check=False)
+    logs = runner.run(["docker", "logs", "--timestamps", container_name], check=False)
     (layout.serve_dir / "vllm.log").write_text(
         logs.stdout + logs.stderr,
         encoding="utf-8",
     )
-    inspect = runner.run(["docker", "inspect", case.container_name], check=False)
-    (layout.serve_dir / "docker.inspect.json").write_text(inspect.stdout, encoding="utf-8")
+    inspect = runner.run(["docker", "inspect", container_name], check=False)
+    (layout.serve_dir / "docker.inspect.json").write_text(
+        redact_inspect_stdout(inspect.stdout, secrets_to_redact),
+        encoding="utf-8",
+    )
     (layout.serve_dir / "serve_command.txt").write_text(
-        " ".join(build_serve_run_command(config, case, layout.run_dir)),
+        shlex.join(mask_command_for_display(serve_command)) + "\n",
         encoding="utf-8",
     )
 
@@ -1573,6 +1853,325 @@ def save_vllm_artifacts_best_effort(config: AutoBenchConfig, runner: Runner,
             raise
         except Exception:
             pass
+
+
+def _role_start_order(case: BenchmarkCase,
+                      role_commands: Mapping[str, RoleCommand]) -> list[RoleCommand]:
+    topology = require_topology_case(case)
+    ordered_names = (
+        [node.name for node in topology.prefill]
+        + [node.name for node in topology.decode]
+        + [topology.frontend.host]
+    )
+    ordered = [
+        role_commands[name]
+        for name in ordered_names
+        if name in role_commands
+    ]
+    ordered_set = {command.role_name for command in ordered}
+    ordered.extend(
+        command
+        for command in role_commands.values()
+        if command.role_name not in ordered_set
+    )
+    return ordered
+
+
+def topology_role_ready_url(case: BenchmarkCase, role_name: str) -> str:
+    topology = require_topology_case(case)
+    if role_name == topology.frontend.host:
+        host = topology.hosts[topology.frontend.host]
+        port = topology.frontend.port
+        return f"http://{host.address}:{port}/v1"
+    for node in (*topology.prefill, *topology.decode):
+        if node.name == role_name:
+            host = topology.hosts[node.host]
+            return f"http://{host.address}:{node.port}/v1"
+    raise ConfigError(f"topology role is not defined: {role_name}")
+
+
+def wait_for_remote_ready(config: AutoBenchConfig, case: BenchmarkCase,
+                          role_name: str) -> bool:
+    topology = require_topology_case(case)
+    api_key = config.run.api_key if role_name == topology.frontend.host else None
+    return wait_for_ready(
+        topology_role_ready_url(case, role_name),
+        api_key,
+        config.run.ready_timeout_sec,
+    )
+
+
+def _topology_role_host(case: BenchmarkCase, role_command: RoleCommand):
+    topology = require_topology_case(case)
+    try:
+        return topology.hosts[role_command.host_name]
+    except KeyError as exc:
+        raise ConfigError(
+            f"topology role host is missing: {role_command.host_name}"
+        ) from exc
+
+
+def topology_role_labels_match(labels: dict[str, str], case: BenchmarkCase,
+                               role_command: RoleCommand, run_dir: Path) -> bool:
+    topology = require_topology_case(case)
+    return (
+        labels.get(NETWORK_MANAGED_LABEL) == "true"
+        and labels.get(NETWORK_RUN_ID_LABEL) == case.run_id
+        and labels.get(CONTAINER_RUN_DIR_LABEL) == str(Path(run_dir).resolve())
+        and labels.get(CONTAINER_MODEL_LABEL) == case.model.name
+        and labels.get(CONTAINER_TOPOLOGY_PROFILE_LABEL) == topology.name
+        and labels.get(CONTAINER_TOPOLOGY_ROLE_NAME_LABEL) == role_command.role_name
+    )
+
+
+def _topology_resolved_dict(config: AutoBenchConfig,
+                            case: BenchmarkCase) -> dict[str, Any]:
+    topology = require_topology_case(case)
+    payload = dry_run_config_to_dict(config)
+    profiles = payload.get("topology_profiles", [])
+    if not isinstance(profiles, list):
+        profiles = []
+    selected = [
+        profile
+        for profile in profiles
+        if isinstance(profile, dict) and profile.get("name") == topology.name
+    ]
+    return {"topology_profiles": selected}
+
+
+def _secret_values_from_masked_args(argv: Sequence[str]) -> set[str]:
+    secrets_to_redact: set[str] = set()
+    masked = mask_command(argv)
+    for original, display in zip(argv, masked):
+        if original == display or "***" not in display:
+            continue
+        if display == "***":
+            secrets_to_redact.add(original)
+            continue
+        if display.endswith("=***") and "=" in original:
+            _key, _separator, value = original.partition("=")
+            if value:
+                secrets_to_redact.add(value)
+    return secrets_to_redact
+
+
+def _legacy_secret_values(config: AutoBenchConfig,
+                          serve_command: Sequence[str]) -> set[str]:
+    secrets_to_redact: set[str] = set()
+    if config.run.api_key:
+        secrets_to_redact.add(config.run.api_key)
+    secrets_to_redact.update(_secret_values_from_masked_args(serve_command))
+    return {value for value in secrets_to_redact if value}
+
+
+def _topology_secret_values(config: AutoBenchConfig,
+                            case: BenchmarkCase,
+                            role_commands: Mapping[str, RoleCommand]) -> set[str]:
+    topology = require_topology_case(case)
+    secrets_to_redact: set[str] = set()
+    if config.run.api_key:
+        secrets_to_redact.add(config.run.api_key)
+    for host in topology.hosts.values():
+        auth = host.auth
+        if auth.password:
+            secrets_to_redact.add(auth.password)
+        if auth.env and auth.env in os.environ:
+            secrets_to_redact.add(os.environ[auth.env])
+    for key, value in topology.env.items():
+        if _is_sensitive_dry_run_key(key) and value:
+            secrets_to_redact.add(str(value))
+    for node in (*topology.prefill, *topology.decode):
+        for key, value in node.env.items():
+            if _is_sensitive_dry_run_key(key) and value:
+                secrets_to_redact.add(str(value))
+    for role_command in role_commands.values():
+        secrets_to_redact.update(_secret_values_from_masked_args(role_command.argv))
+    return {value for value in secrets_to_redact if value}
+
+
+def _redact_known_secrets(value: str, secrets_to_redact: set[str]) -> str:
+    redacted = value
+    for secret_value in sorted(secrets_to_redact, key=len, reverse=True):
+        if secret_value:
+            redacted = redacted.replace(secret_value, "***")
+    return redacted
+
+
+def _redact_inspect_value(value: Any, secrets_to_redact: set[str],
+                          key: str | None = None) -> Any:
+    if key is not None and _is_sensitive_dry_run_key(key) and value is not None:
+        return "***"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _redact_inspect_value(
+                item,
+                secrets_to_redact,
+                str(item_key),
+            )
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            return mask_command(value, secrets_to_redact)
+        return [
+            _redact_inspect_value(item, secrets_to_redact)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return _redact_known_secrets(value, secrets_to_redact)
+    return value
+
+
+def redact_inspect_stdout(stdout: str, secrets_to_redact: set[str]) -> str:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return _redact_known_secrets(stdout, secrets_to_redact)
+    redacted = _redact_inspect_value(payload, secrets_to_redact)
+    return json.dumps(redacted, ensure_ascii=True, indent=2) + "\n"
+
+
+def redact_topology_inspect_stdout(stdout: str,
+                                   secrets_to_redact: set[str]) -> str:
+    return redact_inspect_stdout(stdout, secrets_to_redact)
+
+
+def save_topology_artifacts(config: AutoBenchConfig,
+                            remote_runner: RemoteDockerRunner,
+                            case: BenchmarkCase,
+                            role_commands: Mapping[str, RoleCommand],
+                            started_roles: Sequence[RoleCommand],
+                            layout: CaseLayout) -> None:
+    layout.bench_dir.mkdir(parents=True, exist_ok=True)
+    command_dir = layout.bench_dir / "commands"
+    log_dir = layout.bench_dir / "logs"
+    inspect_dir = layout.bench_dir / "inspect"
+    command_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    inspect_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(
+        layout.bench_dir / "topology.resolved.json",
+        _topology_resolved_dict(config, case),
+    )
+    secrets_to_redact = _topology_secret_values(config, case, role_commands)
+    for role_command in _role_start_order(case, role_commands):
+        (command_dir / f"{role_command.role_name}.txt").write_text(
+            shlex.join(role_command.masked_argv) + "\n",
+            encoding="utf-8",
+        )
+    for role_command in started_roles:
+        host = _topology_role_host(case, role_command)
+        logs = remote_runner.run(
+            host,
+            ["docker", "logs", "--timestamps", role_command.container_name],
+            check=False,
+        )
+        (log_dir / f"{role_command.role_name}.log").write_text(
+            _redact_known_secrets(logs.stdout + logs.stderr, secrets_to_redact),
+            encoding="utf-8",
+        )
+        inspect = remote_runner.run(
+            host,
+            ["docker", "inspect", role_command.container_name],
+            check=False,
+        )
+        (inspect_dir / f"{role_command.role_name}.json").write_text(
+            redact_topology_inspect_stdout(inspect.stdout, secrets_to_redact),
+            encoding="utf-8",
+        )
+
+
+def save_topology_artifacts_best_effort(config: AutoBenchConfig,
+                                        remote_runner: RemoteDockerRunner,
+                                        case: BenchmarkCase,
+                                        role_commands: Mapping[str, RoleCommand],
+                                        started_roles: Sequence[RoleCommand],
+                                        layout: CaseLayout) -> None:
+    try:
+        save_topology_artifacts(
+            config,
+            remote_runner,
+            case,
+            role_commands,
+            started_roles,
+            layout,
+        )
+    except StopRequested:
+        raise
+    except Exception as exc:
+        try:
+            layout.bench_dir.mkdir(parents=True, exist_ok=True)
+            (layout.bench_dir / "artifact.warning.txt").write_text(
+                f"failed to save topology artifacts: {exc}",
+                encoding="utf-8",
+            )
+        except StopRequested:
+            raise
+        except Exception:
+            pass
+
+
+def cleanup_topology_roles_best_effort(remote_runner: RemoteDockerRunner,
+                                       case: BenchmarkCase,
+                                       started_roles: Sequence[RoleCommand],
+                                       run_dir: Path) -> StopRequested | None:
+    stop_requested: StopRequested | None = None
+    for role_command in reversed(started_roles):
+        host = _topology_role_host(case, role_command)
+        try:
+            labels = remote_runner.inspect_labels(host, role_command.container_name)
+        except StopRequested as exc:
+            stop_requested = stop_requested or exc
+            continue
+        except Exception as exc:
+            print(
+                "warning: topology cleanup skipped after label inspect failed "
+                f"for {role_command.container_name}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        if labels is None:
+            continue
+        if not topology_role_labels_match(labels, case, role_command, run_dir):
+            continue
+        for command in (
+            ["docker", "stop", role_command.container_name],
+            ["docker", "rm", "-f", role_command.container_name],
+        ):
+            try:
+                remote_runner.run(host, command, check=False)
+            except StopRequested as exc:
+                stop_requested = stop_requested or exc
+            except Exception as exc:
+                print(
+                    "warning: topology cleanup failed for "
+                    f"{role_command.container_name}: {exc}",
+                    file=sys.stderr,
+                )
+    return stop_requested
+
+
+def remove_existing_topology_role_if_owned(remote_runner: RemoteDockerRunner,
+                                           case: BenchmarkCase,
+                                           role_command: RoleCommand,
+                                           run_dir: Path) -> bool:
+    host = _topology_role_host(case, role_command)
+    labels = remote_runner.inspect_labels(host, role_command.container_name)
+    if labels is None:
+        return True
+    if not topology_role_labels_match(labels, case, role_command, run_dir):
+        return False
+    result = remote_runner.run(
+        host,
+        ["docker", "rm", "-f", role_command.container_name],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "failed to remove stale topology role container: "
+            f"{role_command.container_name} ({result.returncode})"
+        )
+    return True
 
 
 def stop_and_remove_container(runner: Runner, container_name: str, dry_run: bool) -> None:
@@ -1635,7 +2234,7 @@ class ResumeContext:
     run_dir: Path
     initial_manifest: Manifest
     pending_cases: tuple[BenchmarkCase, ...]
-    unknown_manifest_cases: tuple[tuple[str, str, str], ...]
+    unknown_manifest_cases: tuple[CaseKey, ...]
 
 
 def run_lock_path(run_dir: Path) -> Path:
@@ -1895,6 +2494,75 @@ def _config_with_results_dir(config: AutoBenchConfig, results_dir: Path) -> Auto
     return replace(config, run=replace(config.run, results_dir=results_dir))
 
 
+def _is_redacted_secret_placeholder(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.strip().lower() in REDACTED_SECRET_PLACEHOLDERS
+    )
+
+
+def _is_sensitive_resume_key(key: object) -> bool:
+    normalized = str(key).strip().lstrip("-").replace("-", "_").lower()
+    return _is_sensitive_dry_run_key(normalized)
+
+
+def _redacted_sensitive_placeholder_path(value: Any,
+                                         path: str = "config") -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            item_path = f"{path}.{key}"
+            if (
+                _is_sensitive_resume_key(key)
+                and _is_redacted_secret_placeholder(item)
+            ):
+                return item_path
+            found = _redacted_sensitive_placeholder_path(item, item_path)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            for index, item in enumerate(value):
+                item_path = f"{path}[{index}]"
+                if "=" in item:
+                    key, _separator, item_value = item.partition("=")
+                    if (
+                        _is_sensitive_resume_key(key)
+                        and _is_redacted_secret_placeholder(item_value)
+                    ):
+                        return item_path
+                if not _is_redacted_secret_placeholder(item):
+                    continue
+                previous = value[index - 1] if index > 0 else ""
+                if _is_sensitive_resume_key(previous):
+                    return item_path
+            return None
+        for index, item in enumerate(value):
+            found = _redacted_sensitive_placeholder_path(item, f"{path}[{index}]")
+            if found is not None:
+                return found
+    return None
+
+
+def _load_resume_config(run_dir: Path) -> AutoBenchConfig:
+    private_config = run_dir / RESUME_CONFIG_FILE
+    if private_config.exists():
+        return load_config(private_config)
+
+    public_config = run_dir / "config.resolved.json"
+    payload = _read_json_object(public_config, "resolved config")
+    redacted_path = _redacted_sensitive_placeholder_path(payload)
+    if redacted_path is not None:
+        raise ConfigError(
+            f"run is missing private resume config {RESUME_CONFIG_FILE}; "
+            f"public config.resolved.json contains a redacted sensitive value "
+            f"at {redacted_path}. A secret such as an inline password or API "
+            "key has been redacted and cannot be recovered for resume; use "
+            "password_env/auth.env or rerun the benchmark."
+        )
+    return load_config(public_config)
+
+
 def _resume_context_from_state(results_dir: Path, run_id: str,
                                state: dict[str, Any]) -> ResumeContext:
     resolved_results_dir = Path(results_dir)
@@ -1905,7 +2573,7 @@ def _resume_context_from_state(results_dir: Path, run_id: str,
     if status in ("starting", "running"):
         raise ConfigError(f"run is active and cannot be resumed: {status}")
 
-    config = load_config(run_dir / "config.resolved.json")
+    config = _load_resume_config(run_dir)
     config = _config_with_results_dir(config, resolved_results_dir)
     cases = expand_cases(config, run_id=run_id)
     manifest_data = _read_json_object(run_dir / "manifest.json", "manifest")
@@ -1954,33 +2622,114 @@ def load_resume_child_startup_context(results_dir: Path, run_id: str,
     return load_resume_context(results_dir, run_id)
 
 
-def _jsonable(value: Any) -> Any:
+def _jsonable(value: Any, *, redact_remote_auth_password: bool = True) -> Any:
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, RemoteAuth):
+        payload = {
+            field_name: _jsonable(
+                getattr(value, field_name),
+                redact_remote_auth_password=redact_remote_auth_password,
+            )
+            for field_name in value.__dataclass_fields__
+        }
+        if redact_remote_auth_password and value.password is not None:
+            payload["password"] = "***"
+        return payload
     if isinstance(value, tuple):
-        return [_jsonable(item) for item in value]
+        return [
+            _jsonable(item, redact_remote_auth_password=redact_remote_auth_password)
+            for item in value
+        ]
     if isinstance(value, list):
-        return [_jsonable(item) for item in value]
+        return [
+            _jsonable(item, redact_remote_auth_password=redact_remote_auth_password)
+            for item in value
+        ]
     if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        return {
+            str(key): _jsonable(
+                item,
+                redact_remote_auth_password=redact_remote_auth_password,
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        return {
+            str(key): _jsonable(
+                item,
+                redact_remote_auth_password=redact_remote_auth_password,
+            )
+            for key, item in value.items()
+        }
     if hasattr(value, "__dataclass_fields__"):
         return {
-            field_name: _jsonable(getattr(value, field_name))
+            field_name: _jsonable(
+                getattr(value, field_name),
+                redact_remote_auth_password=redact_remote_auth_password,
+            )
             for field_name in value.__dataclass_fields__
         }
     return value
 
 
-def config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
-    return _jsonable(config)
+def config_to_dict(config: AutoBenchConfig, *,
+                   redact_remote_auth_password: bool = True) -> dict[str, Any]:
+    payload = _jsonable(
+        config,
+        redact_remote_auth_password=redact_remote_auth_password,
+    )
+    if not config.serve_profiles:
+        payload.pop("serve_profiles", None)
+    if not config.topology_profiles:
+        payload.pop("topology_profiles", None)
+    return payload
 
 
-def _case_ref(case: BenchmarkCase) -> dict[str, str]:
+def _is_sensitive_dry_run_key(key: object) -> bool:
+    normalized = str(key).lower()
+    if normalized == "tokenizer" or normalized.endswith("_path"):
+        return False
+    if normalized == "api_key" or normalized.endswith("_api_key"):
+        return True
+    parts = [part for part in re.split(r"[^a-z0-9]+", normalized) if part]
+    return any(part in {"password", "token", "secret"} for part in parts)
+
+
+def _mask_dry_run_resolved_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        masked: dict[str, Any] = {}
+        for key, item in value.items():
+            if _is_sensitive_dry_run_key(key) and item is not None:
+                masked[key] = "***"
+            else:
+                masked[key] = _mask_dry_run_resolved_value(item)
+        return masked
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            return mask_command_for_display(value)
+        return [_mask_dry_run_resolved_value(item) for item in value]
+    return value
+
+
+def dry_run_config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
+    payload = _mask_dry_run_resolved_value(config_to_dict(config))
+    if not isinstance(payload, dict):
+        raise ConfigError("dry-run resolved config must be an object")
+    return payload
+
+
+def resume_config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
+    return config_to_dict(config, redact_remote_auth_password=False)
+
+
+def _case_ref(case: BenchmarkCase) -> dict[str, str | None]:
     return {
         "model": case.model.name,
-        "serve_profile": case.serve_profile.name,
+        "serve_profile": case.serve_profile.name if case.serve_profile else None,
+        "topology_profile": (
+            case.topology_profile.name if case.topology_profile else None
+        ),
         "bench_profile": case.bench_profile.name,
     }
 
@@ -2038,24 +2787,51 @@ def write_terminal_state(run_dir: Path, run_id: str, manifest: Manifest,
     write_state(run_dir, state)
 
 
-def _case_key(case: BenchmarkCase) -> tuple[str, str, str]:
-    return (case.model.name, case.serve_profile.name, case.bench_profile.name)
+def _case_key(case: BenchmarkCase) -> CaseKey:
+    return (
+        case.model.name,
+        case.serve_profile.name if case.serve_profile else None,
+        case.topology_profile.name if case.topology_profile else None,
+        case.bench_profile.name,
+    )
 
 
-def _manifest_case_keys(manifest: Manifest) -> set[tuple[str, str, str]]:
-    return {
-        (str(row["model"]), str(row["serve_profile"]), str(row["bench_profile"]))
-        for row in manifest.cases
-    }
+def _manifest_case_keys(manifest: Manifest) -> set[CaseKey]:
+    keys: set[CaseKey] = set()
+    for row in manifest.cases:
+        key = _manifest_row_key(row)
+        if key is not None:
+            keys.add(key)
+    return keys
 
 
-def _manifest_row_key(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
+def _manifest_row_key(row: Mapping[str, Any]) -> CaseKey | None:
     model = row.get("model")
     serve_profile = row.get("serve_profile")
+    topology_profile = row.get("topology_profile")
     bench_profile = row.get("bench_profile")
-    if not all(isinstance(value, str) for value in (model, serve_profile, bench_profile)):
+    if not isinstance(model, str) or not isinstance(bench_profile, str):
         return None
-    return (model, serve_profile, bench_profile)
+    if isinstance(serve_profile, str) and topology_profile is None:
+        return (model, serve_profile, None, bench_profile)
+    if serve_profile is None and isinstance(topology_profile, str):
+        return (model, None, topology_profile, bench_profile)
+    return None
+
+
+def _legacy_topology_manifest_row_key(row: Mapping[str, Any]) -> CaseKey | None:
+    model = row.get("model")
+    serve_profile = row.get("serve_profile")
+    topology_profile = row.get("topology_profile")
+    bench_profile = row.get("bench_profile")
+    if (
+        isinstance(model, str)
+        and isinstance(serve_profile, str)
+        and topology_profile is None
+        and isinstance(bench_profile, str)
+    ):
+        return (model, None, serve_profile, bench_profile)
+    return None
 
 
 def _copy_manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -2072,7 +2848,7 @@ def plan_resume_cases(
     run_id: str,
     cases: tuple[BenchmarkCase, ...],
     manifest_data: Mapping[str, Any],
-) -> tuple[Manifest, tuple[BenchmarkCase, ...], list[tuple[str, str, str]]]:
+) -> tuple[Manifest, tuple[BenchmarkCase, ...], list[CaseKey]]:
     rows = manifest_data.get("cases")
     if not isinstance(rows, list):
         raise ConfigError("manifest cases must be a list")
@@ -2083,21 +2859,27 @@ def plan_resume_cases(
 
     full_keys = {_case_key(case) for case in cases}
     passed_rows: list[dict[str, Any]] = []
-    passed_keys: set[tuple[str, str, str]] = set()
-    unknown_keys: list[tuple[str, str, str]] = []
+    passed_keys: set[CaseKey] = set()
+    unknown_keys: list[CaseKey] = []
 
     for row in rows:
         if not isinstance(row, dict):
             raise ConfigError("manifest cases must contain objects")
         key = _manifest_row_key(row)
         if key is None:
-            raise ConfigError("manifest case row is missing model/serve_profile/bench_profile")
+            raise ConfigError(MANIFEST_CASE_KEY_ERROR)
         if key not in full_keys:
-            unknown_keys.append(key)
-            continue
+            fallback_key = _legacy_topology_manifest_row_key(row)
+            if fallback_key is None or fallback_key not in full_keys:
+                unknown_keys.append(key)
+                continue
+            key = fallback_key
         if row.get("status") == "passed":
             passed_keys.add(key)
-            passed_rows.append(_copy_manifest_row(row))
+            copied = _copy_manifest_row(row)
+            copied["serve_profile"] = key[1]
+            copied["topology_profile"] = key[2]
+            passed_rows.append(copied)
 
     initial_manifest = Manifest(run_id=run_id, total=len(cases), cases=passed_rows)
     pending = tuple(case for case in cases if _case_key(case) not in passed_keys)
@@ -2156,22 +2938,313 @@ def _record_interrupted_group(manifest: Manifest, run_dir: Path, run_id: str,
 def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, str], list[BenchmarkCase]]:
     grouped: dict[tuple[str, str], list[BenchmarkCase]] = {}
     for case in cases:
-        grouped.setdefault((case.model.name, case.serve_profile.name), []).append(case)
+        grouped.setdefault((case.model.name, case.serving_name), []).append(case)
     return grouped
+
+
+def _start_topology_resource_monitors(
+    config: AutoBenchConfig,
+    remote_runner: RemoteDockerRunner,
+    case: BenchmarkCase,
+    layout: CaseLayout,
+    started_roles: Sequence[RoleCommand],
+) -> dict[str, Any]:
+    if not config.run.resource_monitor.enabled:
+        return {}
+
+    monitors: dict[str, Any] = {}
+    for role_command in started_roles:
+        role_name = role_command.role_name
+        monitor = None
+        try:
+            host = _topology_role_host(case, role_command)
+            monitor = ResourceMonitor(
+                output_dir=layout.bench_dir / "resources" / role_name,
+                interval_sec=config.run.resource_monitor.interval_sec,
+                enabled=True,
+                backend=config.run.resource_monitor.backend,
+                readers=RemoteResourceReaders(remote_runner, host),
+                passthrough_exceptions=(StopRequested,),
+            )
+            monitor.start()
+        except (StopRequested, KeyboardInterrupt) as exc:
+            _stop_topology_resource_monitor_best_effort(role_name, monitor)
+            _stop_topology_resource_monitors_best_effort(monitors)
+            raise exc
+        except Exception as exc:
+            cleanup_interrupt = _stop_topology_resource_monitor_best_effort(
+                role_name,
+                monitor,
+            )
+            if cleanup_interrupt is not None:
+                _stop_topology_resource_monitors_best_effort(monitors)
+                raise cleanup_interrupt
+            logger.warning(
+                "remote resource monitor start failed for %s: %s",
+                role_name,
+                exc,
+            )
+            continue
+        monitors[role_name] = monitor
+    return monitors
+
+
+def _stop_topology_resource_monitor_best_effort(
+    role_name: str,
+    monitor: Any,
+) -> BaseException | None:
+    if monitor is None:
+        return None
+    try:
+        monitor.stop()
+    except (StopRequested, KeyboardInterrupt) as exc:
+        logger.warning(
+            "remote resource monitor cleanup interrupted for %s: %s",
+            role_name,
+            exc,
+        )
+        return exc
+    except Exception as exc:
+        logger.warning(
+            "remote resource monitor cleanup failed for %s: %s",
+            role_name,
+            exc,
+        )
+    return None
+
+
+def _stop_topology_resource_monitors_best_effort(
+    monitors: Mapping[str, Any],
+) -> BaseException | None:
+    first_interrupt: BaseException | None = None
+    for role_name, monitor in monitors.items():
+        interrupt = _stop_topology_resource_monitor_best_effort(role_name, monitor)
+        if first_interrupt is None and interrupt is not None:
+            first_interrupt = interrupt
+    return first_interrupt
+
+
+def _stop_topology_resource_monitors(
+    monitors: Mapping[str, Any],
+    layout: CaseLayout,
+) -> None:
+    summaries = {}
+    first_interrupt: BaseException | None = None
+    for role_name, monitor in monitors.items():
+        try:
+            summary = monitor.stop()
+        except (StopRequested, KeyboardInterrupt) as exc:
+            if first_interrupt is None:
+                first_interrupt = exc
+            continue
+        except Exception as exc:
+            logger.warning(
+                "remote resource monitor stop failed for %s: %s",
+                role_name,
+                exc,
+            )
+            continue
+        if summary is not None:
+            summaries[role_name] = summary
+
+    if first_interrupt is not None:
+        raise first_interrupt
+
+    if not summaries:
+        return
+
+    try:
+        append_prefixed_summaries_to_result_files(layout.bench_dir, summaries)
+    except (StopRequested, KeyboardInterrupt):
+        raise
+    except Exception as exc:
+        logger.warning("remote resource monitor result merge failed: %s", exc)
+
+
+def run_topology_group(config: AutoBenchConfig, run_id: str,
+                       local_runner: Runner,
+                       remote_runner: RemoteDockerRunner,
+                       group_cases: list[BenchmarkCase],
+                       all_cases: tuple[BenchmarkCase, ...],
+                       completed: int,
+                       manifest: Manifest,
+                       run_dir: Path) -> tuple[int, int, bool]:
+    serve_case = group_cases[0]
+    serve_layout = build_layout(config, run_id, serve_case)
+    role_commands: Mapping[str, RoleCommand] = {}
+    started_roles: list[RoleCommand] = []
+    completed_delta = 0
+    group_exit_code = 0
+    interrupted = False
+    artifact_stop: StopRequested | None = None
+    cleanup_stop: StopRequested | None = None
+    try:
+        role_commands = require_topology_case(serve_case).build_commands(
+            config,
+            serve_case,
+            serve_layout.run_dir,
+        )
+        ordered_roles = _role_start_order(serve_case, role_commands)
+        for role_command in ordered_roles:
+            host = _topology_role_host(serve_case, role_command)
+            if not remove_existing_topology_role_if_owned(
+                remote_runner,
+                serve_case,
+                role_command,
+                serve_layout.run_dir,
+            ):
+                raise RuntimeError(
+                    "topology role container exists but is not owned by this run: "
+                    f"{role_command.container_name}"
+                )
+            start_result = remote_runner.run(
+                host,
+                list(role_command.argv),
+                check=False,
+            )
+            if start_result.returncode != 0:
+                raise RuntimeError(
+                    "topology role failed to start: "
+                    f"{role_command.role_name} ({start_result.returncode})"
+                )
+            started_roles.append(role_command)
+
+        for role_command in started_roles:
+            if not wait_for_remote_ready(config, serve_case, role_command.role_name):
+                raise RuntimeError(
+                    "topology role ready check timed out: "
+                    f"{role_command.role_name}"
+                )
+
+        for case in group_cases:
+            layout = build_layout(config, run_id, case)
+            layout.bench_dir.mkdir(parents=True, exist_ok=True)
+            write_state(
+                run_dir,
+                current_state(
+                    run_id,
+                    all_cases,
+                    completed + completed_delta,
+                    case,
+                    "running",
+                    manifest=manifest,
+                ),
+            )
+            resource_monitors = _start_topology_resource_monitors(
+                config,
+                remote_runner,
+                case,
+                layout,
+                started_roles,
+            )
+            bench_interrupted: BaseException | None = None
+            try:
+                try:
+                    status, error = _run_bench_case(
+                        config,
+                        local_runner,
+                        case,
+                        layout,
+                        dry_run=False,
+                        monitor_resources=False,
+                    )
+                except (StopRequested, KeyboardInterrupt) as exc:
+                    bench_interrupted = exc
+                    raise
+            finally:
+                try:
+                    _stop_topology_resource_monitors(resource_monitors, layout)
+                except (StopRequested, KeyboardInterrupt):
+                    if bench_interrupted is None:
+                        raise
+            if status != "passed":
+                group_exit_code = 1
+            manifest.record(case, layout, status, error=error)
+            write_json_atomic(layout.bench_dir / "status.json", {
+                "status": status,
+                "error": error,
+            })
+            completed_delta += 1
+            write_manifest(run_dir, manifest)
+    except StopRequested as exc:
+        group_exit_code = 130
+        interrupted = True
+        manifest.terminal_status = "interrupted"
+        completed_delta += _record_interrupted_group(
+            manifest,
+            run_dir,
+            run_id,
+            group_cases,
+            config,
+            str(exc) or "stop requested",
+        )
+    except Exception as exc:
+        group_exit_code = 1
+        completed_delta += _record_group_status(
+            manifest,
+            run_dir,
+            run_id,
+            group_cases,
+            config,
+            "failed",
+            str(exc),
+        )
+    finally:
+        for case in group_cases:
+            layout = build_layout(config, run_id, case)
+            try:
+                save_topology_artifacts_best_effort(
+                    config,
+                    remote_runner,
+                    serve_case,
+                    role_commands,
+                    started_roles,
+                    layout,
+                )
+            except StopRequested as exc:
+                artifact_stop = artifact_stop or exc
+        cleanup_stop = cleanup_topology_roles_best_effort(
+            remote_runner,
+            serve_case,
+            started_roles,
+            serve_layout.run_dir,
+        )
+        if config.run.cooldown_sec > 0:
+            time.sleep(config.run.cooldown_sec)
+        if artifact_stop is not None:
+            raise artifact_stop
+        if cleanup_stop is not None:
+            raise cleanup_stop
+    return completed_delta, group_exit_code, interrupted
 
 
 def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
-    network_owned = config.run.create_network
-    write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
+    has_legacy_cases = any(case.serve_profile is not None for case in cases)
+    network_owned = config.run.create_network and has_legacy_cases
+    write_json_atomic(
+        run_dir / "config.resolved.json",
+        dry_run_config_to_dict(config),
+    )
     try:
-        if config.run.create_network:
+        if network_owned:
             print_cmd(build_network_create_command(config, run_id))
         for group_cases in _group_cases_by_serve(cases).values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
-            print_cmd(build_serve_run_command(config, serve_case, serve_layout.run_dir))
+            if serve_case.topology_profile is not None:
+                commands = serve_case.topology_profile.build_commands(
+                    config,
+                    serve_case,
+                    serve_layout.run_dir,
+                )
+                for command in _role_start_order(serve_case, commands):
+                    print_cmd(command.masked_argv)
+            else:
+                print_cmd(
+                    build_serve_run_command(config, serve_case, serve_layout.run_dir)
+                )
             for case in group_cases:
                 layout = build_layout(config, run_id, case)
                 print_cmd(build_bench_run_command(config, case, layout.bench_dir))
@@ -2216,7 +3289,11 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     completed = len(manifest.cases)
     interrupted = False
     try:
-        write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
+        write_json_atomic(run_dir / "config.resolved.json", dry_run_config_to_dict(config))
+        write_private_json_atomic(
+            run_dir / RESUME_CONFIG_FILE,
+            resume_config_to_dict(config),
+        )
         validate_local_paths(config)
 
         if not cases:
@@ -2236,10 +3313,34 @@ def run_controller(config: AutoBenchConfig, run_id: str,
             ))
             network_owned = True
         grouped = _group_cases_by_serve(cases)
+        remote_runner: RemoteDockerRunner | None = None
 
         for group_cases in grouped.values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
+            if serve_case.topology_profile is not None:
+                if remote_runner is None:
+                    remote_runner = RemoteDockerRunner()
+                topology_completed, topology_exit_code, topology_interrupted = (
+                    run_topology_group(
+                        config,
+                        run_id,
+                        active_runner,
+                        remote_runner,
+                        group_cases,
+                        all_cases,
+                        completed,
+                        manifest,
+                        run_dir,
+                    )
+                )
+                completed += topology_completed
+                if topology_exit_code != 0:
+                    exit_code = topology_exit_code
+                if topology_interrupted:
+                    interrupted = True
+                    break
+                continue
             if not dry_run:
                 write_vllm_cache_metadata(config, serve_case, serve_layout)
             serve_cmd = build_serve_run_command(config, serve_case, serve_layout.run_dir)
@@ -2300,102 +3401,13 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                             manifest=manifest,
                         ),
                     )
-                    bench_cmd = build_bench_run_command(config, case, layout.bench_dir)
-                    if dry_run:
-                        print_cmd(bench_cmd)
-                        status = "passed"
-                        error = None
-                    else:
-                        if not remove_existing_bench_container_if_owned(
-                            active_runner,
-                            case,
-                            layout.run_dir,
-                        ):
-                            raise RuntimeError(
-                                "benchmark container exists but is not owned by this run: "
-                                f"{make_bench_container_name(case)}"
-                            )
-                        bench_interrupted: BaseException | None = None
-                        monitor = (
-                            ResourceMonitor(
-                                output_dir=layout.bench_dir,
-                                interval_sec=config.run.resource_monitor.interval_sec,
-                                enabled=True,
-                                backend=config.run.resource_monitor.backend,
-                            )
-                            if config.run.resource_monitor.enabled
-                            else None
-                        )
-                        try:
-                            try:
-                                if monitor is not None:
-                                    try:
-                                        monitor.start()
-                                    except (StopRequested, KeyboardInterrupt):
-                                        raise
-                                    except Exception as exc:
-                                        logger.warning(
-                                            "resource monitor start failed: %s",
-                                            exc,
-                                        )
-                                        monitor = None
-                                with (layout.bench_dir / "bench.log").open(
-                                    "w",
-                                    encoding="utf-8",
-                                ) as log:
-                                    result = active_runner.run(
-                                        bench_cmd,
-                                        check=False,
-                                        capture=False,
-                                        stdout=log,
-                                        stderr=log,
-                                    )
-                            except (StopRequested, KeyboardInterrupt) as exc:
-                                bench_interrupted = exc
-                                raise
-                            finally:
-                                if monitor is not None:
-                                    resource_summary = None
-                                    try:
-                                        resource_summary = monitor.stop()
-                                    except (StopRequested, KeyboardInterrupt):
-                                        if bench_interrupted is None:
-                                            raise
-                                    except Exception as exc:
-                                        logger.warning(
-                                            "resource monitor stop failed: %s",
-                                            exc,
-                                        )
-                                    if resource_summary is not None:
-                                        try:
-                                            append_summary_to_result_files(
-                                                layout.bench_dir,
-                                                resource_summary,
-                                            )
-                                        except (StopRequested, KeyboardInterrupt):
-                                            if bench_interrupted is None:
-                                                raise
-                                        except Exception as exc:
-                                            logger.warning(
-                                                "resource monitor result merge failed: %s",
-                                                exc,
-                                            )
-                        finally:
-                            try:
-                                cleanup_bench_container_if_owned(
-                                    active_runner,
-                                    case,
-                                    layout.run_dir,
-                                )
-                            except (StopRequested, KeyboardInterrupt):
-                                if bench_interrupted is None:
-                                    raise
-                            except Exception:
-                                pass
-                        status = "passed" if result.returncode == 0 else "failed"
-                        error = None if result.returncode == 0 else (
-                            f"benchmark exited {result.returncode}"
-                        )
+                    status, error = _run_bench_case(
+                        config,
+                        active_runner,
+                        case,
+                        layout,
+                        dry_run,
+                    )
                     if status != "passed":
                         exit_code = 1
                     manifest.record(case, layout, status, error=error)
@@ -2679,9 +3691,10 @@ def start_detached(config_path: Path | None, config: AutoBenchConfig, run_id: st
 def _format_current(current: Any) -> str:
     if not isinstance(current, dict):
         return "-"
+    serving_name = current.get("serve_profile") or current.get("topology_profile")
     return "/".join([
         str(current.get("model", "-")),
-        str(current.get("serve_profile", "-")),
+        str(serving_name or "-"),
         str(current.get("bench_profile", "-")),
     ])
 
@@ -2804,11 +3817,13 @@ def current_bench_log_path(run_dir: Path) -> Path | None:
     if not isinstance(current, dict):
         return None
     model = _safe_log_component(current.get("model"))
-    serve_profile = _safe_log_component(current.get("serve_profile"))
+    serving_name = _safe_log_component(
+        current.get("serve_profile") or current.get("topology_profile")
+    )
     bench_profile = _safe_log_component(current.get("bench_profile"))
-    if not all([model, serve_profile, bench_profile]):
+    if not all([model, serving_name, bench_profile]):
         return None
-    log_path = run_dir / model / serve_profile / bench_profile / "bench.log"
+    log_path = run_dir / model / serving_name / bench_profile / "bench.log"
     return log_path if log_path.exists() else None
 
 

@@ -34,6 +34,7 @@ def _fake_config():
     ]
     return SimpleNamespace(
         serve_profiles=serve,
+        topology_profiles=[],
         models=[SimpleNamespace(name="qwen")],
         bench_profiles=[SimpleNamespace(name="smoke")],
     )
@@ -80,6 +81,154 @@ def test_aggregate_missing_engine_fills_na(tmp_path):
     rows = list(csv.DictReader(out.open(encoding="utf-8-sig")))
     assert rows[0]["vllm__throughput_tok_s"] == "100"
     assert rows[0]["sglang__throughput_tok_s"] == "N/A"
+
+
+def test_aggregate_keeps_models_with_same_compare_dimensions(tmp_path):
+    config = _fake_config()
+    config.serve_profiles = [
+        SimpleNamespace(name="vllm_bf16", engine="vllm", gpus="all", args=()),
+    ]
+    config.models = [
+        SimpleNamespace(name="qwen_a"),
+        SimpleNamespace(name="qwen_b"),
+    ]
+    run_dir = tmp_path / "run1"
+    _write_result_csv(
+        run_dir / "qwen_a" / "vllm_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=11,
+        tput=100,
+        hitrate=80.0,
+    )
+    _write_result_csv(
+        run_dir / "qwen_b" / "vllm_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=22,
+        tput=200,
+        hitrate=40.0,
+    )
+
+    out = bc.aggregate_compare(config, run_dir)
+
+    with out.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    assert len(rows) == 2
+    assert reader.fieldnames[:5] == [
+        "model",
+        "bench_profile",
+        "input_len",
+        "output_len",
+        "parallel_num",
+    ]
+    by_model = {row["model"]: row for row in rows}
+    assert by_model["qwen_a"]["vllm__throughput_tok_s"] == "100"
+    assert by_model["qwen_a"]["vllm__ttft_p50_ms"] == "11"
+    assert by_model["qwen_b"]["vllm__throughput_tok_s"] == "200"
+    assert by_model["qwen_b"]["vllm__ttft_p50_ms"] == "22"
+    plot_names = {path.name for path in (run_dir / "plots").glob("*.png")}
+    assert "qwen_a__smoke__64x32__throughput_tok_s.png" in plot_names
+    assert "qwen_b__smoke__64x32__throughput_tok_s.png" in plot_names
+
+
+def test_aggregate_reads_topology_profile_results(tmp_path):
+    config = _fake_config()
+    config.topology_profiles = [
+        SimpleNamespace(name="sglang_pd_2p2d", engine="sglang"),
+    ]
+    run_dir = tmp_path / "run1"
+    _write_result_csv(
+        run_dir / "qwen" / "vllm_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=11,
+        tput=100,
+        hitrate=80.0,
+    )
+    _write_result_csv(
+        run_dir / "qwen" / "sglang_pd_2p2d" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=22,
+        tput=200,
+        hitrate=40.0,
+    )
+
+    out = bc.aggregate_compare(config, run_dir)
+
+    rows = list(csv.DictReader(out.open(encoding="utf-8-sig")))
+    assert rows[0]["vllm__throughput_tok_s"] == "100"
+    assert rows[0]["sglang_pd_2p2d__throughput_tok_s"] == "200"
+
+
+def test_aggregate_duplicate_engine_profiles_use_serving_names(tmp_path):
+    config = _fake_config()
+    config.serve_profiles = [
+        SimpleNamespace(name="sglang_bf16", engine="sglang", gpus="all", args=()),
+    ]
+    config.topology_profiles = [
+        SimpleNamespace(name="sglang_pd_2p2d", engine="sglang"),
+    ]
+    run_dir = tmp_path / "run1"
+    _write_result_csv(
+        run_dir / "qwen" / "sglang_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=11,
+        tput=100,
+        hitrate=80.0,
+    )
+    _write_result_csv(
+        run_dir / "qwen" / "sglang_pd_2p2d" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=22,
+        tput=200,
+        hitrate=40.0,
+    )
+
+    out = bc.aggregate_compare(config, run_dir)
+
+    rows = list(csv.DictReader(out.open(encoding="utf-8-sig")))
+    assert rows[0]["sglang_bf16__throughput_tok_s"] == "100"
+    assert rows[0]["sglang_pd_2p2d__throughput_tok_s"] == "200"
+    assert "sglang__throughput_tok_s" not in rows[0]
+
+
+def test_aggregate_label_collision_falls_back_to_serving_names(tmp_path):
+    config = _fake_config()
+    config.serve_profiles = [
+        SimpleNamespace(name="vllm_bf16", engine="vllm", gpus="all", args=()),
+        SimpleNamespace(name="sglang_bf16", engine="sglang", gpus="all", args=()),
+    ]
+    config.topology_profiles = [
+        SimpleNamespace(name="vllm", engine="sglang"),
+    ]
+    run_dir = tmp_path / "run1"
+    _write_result_csv(
+        run_dir / "qwen" / "vllm_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=11,
+        tput=100,
+        hitrate=80.0,
+    )
+    _write_result_csv(
+        run_dir / "qwen" / "sglang_bf16" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=22,
+        tput=200,
+        hitrate=40.0,
+    )
+    _write_result_csv(
+        run_dir / "qwen" / "vllm" / "smoke" / "result.csv",
+        parallel=1,
+        ttft_p50=33,
+        tput=300,
+        hitrate=20.0,
+    )
+
+    out = bc.aggregate_compare(config, run_dir)
+
+    rows = list(csv.DictReader(out.open(encoding="utf-8-sig")))
+    assert rows[0]["vllm_bf16__throughput_tok_s"] == "100"
+    assert rows[0]["sglang_bf16__throughput_tok_s"] == "200"
+    assert rows[0]["vllm__throughput_tok_s"] == "300"
 
 
 def test_aggregate_no_results_returns_none(tmp_path):

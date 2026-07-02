@@ -120,12 +120,14 @@ class ResourceMonitor:
         enabled=True,
         backend="nvidia-smi",
         readers=None,
+        passthrough_exceptions=(),
     ):
         self.output_dir = Path(output_dir)
         self.interval_sec = float(interval_sec)
         self.enabled = enabled
         self.backend = backend
         self.readers = readers or default_readers()
+        self.passthrough_exceptions = tuple(passthrough_exceptions)
         self.samples = []
         self.gpu_samples = []
         self.error_count = 0
@@ -135,6 +137,7 @@ class ResourceMonitor:
         self._previous_net = None
         self._previous_disk = None
         self._thread = None
+        self._thread_exception = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
 
@@ -144,6 +147,7 @@ class ResourceMonitor:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
+        self._thread_exception = None
         self.sample_once()
         self._thread = threading.Thread(
             target=self._run,
@@ -154,7 +158,17 @@ class ResourceMonitor:
 
     def _run(self):
         while not self._stop.wait(self.interval_sec):
-            self.sample_once()
+            try:
+                self.sample_once()
+            except Exception as exc:
+                if self.passthrough_exceptions and isinstance(
+                    exc,
+                    self.passthrough_exceptions,
+                ):
+                    self._thread_exception = exc
+                    self._stop.set()
+                    return
+                raise
 
     def sample_once(self, now=None):
         if not self.enabled:
@@ -187,13 +201,13 @@ class ResourceMonitor:
                 else None
             )
             self._previous_cpu = current_cpu
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
 
         try:
             sample.update(parse_meminfo(self.readers.meminfo()))
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
 
         try:
             current_net = parse_net_dev(self.readers.net_dev())
@@ -203,8 +217,8 @@ class ResourceMonitor:
                 else {"net_rx_mb_s": None, "net_tx_mb_s": None}
             )
             self._previous_net = current_net
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
 
         try:
             current_disk = parse_diskstats(self.readers.diskstats())
@@ -214,8 +228,8 @@ class ResourceMonitor:
                 else {"disk_read_mb_s": None, "disk_write_mb_s": None}
             )
             self._previous_disk = current_disk
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
 
     def _sample_gpu(self, sample):
         if self.backend != "nvidia-smi":
@@ -224,12 +238,33 @@ class ResourceMonitor:
 
         try:
             gpus = parse_nvidia_smi_csv(self.readers.nvidia_smi())
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
             gpus = []
 
         self.gpu_samples.extend(gpus)
         apply_gpu_aggregate(sample, gpus)
+
+    def _handle_sample_error(self, exc):
+        if self.passthrough_exceptions and isinstance(
+            exc,
+            self.passthrough_exceptions,
+        ):
+            raise exc
+        self.error_count += 1
+
+    def _raise_thread_exception(self):
+        if self._thread_exception is not None:
+            raise self._thread_exception
+
+    def _snapshot_state(self, *, block=True):
+        acquired = self._lock.acquire(blocking=block)
+        if not acquired:
+            return list(self.samples), list(self.gpu_samples), self.error_count
+        try:
+            return list(self.samples), list(self.gpu_samples), self.error_count
+        finally:
+            self._lock.release()
 
     def stop(self):
         if not self.enabled:
@@ -237,16 +272,25 @@ class ResourceMonitor:
 
         was_started = self._thread is not None
         self._stop.set()
+        thread_alive = False
         if self._thread is not None:
-            self._thread.join(timeout=max(self.interval_sec, 1.0) + 1.0)
+            join_timeout = max(self.interval_sec, 1.0) + 1.0
+            self._thread.join(timeout=join_timeout)
+            self._raise_thread_exception()
+            thread_alive = self._thread.is_alive()
+            if thread_alive:
+                self._thread.join(timeout=join_timeout)
+                self._raise_thread_exception()
+                thread_alive = self._thread.is_alive()
 
-        if was_started and self._started_at is not None:
+        if was_started and self._started_at is not None and not thread_alive:
             self.sample_once()
+            self._raise_thread_exception()
 
-        with self._lock:
-            samples = list(self.samples)
-            gpu_samples = list(self.gpu_samples)
-            error_count = self.error_count
+        samples, gpu_samples, error_count = self._snapshot_state(
+            block=not thread_alive,
+        )
+        self._raise_thread_exception()
 
         summary = summarize_samples(
             samples,
@@ -621,6 +665,22 @@ def flatten_summary_for_result(summary):
     return values
 
 
+def prefixed_resource_columns(prefix):
+    return [f"{prefix}_{column}" for column in RESOURCE_RESULT_COLUMNS]
+
+
+def flatten_prefixed_summaries(summaries):
+    values = {}
+    for prefix, summary in summaries.items():
+        flattened = flatten_summary_for_result(summary)
+        for column, prefixed_column in zip(
+            RESOURCE_RESULT_COLUMNS,
+            prefixed_resource_columns(prefix),
+        ):
+            values[prefixed_column] = flattened.get(column, "")
+    return values
+
+
 def append_summary_to_result_files(output_dir, summary):
     output_dir = Path(output_dir)
     values = flatten_summary_for_result(summary)
@@ -634,7 +694,27 @@ def append_summary_to_result_files(output_dir, summary):
         append_summary_to_xlsx(xlsx_path, values)
 
 
+def append_prefixed_summaries_to_result_files(output_dir, summaries):
+    output_dir = Path(output_dir)
+    values = flatten_prefixed_summaries(summaries)
+    if not values:
+        return
+
+    columns = list(values)
+    csv_path = output_dir / "result.csv"
+    if csv_path.exists():
+        append_values_to_csv(csv_path, values, columns)
+
+    xlsx_path = output_dir / "result.xlsx"
+    if xlsx_path.exists():
+        append_values_to_xlsx(xlsx_path, values, columns)
+
+
 def append_summary_to_csv(path, values):
+    append_values_to_csv(path, values, RESOURCE_RESULT_COLUMNS)
+
+
+def append_values_to_csv(path, values, columns):
     path = Path(path)
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -642,12 +722,12 @@ def append_summary_to_csv(path, values):
         rows = list(reader)
 
     merged_fieldnames = fieldnames + [
-        column for column in RESOURCE_RESULT_COLUMNS
+        column for column in columns
         if column not in fieldnames
     ]
     for row in rows:
-        for column in RESOURCE_RESULT_COLUMNS:
-            row[column] = values.get(column, "")
+        for column in columns:
+            row[column] = _result_value(values.get(column, ""))
 
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=merged_fieldnames)
@@ -656,6 +736,15 @@ def append_summary_to_csv(path, values):
 
 
 def append_summary_to_xlsx(path, values):
+    append_values_to_xlsx(
+        path,
+        values,
+        RESOURCE_RESULT_COLUMNS,
+        column_labels=RESOURCE_RESULT_COLUMN_LABELS,
+    )
+
+
+def append_values_to_xlsx(path, values, columns, column_labels=None):
     try:
         import openpyxl
     except ImportError:
@@ -671,7 +760,7 @@ def append_summary_to_xlsx(path, values):
     }
 
     next_column = worksheet.max_column + 1
-    for column_name in RESOURCE_RESULT_COLUMNS:
+    for column_name in columns:
         column = column_by_name.get(column_name)
         if column is None:
             column = next_column
@@ -679,19 +768,24 @@ def append_summary_to_xlsx(path, values):
             column_by_name[column_name] = column
             worksheet.cell(row=1, column=column, value=column_name)
         if worksheet.max_row >= 2:
+            label = (
+                column_labels.get(column_name, column_name)
+                if column_labels is not None
+                else column_name
+            )
             worksheet.cell(
                 row=2,
                 column=column,
-                value=RESOURCE_RESULT_COLUMN_LABELS[column_name],
+                value=label,
             )
 
     data_start_row = 3 if worksheet.max_row >= 2 else 2
     for row in range(data_start_row, worksheet.max_row + 1):
-        for column_name in RESOURCE_RESULT_COLUMNS:
+        for column_name in columns:
             worksheet.cell(
                 row=row,
                 column=column_by_name[column_name],
-                value=values.get(column_name, ""),
+                value=_result_value(values.get(column_name, "")),
             )
 
     workbook.save(path)

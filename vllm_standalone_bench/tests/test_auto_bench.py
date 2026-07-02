@@ -1,7 +1,9 @@
+import csv
 import hashlib
 import json
 import math
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -30,6 +32,15 @@ def value_after(cmd, flag):
 
 def values_after(cmd, flag):
     return [cmd[index + 1] for index, value in enumerate(cmd) if value == flag]
+
+
+def labels_from(cmd):
+    labels = {}
+    for value in values_after(cmd, "--label"):
+        key, separator, label_value = value.partition("=")
+        if separator:
+            labels[key] = label_value
+    return labels
 
 
 def minimal_config(tmp_path):
@@ -111,6 +122,259 @@ def test_load_config_applies_defaults_and_expands_cases(tmp_path):
     assert len(cases) == 1
     assert cases[0].api_model_name == "qwen2_5_1_5b"
     assert cases[0].container_name.startswith("bench-vllm-qwen2_5_1_5b-bf16_default-")
+
+
+def test_expand_cases_uses_topology_profiles(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
+    cases = ab.expand_cases(config, run_id="run123")
+
+    assert len(cases) == 1
+    case = cases[0]
+    assert case.serve_profile is None
+    assert case.topology_profile.name == "sglang_pd_2p2d"
+    assert case.serving_name == "sglang_pd_2p2d"
+
+
+def test_start_detached_accepts_topology_profiles_before_lock(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config
+
+    config_path = write_config(tmp_path, pd_topology_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_dir = tmp_path / "results" / "run123"
+    calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    assert exit_code == 0
+    assert calls
+    assert (run_dir / "state.json").exists()
+    assert (run_dir / ".run.lock").exists()
+
+
+def test_legacy_command_helpers_reject_topology_case(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    with pytest.raises(ab.ConfigError, match="legacy"):
+        ab.build_serve_run_command(config, case, tmp_path / "run")
+
+
+def test_topology_layout_uses_topology_profile(tmp_path):
+    from test_remote_topology import (
+        pd_topology_config,
+        write_config as write_topology_config,
+    )
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    layout = ab.build_layout(config, "run123", case)
+
+    model = "qwen2_5_1_5b"
+    assert layout.serve_dir == tmp_path / "results" / "run123" / model / "sglang_pd_2p2d"
+    assert layout.bench_dir == layout.serve_dir / "smoke"
+
+
+def test_topology_bench_command_targets_frontend_endpoint(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+
+    labels = labels_from(cmd)
+    assert value_after(cmd, "--base-url") == "http://10.0.0.31:8000/v1"
+    assert labels["vllm_auto_bench.topology_profile"] == "sglang_pd_2p2d"
+    assert "vllm_auto_bench.serve_profile" not in labels
+
+
+def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, capsys):
+    from test_remote_topology import pd_topology_config
+
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "secret-p1-password",
+    }
+    topology["hosts"]["p2"]["auth"]["key_path"] = "/home/bench/.ssh/id_ed25519"
+    topology["frontend"]["args"] = [
+        "--api-key",
+        "router-secret",
+        "--openai-api-key",
+        "router-openai-secret",
+    ]
+    topology["env"] = {
+        "OPENAI_API_KEY": "profile-openai-secret",
+        "DB_PASSWORD": "profile-db-password",
+        "VISIBLE_ENV": "profile-visible",
+    }
+    topology["prefill"][0]["env"] = {
+        "SERVICE_TOKEN": "node-service-token",
+        "VISIBLE_NODE_ENV": "node-visible",
+    }
+    topology["prefill"][0]["args"] = [
+        "--db-password",
+        "node-db-secret",
+        "--tokenizer-path",
+        "/models/Qwen2.5-1.5B-Instruct",
+    ]
+    config = ab.load_config(write_config(tmp_path, data))
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+    out = capsys.readouterr().out
+    resolved = json.loads(
+        (tmp_path / "results" / "run123" / "config.resolved.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    rendered_resolved = json.dumps(resolved)
+    assert result == 0
+    assert "sglang.launch_server" in out
+    assert "sglang_router.launch_router" in out
+    assert "run_bench_multi.py" in out
+    assert "--pd-disaggregation" in out
+    assert "docker network create" not in out
+    assert "docker network rm" not in out
+    assert "secret-p1-password" not in out
+    assert "router-secret" not in out
+    assert "router-openai-secret" not in out
+    assert "node-db-secret" not in out
+    assert "local-bench-key" not in out
+    assert "secret-p1-password" not in rendered_resolved
+    assert "router-secret" not in rendered_resolved
+    assert "router-openai-secret" not in rendered_resolved
+    assert "node-db-secret" not in rendered_resolved
+    assert "local-bench-key" not in rendered_resolved
+    assert "profile-openai-secret" not in rendered_resolved
+    assert "profile-db-password" not in rendered_resolved
+    assert "node-service-token" not in rendered_resolved
+    assert resolved["models"][0]["tokenizer_path"] == (
+        "/models/Qwen2.5-1.5B-Instruct"
+    )
+    assert resolved["models"][0]["host_tokenizer_path"] != "***"
+    assert resolved["run"]["api_key"] == "***"
+    assert resolved["topology_profiles"][0]["frontend"]["args"] == [
+        "--api-key",
+        "***",
+        "--openai-api-key",
+        "***",
+    ]
+    assert resolved["topology_profiles"][0]["env"]["OPENAI_API_KEY"] == "***"
+    assert resolved["topology_profiles"][0]["env"]["DB_PASSWORD"] == "***"
+    assert resolved["topology_profiles"][0]["env"]["VISIBLE_ENV"] == "profile-visible"
+    assert (
+        resolved["topology_profiles"][0]["hosts"]["p2"]["auth"]["key_path"]
+        == "/home/bench/.ssh/id_ed25519"
+    )
+    assert resolved["topology_profiles"][0]["prefill"][0]["env"] == {
+        "SERVICE_TOKEN": "***",
+        "VISIBLE_NODE_ENV": "node-visible",
+    }
+    assert resolved["topology_profiles"][0]["prefill"][0]["args"] == [
+        "--db-password",
+        "***",
+        "--tokenizer-path",
+        "/models/Qwen2.5-1.5B-Instruct",
+    ]
+    assert (
+        resolved["topology_profiles"][0]["hosts"]["p1"]["auth"].get("password")
+        == "***"
+    )
+
+
+def secret_topology_config(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    data = pd_topology_config(tmp_path)
+    data["run"]["api_key"] = "run-secret"
+    data["run"]["resource_monitor"] = {"enabled": False}
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "ssh-secret",
+    }
+    topology["env"] = {
+        "OPENAI_API_KEY": "env-secret",
+        "VISIBLE_ENV": "visible",
+    }
+    topology["frontend"]["args"] = ["--api-key", "router-secret"]
+    topology["prefill"][0]["env"] = {"SERVICE_TOKEN": "node-token-secret"}
+    topology["prefill"][0]["args"] = ["--db-password", "node-password-secret"]
+    return data
+
+
+def test_real_run_writes_redacted_resolved_config_and_private_resume_config(
+    tmp_path,
+    monkeypatch,
+):
+    data = secret_topology_config(tmp_path)
+    config = ab.load_config(write_config(tmp_path, data))
+    remote = FakeRemoteDockerRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    run_dir = tmp_path / "results" / "run123"
+    public_path = run_dir / "config.resolved.json"
+    resume_path = run_dir / ab.RESUME_CONFIG_FILE
+    public_text = public_path.read_text(encoding="utf-8")
+    for secret_value in (
+        "run-secret",
+        "ssh-secret",
+        "env-secret",
+        "router-secret",
+        "node-token-secret",
+        "node-password-secret",
+    ):
+        assert secret_value not in public_text
+    public_config = json.loads(public_text)
+    topology = public_config["topology_profiles"][0]
+    assert public_config["run"]["api_key"] == "***"
+    assert topology["hosts"]["p1"]["auth"]["password"] == "***"
+    assert topology["env"]["OPENAI_API_KEY"] == "***"
+    assert topology["env"]["VISIBLE_ENV"] == "visible"
+    assert topology["frontend"]["args"] == ["--api-key", "***"]
+    assert topology["prefill"][0]["env"]["SERVICE_TOKEN"] == "***"
+    assert topology["prefill"][0]["args"] == ["--db-password", "***"]
+
+    assert resume_path.exists()
+    assert stat.S_IMODE(resume_path.stat().st_mode) == 0o600
+    resume_text = resume_path.read_text(encoding="utf-8")
+    for secret_value in (
+        "run-secret",
+        "ssh-secret",
+        "env-secret",
+        "router-secret",
+        "node-token-secret",
+        "node-password-secret",
+    ):
+        assert secret_value in resume_text
+    context = ab.load_resume_context(tmp_path / "results", "run123")
+    assert context.config.run.api_key == "run-secret"
+    assert (
+        context.config.topology_profiles[0].hosts["p1"].auth.password
+        == "ssh-secret"
+    )
 
 
 def test_resource_monitor_defaults_enabled(tmp_path):
@@ -285,6 +549,87 @@ def test_build_vllm_command_uses_bridge_network_without_host_port(tmp_path):
     assert value_after(cmd, "--port") == "8000"
     assert value_after(cmd, "--api-key") == "local-bench-key"
     assert value_after(cmd, "--dtype") == "bfloat16"
+
+
+def test_save_vllm_artifacts_masks_api_key_in_serve_command(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["api_key"] = "legacy-secret"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+
+    ab.save_vllm_artifacts(config, FakeRunner(), case, layout)
+
+    serve_command = (layout.serve_dir / "serve_command.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "legacy-secret" not in serve_command
+    assert "***" in serve_command
+
+
+def test_save_vllm_artifacts_redacts_secrets_in_docker_inspect(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["api_key"] = "legacy-api-secret"
+    data["serve_profiles"][0]["args"] = [
+        "--dtype",
+        "bfloat16",
+        "--db-password",
+        "db-secret",
+        "--service-token=token-secret",
+    ]
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+
+    class InspectSecretRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True,
+                stdout=None, stderr=None):
+            if args[:2] == ["docker", "inspect"]:
+                payload = [{
+                    "Config": {
+                        "Cmd": [
+                            "vllm",
+                            "serve",
+                            "--api-key",
+                            "legacy-api-secret",
+                            "--db-password",
+                            "db-secret",
+                            "--service-token=token-secret",
+                            "--visible-flag",
+                            "ordinary-value",
+                        ],
+                        "Args": ["--service-token=token-secret"],
+                    },
+                    "Plain": "ordinary-value",
+                    "Raw": "legacy-api-secret db-secret token-secret",
+                }]
+                return ab.Completed(list(args), 0, json.dumps(payload), "")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    ab.save_vllm_artifacts(config, InspectSecretRunner(), case, layout)
+
+    inspect_text = (layout.serve_dir / "docker.inspect.json").read_text(
+        encoding="utf-8"
+    )
+    serve_command = (layout.serve_dir / "serve_command.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "legacy-api-secret" not in inspect_text
+    assert "db-secret" not in inspect_text
+    assert "token-secret" not in inspect_text
+    assert "***" in inspect_text
+    assert "ordinary-value" in inspect_text
+    assert "legacy-api-secret" not in serve_command
+    assert "db-secret" not in serve_command
+    assert "token-secret" not in serve_command
+    assert "***" in serve_command
 
 
 def test_build_vllm_command_includes_ownership_labels(tmp_path):
@@ -576,6 +921,25 @@ def test_manifest_records_relative_artifact_paths(tmp_path):
     assert data["run_id"] == "run123"
     assert data["status"] == "completed"
     assert data["cases"][0]["csv"] == "qwen2_5_1_5b/bf16_default/smoke/result.csv"
+    assert data["cases"][0]["serve_profile"] == "bf16_default"
+    assert data["cases"][0]["topology_profile"] is None
+
+
+def test_topology_manifest_records_null_serve_profile(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config, write_config as write_topology_config
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: FakeRemoteDockerRunner())
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *args, **kwargs: True)
+
+    ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8")
+    )
+    row = manifest["cases"][0]
+    assert row["serve_profile"] is None
+    assert row["topology_profile"] == "sglang_pd_2p2d"
 
 
 def test_manifest_interrupted_wins_over_incomplete_cases(tmp_path):
@@ -663,10 +1027,69 @@ def test_plan_resume_cases_keeps_passed_and_selects_pending(tmp_path):
 
     assert unknown == []
     assert [row["bench_profile"] for row in initial_manifest.cases] == ["smoke"]
+    assert initial_manifest.cases[0]["topology_profile"] is None
     assert initial_manifest.cases[0]["status"] == "passed"
     assert initial_manifest.cases[0]["extra"] == {"source": "old"}
     assert [case.bench_profile.name for case in pending] == ["smoke2"]
     assert initial_manifest.total == 2
+
+
+def test_plan_resume_cases_supports_topology_key(tmp_path):
+    from test_remote_topology import pd_topology_config, write_config as write_topology_config
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "cases": [{
+            "model": "qwen2_5_1_5b",
+            "serve_profile": None,
+            "topology_profile": "sglang_pd_2p2d",
+            "bench_profile": "smoke",
+            "status": "passed",
+        }],
+    }
+
+    initial, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert len(initial.cases) == 1
+    assert pending == ()
+    assert unknown == []
+
+
+def test_plan_resume_cases_migrates_legacy_topology_row(tmp_path):
+    from test_remote_topology import pd_topology_config, write_config as write_topology_config
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "cases": [{
+            "model": "qwen2_5_1_5b",
+            "serve_profile": "sglang_pd_2p2d",
+            "bench_profile": "smoke",
+            "status": "passed",
+            "extra": {"source": "legacy-topology"},
+        }],
+    }
+
+    initial, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert pending == ()
+    assert unknown == []
+    assert len(initial.cases) == 1
+    row = initial.cases[0]
+    assert row["serve_profile"] is None
+    assert row["topology_profile"] == "sglang_pd_2p2d"
+    assert row["extra"] == {"source": "legacy-topology"}
 
 
 def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
@@ -723,7 +1146,20 @@ def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
                 "status": "passed",
             }],
         },
-        "manifest case row is missing model/serve_profile/bench_profile",
+        "manifest case row must include model, bench_profile, and exactly one of serve_profile/topology_profile",
+    ),
+    (
+        {
+            "run_id": "run123",
+            "cases": [{
+                "model": "qwen2_5_1_5b",
+                "serve_profile": "bf16_default",
+                "topology_profile": "sglang_pd_2p2d",
+                "bench_profile": "smoke",
+                "status": "passed",
+            }],
+        },
+        "manifest case row must include model, bench_profile, and exactly one of serve_profile/topology_profile",
     ),
     ({"run_id": "other", "cases": []}, "manifest run_id mismatch"),
 ])
@@ -765,7 +1201,37 @@ def test_plan_resume_cases_reports_manifest_rows_not_in_config(tmp_path):
 
     assert initial_manifest.cases == []
     assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2"]
-    assert unknown == [("old_model", "old_serve", "old_bench")]
+    assert unknown == [("old_model", "old_serve", None, "old_bench")]
+
+
+def test_plan_resume_cases_reports_unknown_topology_rows(tmp_path):
+    from test_remote_topology import pd_topology_config, write_config as write_topology_config
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "status": "interrupted",
+        "cases": [
+            {
+                "model": "qwen2_5_1_5b",
+                "serve_profile": None,
+                "topology_profile": "old_topology",
+                "bench_profile": "smoke",
+                "status": "passed",
+            }
+        ],
+    }
+
+    initial_manifest, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert initial_manifest.cases == []
+    assert pending == cases
+    assert unknown == [("qwen2_5_1_5b", None, "old_topology", "smoke")]
 
 
 def write_resume_state(run_dir, status="interrupted"):
@@ -786,7 +1252,10 @@ def write_resume_manifest(run_dir, cases, config, statuses):
         layout = ab.build_layout(config, run_dir.name, case)
         rows.append({
             "model": case.model.name,
-            "serve_profile": case.serve_profile.name,
+            "serve_profile": case.serve_profile.name if case.serve_profile else None,
+            "topology_profile": (
+                case.topology_profile.name if case.topology_profile else None
+            ),
             "bench_profile": case.bench_profile.name,
             "status": status,
             "csv": str((layout.bench_dir / "result.csv").relative_to(layout.run_dir)),
@@ -797,6 +1266,30 @@ def write_resume_manifest(run_dir, cases, config, statuses):
         "status": "interrupted",
         "cases": rows,
     })
+
+
+def test_load_resume_context_rejects_redacted_inline_password_without_private_config(
+    tmp_path,
+):
+    from test_remote_topology import pd_topology_config
+
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "***",
+    }
+    config = ab.load_config(write_config(tmp_path, data))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_json_atomic(run_dir / "config.resolved.json", ab.config_to_dict(config))
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, [], config, [])
+
+    with pytest.raises(
+        ab.ConfigError,
+        match="private resume config|inline password.*redacted|password_env|rerun",
+    ):
+        ab.load_resume_context(tmp_path / "results", "run123")
 
 
 def test_load_resume_context_uses_cli_results_dir_over_resolved_config(tmp_path):
@@ -907,7 +1400,7 @@ def test_load_resume_context_returns_unknown_manifest_cases(tmp_path):
 
     context = ab.load_resume_context(tmp_path / "results", "run123")
 
-    assert context.unknown_manifest_cases == (("old_model", "old_serve", "old_bench"),)
+    assert context.unknown_manifest_cases == (("old_model", "old_serve", None, "old_bench"),)
 
 
 def test_controller_command_matches_resume_child(tmp_path):
@@ -1152,20 +1645,223 @@ class FakeRunner:
             return ab.Completed(list(args), 0, "", "")
         if args[:3] == ["docker", "inspect", "--type=image"]:
             return ab.Completed(list(args), 0, "image\n", "")
+        if args[:3] == ["docker", "run", "--rm"] and any(
+            "run_bench_multi.py" in str(arg) for arg in args
+        ):
+            for mount in values_after(args, "-v"):
+                host_dir, separator, container_dir = mount.partition(":")
+                if separator and container_dir == "/results":
+                    result_csv = Path(host_dir) / "result.csv"
+                    result_csv.parent.mkdir(parents=True, exist_ok=True)
+                    result_csv.write_text(
+                        "model,throughput_tok_s\nm,12.5\n",
+                        encoding="utf-8-sig",
+                    )
+                    break
+            return ab.Completed(list(args), 0, "ok\n", "")
         return ab.Completed(list(args), 0, "ok\n", "")
+
+
+class FakeRemoteDockerRunner:
+    def __init__(self, failures=None):
+        self.commands = []
+        self.failures = failures or {}
+        self.labels = {}
+
+    def run(self, host, command, *, check=False, capture=True, text=True,
+            stdout=None, stderr=None):
+        self.commands.append((host.name, list(command)))
+        key = (host.name, " ".join(command[:3]))
+        if key in self.failures:
+            return ab.Completed(list(command), self.failures[key], "", "forced failure")
+        if command[:3] == ["docker", "run", "-d"]:
+            self.labels[value_after(command, "--name")] = {
+                label.split("=", 1)[0]: label.split("=", 1)[1]
+                for label in values_after(command, "--label")
+                if "=" in label
+            }
+            return ab.Completed(list(command), 0, "container-id\n", "")
+        if command[:4] == ["docker", "inspect", "--format", "{{json .Config.Labels}}"]:
+            labels = self.labels.get(command[4])
+            if labels is None:
+                return ab.Completed(list(command), 1, "", "not found")
+            return ab.Completed(list(command), 0, json.dumps(labels) + "\n", "")
+        if command[:2] == ["docker", "logs"]:
+            return ab.Completed(list(command), 0, f"{host.name} log\n", "")
+        if command[:2] == ["docker", "inspect"]:
+            return ab.Completed(list(command), 0, "[]\n", "")
+        if command[:2] == ["docker", "stop"]:
+            return ab.Completed(list(command), 0, "", "")
+        if command[:3] == ["docker", "rm", "-f"]:
+            return ab.Completed(list(command), 0, "", "")
+        return ab.Completed(list(command), 0, "ok\n", "")
+
+    def inspect_labels(self, host, container_name):
+        result = self.run(
+            host,
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .Config.Labels}}",
+                container_name,
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout.strip() or "{}")
+
+
+class InspectSecretRemoteRunner(FakeRemoteDockerRunner):
+    def run(self, host, command, *, check=False, capture=True, text=True,
+            stdout=None, stderr=None):
+        if command[:2] == ["docker", "inspect"] and command[:3] != [
+            "docker",
+            "inspect",
+            "--format",
+        ]:
+            self.commands.append((host.name, list(command)))
+            payload = [{
+                "Config": {
+                    "Env": [
+                        "OPENAI_API_KEY=remote-env-secret",
+                        "DB_PASSWORD=remote-db-secret",
+                        "VISIBLE=value",
+                    ],
+                    "Cmd": [
+                        "python",
+                        "-m",
+                        "server",
+                        "--api-key",
+                        "router-secret",
+                    ],
+                    "Args": [
+                        "--password",
+                        "arg-password",
+                    ],
+                },
+                "Args": ["--token", "arg-token"],
+                "Raw": "remote-env-secret router-secret arg-password arg-token",
+            }]
+            return ab.Completed(list(command), 0, json.dumps(payload), "")
+        return super().run(
+            host,
+            command,
+            check=check,
+            capture=capture,
+            text=text,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+class LogSecretRemoteRunner(FakeRemoteDockerRunner):
+    def run(self, host, command, *, check=False, capture=True, text=True,
+            stdout=None, stderr=None):
+        if command[:2] == ["docker", "logs"]:
+            self.commands.append((host.name, list(command)))
+            return ab.Completed(
+                list(command),
+                0,
+                f"{host.name} run-secret router-secret env-secret\n",
+                "ssh-secret node-token-secret node-password-secret\n",
+            )
+        return super().run(
+            host,
+            command,
+            check=check,
+            capture=capture,
+            text=text,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+class ArtifactFailingRemoteRunner(FakeRemoteDockerRunner):
+    def run(self, host, command, *, check=False, capture=True, text=True,
+            stdout=None, stderr=None):
+        if command[:2] == ["docker", "logs"]:
+            self.commands.append((host.name, list(command)))
+            raise RuntimeError("logs unavailable")
+        return super().run(
+            host,
+            command,
+            check=check,
+            capture=capture,
+            text=text,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+class ForeignLabelRemoteRunner(FakeRemoteDockerRunner):
+    def inspect_labels(self, host, container_name):
+        self.commands.append((
+            host.name,
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .Config.Labels}}",
+                container_name,
+            ],
+        ))
+        if container_name not in self.labels:
+            return None
+        return {
+            "vllm_auto_bench.managed": "true",
+            "vllm_auto_bench.run_id": "foreign-run",
+        }
+
+
+class ForeignSameNameRemoteRunner(FakeRemoteDockerRunner):
+    def __init__(self, container_name):
+        super().__init__()
+        self.container_name = container_name
+
+    def inspect_labels(self, host, container_name):
+        self.commands.append((
+            host.name,
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .Config.Labels}}",
+                container_name,
+            ],
+        ))
+        if container_name != self.container_name:
+            return None
+        return {
+            "vllm_auto_bench.managed": "true",
+            "vllm_auto_bench.run_id": "foreign-run",
+            "vllm_auto_bench.role_name": "p1",
+        }
 
 
 class FakeResourceMonitor:
     instances = []
 
-    def __init__(self, *, output_dir, interval_sec, enabled, backend):
+    def __init__(
+        self,
+        *,
+        output_dir,
+        interval_sec,
+        enabled,
+        backend,
+        readers=None,
+        passthrough_exceptions=(),
+    ):
         self.output_dir = Path(output_dir)
         self.interval_sec = interval_sec
         self.enabled = enabled
         self.backend = backend
+        self.readers = readers
+        self.passthrough_exceptions = tuple(passthrough_exceptions)
         self.started = False
         self.stopped = False
-        FakeResourceMonitor.instances.append(self)
+        type(self).instances.append(self)
 
     def start(self):
         self.started = True
@@ -1175,8 +1871,12 @@ class FakeResourceMonitor:
         summary = {
             "available": True,
             "sample_count": 1,
-            "aggregate": {"cpu_util_avg_pct": 12.5},
+            "aggregate": {
+                "cpu_util_avg_pct": 12.5,
+                "gpu_mem_used_max_mb": 1234.0,
+            },
         }
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "resource_summary.json").write_text(
             json.dumps(summary),
             encoding="utf-8",
@@ -1193,6 +1893,70 @@ class StopFailingResourceMonitor(FakeResourceMonitor):
     def stop(self):
         self.stopped = True
         raise RuntimeError("stop failed")
+
+
+class StopRequestedResourceMonitor(FakeResourceMonitor):
+    def stop(self):
+        self.stopped = True
+        raise ab.StopRequested("monitor background interrupted")
+
+
+class MiddleStopRequestedResourceMonitor(FakeResourceMonitor):
+    instances = []
+
+    def stop(self):
+        self.stopped = True
+        if self.output_dir.name == "p2":
+            raise ab.StopRequested("p2 monitor background interrupted")
+        return super().stop()
+
+
+class SecondStartInterruptingResourceMonitor(FakeResourceMonitor):
+    instances = []
+
+    def start(self):
+        self.started = True
+        if len(type(self).instances) == 2:
+            raise ab.StopRequested("monitor interrupted")
+
+
+class SecondStartFailsCleanupStopRequestedResourceMonitor(FakeResourceMonitor):
+    instances = []
+
+    def start(self):
+        self.started = True
+        if self.output_dir.name == "p2":
+            raise RuntimeError("start failed")
+
+    def stop(self):
+        self.stopped = True
+        if self.output_dir.name == "p2":
+            raise ab.StopRequested("cleanup stop requested")
+        return super().stop()
+
+
+class ReaderStopRequestedRemoteRunner(FakeRemoteDockerRunner):
+    def __init__(self, interrupt_host):
+        super().__init__()
+        self.interrupt_host = interrupt_host
+        self.capture_calls = []
+
+    def capture(self, host, command):
+        self.capture_calls.append((host.name, list(command)))
+        if host.name == self.interrupt_host:
+            raise ab.StopRequested("reader interrupted")
+        if command == ["cat", "/proc/stat"]:
+            return "cpu  100 0 50 850 0 0 0 0 0 0\n"
+        if command == ["cat", "/proc/meminfo"]:
+            return "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n"
+        if command in (
+            ["cat", "/proc/net/dev"],
+            ["cat", "/proc/diskstats"],
+        ):
+            return ""
+        if command[:1] == ["nvidia-smi"]:
+            return ""
+        raise AssertionError(f"unexpected capture command: {command!r}")
 
 
 def command_index(commands, prefix):
@@ -1232,6 +1996,567 @@ def network_create_command(commands):
         if command[:3] == ["docker", "network", "create"]:
             return command
     raise AssertionError("docker network create command not found")
+
+
+def topology_config_with_image(tmp_path):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["image"] = "sglang:pd"
+    return ab.load_config(write_config(tmp_path, data))
+
+
+def topology_role_command(config, role_name, run_id="run123"):
+    case = ab.expand_cases(config, run_id=run_id)[0]
+    layout = ab.build_layout(config, run_id, case)
+    return case.topology_profile.build_commands(config, case, layout.run_dir)[role_name]
+
+
+def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["image"] = "sglang:pd"
+    data["topology_profiles"][0]["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "inline-secret",
+    }
+    config = ab.load_config(write_config(tmp_path, data))
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    ready_roles = []
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+    monkeypatch.setattr(
+        ab,
+        "wait_for_remote_ready",
+        lambda _config, _case, role_name: ready_roles.append(role_name) or True,
+        raising=False,
+    )
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 0
+    names = [
+        cmd[1][cmd[1].index("--name") + 1]
+        for cmd in remote.commands
+        if cmd[1][:3] == ["docker", "run", "-d"]
+    ]
+    assert names[:5] == [
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-p1",
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-p2",
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-d1",
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-d2",
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-router",
+    ]
+    assert ready_roles == ["p1", "p2", "d1", "d2", "router"]
+    assert len(bench_run_commands(local.commands)) == 1
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    role_commands = case.topology_profile.build_commands(config, case, layout.run_dir)
+    monitors_by_role = {
+        monitor.output_dir.name: monitor
+        for monitor in FakeResourceMonitor.instances
+    }
+    assert set(monitors_by_role) == {"p1", "p2", "d1", "d2", "router"}
+    for role_name, monitor in monitors_by_role.items():
+        assert monitor.output_dir == layout.bench_dir / "resources" / role_name
+        assert monitor.started is True
+        assert monitor.stopped is True
+        assert monitor.readers.runner is remote
+        assert monitor.readers.host.name == role_commands[role_name].host_name
+    with (layout.bench_dir / "result.csv").open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["p1_resource_monitor_available"] == "true"
+    assert rows[0]["p1_cpu_util_avg_pct"] == "12.5"
+    assert rows[0]["router_gpu_mem_used_max_mb"] == "1234.0"
+    assert any(
+        cmd[1][:2] == ["docker", "stop"] and "router" in cmd[1][2]
+        for cmd in remote.commands
+    )
+    assert (layout.bench_dir / "commands" / "p1.txt").read_text(
+        encoding="utf-8"
+    ).startswith("docker run -d")
+    assert (layout.bench_dir / "logs" / "router.log").read_text(
+        encoding="utf-8"
+    ) == "router log\n"
+    assert (layout.bench_dir / "inspect" / "router.json").read_text(
+        encoding="utf-8"
+    ) == "[]\n"
+    topology_text = (layout.bench_dir / "topology.resolved.json").read_text(
+        encoding="utf-8"
+    )
+    assert "inline-secret" not in topology_text
+    resolved = json.loads(topology_text)
+    assert resolved["topology_profiles"][0]["hosts"]["p1"]["auth"]["password"] == "***"
+
+
+def test_topology_remote_resource_monitor_start_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    StartFailingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", StartFailingResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 0
+    assert len(bench_run_commands(local.commands)) == 1
+    assert len(StartFailingResourceMonitor.instances) == 5
+    assert all(monitor.stopped for monitor in StartFailingResourceMonitor.instances)
+
+
+def test_topology_resource_monitor_start_interrupt_stops_started_monitors(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    role_commands = case.topology_profile.build_commands(config, case, layout.run_dir)
+    started_roles = [role_commands["p1"], role_commands["p2"]]
+    SecondStartInterruptingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "ResourceMonitor", SecondStartInterruptingResourceMonitor)
+
+    with pytest.raises(ab.StopRequested, match="monitor interrupted"):
+        ab._start_topology_resource_monitors(
+            config,
+            remote,
+            case,
+            layout,
+            started_roles,
+        )
+
+    assert len(SecondStartInterruptingResourceMonitor.instances) == 2
+    assert [monitor.started for monitor in SecondStartInterruptingResourceMonitor.instances] == [
+        True,
+        True,
+    ]
+    assert [monitor.stopped for monitor in SecondStartInterruptingResourceMonitor.instances] == [
+        True,
+        True,
+    ]
+
+
+def test_topology_resource_monitor_start_failure_cleanup_stop_requested_stops_started(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    role_commands = case.topology_profile.build_commands(config, case, layout.run_dir)
+    started_roles = [role_commands["p1"], role_commands["p2"]]
+    SecondStartFailsCleanupStopRequestedResourceMonitor.instances = []
+    monkeypatch.setattr(
+        ab,
+        "ResourceMonitor",
+        SecondStartFailsCleanupStopRequestedResourceMonitor,
+    )
+
+    with pytest.raises(ab.StopRequested, match="cleanup stop requested"):
+        ab._start_topology_resource_monitors(
+            config,
+            remote,
+            case,
+            layout,
+            started_roles,
+        )
+
+    monitors_by_role = {
+        monitor.output_dir.name: monitor
+        for monitor in SecondStartFailsCleanupStopRequestedResourceMonitor.instances
+    }
+    assert set(monitors_by_role) == {"p1", "p2"}
+    assert monitors_by_role["p1"].stopped is True
+    assert monitors_by_role["p2"].stopped is True
+
+
+def test_topology_remote_reader_stop_requested_interrupts_start_and_stops_started_monitor(
+    tmp_path,
+):
+    config = topology_config_with_image(tmp_path)
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    role_commands = case.topology_profile.build_commands(config, case, layout.run_dir)
+    started_roles = [role_commands["p1"], role_commands["p2"]]
+    remote = ReaderStopRequestedRemoteRunner(
+        interrupt_host=role_commands["p2"].host_name,
+    )
+
+    with pytest.raises(ab.StopRequested, match="reader interrupted"):
+        ab._start_topology_resource_monitors(
+            config,
+            remote,
+            case,
+            layout,
+            started_roles,
+        )
+
+    assert (
+        role_commands["p2"].host_name,
+        ["cat", "/proc/stat"],
+    ) in remote.capture_calls
+    assert (layout.bench_dir / "resources" / "p1" / "resource_summary.json").is_file()
+
+
+def test_topology_remote_resource_monitor_stop_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    StopFailingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", StopFailingResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 0
+    assert len(bench_run_commands(local.commands)) == 1
+    assert len(StopFailingResourceMonitor.instances) == 5
+    assert all(monitor.stopped for monitor in StopFailingResourceMonitor.instances)
+
+
+def test_topology_remote_resource_monitor_stop_requested_interrupts_run(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    StopRequestedResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", StopRequestedResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 130
+    assert len(bench_run_commands(local.commands)) == 1
+    assert any(
+        cmd[1][:2] == ["docker", "stop"] and "router" in cmd[1][2]
+        for cmd in remote.commands
+    )
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert manifest["status"] == "interrupted"
+    assert manifest["cases"][0]["status"] == "interrupted"
+    assert "monitor background interrupted" in manifest["cases"][0]["error"]
+
+
+def test_topology_remote_resource_monitor_stop_requested_stops_remaining_monitors(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    MiddleStopRequestedResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", MiddleStopRequestedResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 130
+    assert len(MiddleStopRequestedResourceMonitor.instances) == 5
+    monitors_by_role = {
+        monitor.output_dir.name: monitor
+        for monitor in MiddleStopRequestedResourceMonitor.instances
+    }
+    assert [role for role, monitor in monitors_by_role.items() if monitor.stopped] == [
+        "p1",
+        "p2",
+        "d1",
+        "d2",
+        "router",
+    ]
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert manifest["status"] == "interrupted"
+    assert manifest["cases"][0]["status"] == "interrupted"
+    assert "p2 monitor background interrupted" in manifest["cases"][0]["error"]
+
+
+def test_topology_prefixed_resource_merge_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    def fail_merge(*args, **kwargs):
+        raise RuntimeError("prefixed merge failed")
+
+    monkeypatch.setattr(ab, "append_prefixed_summaries_to_result_files", fail_merge)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 0
+    assert len(bench_run_commands(local.commands)) == 1
+    assert "remote resource monitor result merge failed" in caplog.text
+    assert any(
+        cmd[1][:2] == ["docker", "stop"] and "router" in cmd[1][2]
+        for cmd in remote.commands
+    )
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert manifest["cases"][0]["status"] == "passed"
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    status = json.loads((layout.bench_dir / "status.json").read_text(encoding="utf-8"))
+    assert status == {"status": "passed", "error": None}
+
+
+def test_topology_owned_stale_role_removed_before_start(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    role_command = topology_role_command(config, "p1")
+    remote = FakeRemoteDockerRunner()
+    remote.labels[role_command.container_name] = labels_from(list(role_command.argv))
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    inspect_index = command_index(
+        [command for _host, command in remote.commands],
+        [
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .Config.Labels}}",
+            role_command.container_name,
+        ],
+    )
+    rm_index = command_index(
+        [command for _host, command in remote.commands],
+        ["docker", "rm", "-f", role_command.container_name],
+    )
+    run_index = command_index(
+        [command for _host, command in remote.commands],
+        ["docker", "run", "-d"],
+    )
+    assert inspect_index < rm_index < run_index
+
+
+def test_topology_foreign_same_name_role_fails_without_removal(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    role_command = topology_role_command(config, "p1")
+    remote = ForeignSameNameRemoteRunner(role_command.container_name)
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 1
+    assert not any(
+        cmd[1][:2] == ["docker", "stop"] and cmd[1][2] == role_command.container_name
+        for cmd in remote.commands
+    )
+    assert not any(
+        cmd[1][:3] == ["docker", "rm", "-f"] and cmd[1][3] == role_command.container_name
+        for cmd in remote.commands
+    )
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["cases"][0]["status"] == "failed"
+
+
+def test_topology_run_does_not_append_legacy_local_resource_columns(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    assert len(FakeResourceMonitor.instances) == 5
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    with (layout.bench_dir / "result.csv").open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert "resource_monitor_available" not in rows[0]
+    assert rows[0]["p1_resource_monitor_available"] == "true"
+
+
+def test_wait_for_remote_ready_uses_api_key_only_for_router(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    case = ab.expand_cases(config, run_id="run123")[0]
+    probes = []
+
+    def fake_wait_for_ready(url, api_key, timeout_sec):
+        probes.append((url, api_key, timeout_sec))
+        return True
+
+    monkeypatch.setattr(ab, "wait_for_ready", fake_wait_for_ready)
+
+    assert ab.wait_for_remote_ready(config, case, "p1") is True
+    assert ab.wait_for_remote_ready(config, case, "router") is True
+
+    assert probes == [
+        ("http://10.0.0.11:30000/v1", None, 30),
+        ("http://10.0.0.31:8000/v1", "local-bench-key", 30),
+    ]
+
+
+def test_topology_inspect_artifact_redacts_secrets(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["env"] = {
+        "OPENAI_API_KEY": "remote-env-secret",
+        "DB_PASSWORD": "remote-db-secret",
+    }
+    topology["frontend"]["args"] = ["--api-key", "router-secret"]
+    topology["prefill"][0]["args"] = ["--password", "arg-password"]
+    topology["decode"][0]["args"] = ["--token", "arg-token"]
+    config = ab.load_config(write_config(tmp_path, data))
+    remote = InspectSecretRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    inspect_text = (layout.bench_dir / "inspect" / "router.json").read_text(
+        encoding="utf-8"
+    )
+    assert "remote-env-secret" not in inspect_text
+    assert "remote-db-secret" not in inspect_text
+    assert "router-secret" not in inspect_text
+    assert "arg-password" not in inspect_text
+    assert "arg-token" not in inspect_text
+    assert "***" in inspect_text
+
+
+def test_topology_artifacts_role_logs_redact_known_secrets(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, secret_topology_config(tmp_path)))
+    remote = LogSecretRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    log_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((layout.bench_dir / "logs").glob("*.log"))
+    )
+    for secret_value in (
+        "run-secret",
+        "ssh-secret",
+        "env-secret",
+        "router-secret",
+        "node-token-secret",
+        "node-password-secret",
+    ):
+        assert secret_value not in log_text
+    assert "***" in log_text
+
+
+def test_topology_foreign_labels_skip_cleanup(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    remote = ForeignLabelRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    assert not any(cmd[1][:2] == ["docker", "stop"] for cmd in remote.commands)
+    assert not any(cmd[1][:3] == ["docker", "rm", "-f"] for cmd in remote.commands)
+
+
+def test_topology_artifact_failure_still_cleans_up_and_passes(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    remote = ArtifactFailingRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    assert any(cmd[1][:2] == ["docker", "stop"] for cmd in remote.commands)
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["cases"][0]["status"] == "passed"
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    assert "failed to save topology artifacts" in (
+        layout.bench_dir / "artifact.warning.txt"
+    ).read_text(encoding="utf-8")
+
+
+def test_topology_prefill_start_failure_cleans_started_roles(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["image"] = "sglang:pd"
+    config = ab.load_config(write_config(tmp_path, data))
+    remote = FakeRemoteDockerRunner(failures={("p2", "docker run -d"): 1})
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 1
+    assert any(
+        cmd[0] == "p1" and cmd[1][:2] == ["docker", "stop"]
+        for cmd in remote.commands
+    )
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["cases"][0]["status"] == "failed"
 
 
 def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
@@ -1274,6 +2599,10 @@ def test_run_controller_starts_and_stops_resource_monitor(tmp_path, monkeypatch)
     assert monitor.stopped is True
     assert monitor.interval_sec == 1.0
     assert monitor.backend == "nvidia-smi"
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    assert monitor.output_dir == layout.bench_dir
+    assert monitor.readers is None
     assert summaries[0][1]["aggregate"]["cpu_util_avg_pct"] == 12.5
 
 
@@ -2246,6 +3575,47 @@ def test_status_reads_state_file(tmp_path, capsys):
     assert "m/s/b" in captured.out
     assert "pid: 12345" in captured.out
     assert "manifest: completed_with_failures cases=3" in captured.out
+
+
+def test_status_reads_topology_current(tmp_path, capsys):
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": {
+            "model": "m",
+            "serve_profile": None,
+            "topology_profile": "topo",
+            "bench_profile": "b",
+        },
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+
+    exit_code = ab.print_status(run_dir)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "m/topo/b" in captured.out
+
+
+def test_current_bench_log_path_uses_topology_current(tmp_path):
+    run_dir = tmp_path / "results" / "run123"
+    log_path = run_dir / "m" / "topo" / "b" / "bench.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("bench log\n", encoding="utf-8")
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "running",
+        "current": {
+            "model": "m",
+            "serve_profile": None,
+            "topology_profile": "topo",
+            "bench_profile": "b",
+        },
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 1, "total": 1},
+    })
+
+    assert ab.current_bench_log_path(run_dir) == log_path
 
 
 def test_status_corrupt_state_returns_error(tmp_path, capsys):
@@ -4029,6 +5399,21 @@ def test_shipped_sglang_compare_config_parses():
     assert engines == {"vllm", "sglang"}
     assert "vllm" in config.run.images
     assert "sglang" in config.run.images
+
+
+def test_shipped_sglang_pd_remote_config_parses(tmp_path):
+    path = CONFIG_DIR / "auto_bench.sglang_pd_remote.example.json"
+    config = ab.load_config(path)
+    assert config.serve_profiles == ()
+    assert config.topology_profiles[0].engine == "sglang"
+    assert config.topology_profiles[0].frontend.kind == "sglang_router"
+    case = ab.expand_cases(config, run_id="dryrun")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "dryrun")
+    assert {"p1", "p2", "d1", "d2", "router"} <= set(commands)
+    router = commands["router"].argv
+    assert "sglang_router.launch_router" in router
+    assert "http://192.0.2.11:30000" in values_after(router, "--prefill")
+    assert "http://192.0.2.21:30001" in values_after(router, "--decode")
 
 
 def test_controller_dry_run_prints_sglang_command(tmp_path, capsys):

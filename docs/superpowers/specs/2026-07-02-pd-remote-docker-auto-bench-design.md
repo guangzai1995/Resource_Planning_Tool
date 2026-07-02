@@ -2,7 +2,7 @@
 
 ## Status
 
-Ready for user review.
+Reviewed and ready for implementation planning.
 
 ## Context
 
@@ -370,8 +370,8 @@ docker run -d --name <container> \
   --entrypoint python3 <router_image_or_image> \
   -m sglang_router.launch_router \
   --pd-disaggregation \
-  --prefill http://<p1.address>:<p1.port> [<p1.bootstrap_port>] \
-  --prefill http://<p2.address>:<p2.port> [<p2.bootstrap_port>] \
+  --prefill http://<p1.address>:<p1.port> \
+  --prefill http://<p2.address>:<p2.port> \
   --decode http://<d1.address>:<d1.port> \
   --decode http://<d2.address>:<d2.port> \
   --host 0.0.0.0 \
@@ -387,6 +387,10 @@ The adapter must allow topology-level defaults and node-level overrides for:
 - Docker volumes
 - Docker `--gpus`
 - additional engine args
+
+`bootstrap_port` is rendered on prefill and decode worker commands only. The
+router registers each worker by HTTP endpoint through repeated `--prefill` and
+`--decode` flags.
 
 ## vLLM Adapter
 
