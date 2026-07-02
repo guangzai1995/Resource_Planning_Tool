@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
+from resource_monitor import ResourceMonitor, append_summary_to_result_files
 
 logger = logging.getLogger("auto_bench")
 
@@ -60,6 +61,13 @@ class VllmCacheConfig:
 
 
 @dataclass(frozen=True)
+class ResourceMonitorRunConfig:
+    enabled: bool = True
+    backend: str = "nvidia-smi"
+    interval_sec: float = 1.0
+
+
+@dataclass(frozen=True)
 class RunConfig:
     name: str
     results_dir: Path
@@ -78,6 +86,9 @@ class RunConfig:
         default_factory=lambda: types.MappingProxyType({})
     )
     vllm_cache: VllmCacheConfig = field(default_factory=VllmCacheConfig)
+    resource_monitor: ResourceMonitorRunConfig = field(
+        default_factory=ResourceMonitorRunConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -396,6 +407,28 @@ def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
     )
 
 
+def _parse_resource_monitor(run: dict[str, Any]) -> ResourceMonitorRunConfig:
+    raw = run.get("resource_monitor")
+    if raw is None:
+        return ResourceMonitorRunConfig()
+    data = _require_mapping(raw, "run.resource_monitor")
+    enabled = _bool(data.get("enabled", True), "run.resource_monitor.enabled")
+    backend = _string(data.get("backend", "nvidia-smi"), "run.resource_monitor.backend")
+    if backend != "nvidia-smi":
+        raise ConfigError("run.resource_monitor.backend only supports nvidia-smi")
+    interval_sec = _finite_float(
+        data.get("interval_sec", 1.0),
+        "run.resource_monitor.interval_sec",
+    )
+    if interval_sec <= 0:
+        raise ConfigError("run.resource_monitor.interval_sec must be > 0")
+    return ResourceMonitorRunConfig(
+        enabled=enabled,
+        backend=backend,
+        interval_sec=interval_sec,
+    )
+
+
 def _parse_run(data: dict[str, Any], config_dir: Path) -> RunConfig:
     run = _require_mapping(data.get("run"), "run")
     host_port = run.get("host_port")
@@ -422,6 +455,7 @@ def _parse_run(data: dict[str, Any], config_dir: Path) -> RunConfig:
         vllm_image=vllm_image,
         images=images,
         vllm_cache=_parse_vllm_cache(run, config_dir),
+        resource_monitor=_parse_resource_monitor(run),
     )
 
 
@@ -2282,21 +2316,70 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                                 f"{make_bench_container_name(case)}"
                             )
                         bench_interrupted: BaseException | None = None
+                        monitor = (
+                            ResourceMonitor(
+                                output_dir=layout.bench_dir,
+                                interval_sec=config.run.resource_monitor.interval_sec,
+                                enabled=True,
+                                backend=config.run.resource_monitor.backend,
+                            )
+                            if config.run.resource_monitor.enabled
+                            else None
+                        )
                         try:
-                            with (layout.bench_dir / "bench.log").open(
-                                "w",
-                                encoding="utf-8",
-                            ) as log:
-                                result = active_runner.run(
-                                    bench_cmd,
-                                    check=False,
-                                    capture=False,
-                                    stdout=log,
-                                    stderr=log,
-                                )
-                        except (StopRequested, KeyboardInterrupt) as exc:
-                            bench_interrupted = exc
-                            raise
+                            try:
+                                if monitor is not None:
+                                    try:
+                                        monitor.start()
+                                    except (StopRequested, KeyboardInterrupt):
+                                        raise
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "resource monitor start failed: %s",
+                                            exc,
+                                        )
+                                        monitor = None
+                                with (layout.bench_dir / "bench.log").open(
+                                    "w",
+                                    encoding="utf-8",
+                                ) as log:
+                                    result = active_runner.run(
+                                        bench_cmd,
+                                        check=False,
+                                        capture=False,
+                                        stdout=log,
+                                        stderr=log,
+                                    )
+                            except (StopRequested, KeyboardInterrupt) as exc:
+                                bench_interrupted = exc
+                                raise
+                            finally:
+                                if monitor is not None:
+                                    resource_summary = None
+                                    try:
+                                        resource_summary = monitor.stop()
+                                    except (StopRequested, KeyboardInterrupt):
+                                        if bench_interrupted is None:
+                                            raise
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "resource monitor stop failed: %s",
+                                            exc,
+                                        )
+                                    if resource_summary is not None:
+                                        try:
+                                            append_summary_to_result_files(
+                                                layout.bench_dir,
+                                                resource_summary,
+                                            )
+                                        except (StopRequested, KeyboardInterrupt):
+                                            if bench_interrupted is None:
+                                                raise
+                                        except Exception as exc:
+                                            logger.warning(
+                                                "resource monitor result merge failed: %s",
+                                                exc,
+                                            )
                         finally:
                             try:
                                 cleanup_bench_container_if_owned(

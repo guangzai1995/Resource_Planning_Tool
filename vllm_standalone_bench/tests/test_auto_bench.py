@@ -113,6 +113,66 @@ def test_load_config_applies_defaults_and_expands_cases(tmp_path):
     assert cases[0].container_name.startswith("bench-vllm-qwen2_5_1_5b-bf16_default-")
 
 
+def test_resource_monitor_defaults_enabled(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+
+    assert config.run.resource_monitor.enabled is True
+    assert config.run.resource_monitor.backend == "nvidia-smi"
+    assert config.run.resource_monitor.interval_sec == 1.0
+
+
+def test_resource_monitor_can_be_disabled(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {"enabled": False}
+
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert config.run.resource_monitor.enabled is False
+    assert config.run.resource_monitor.backend == "nvidia-smi"
+
+
+def test_resource_monitor_rejects_unsupported_backend(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {
+        "enabled": True,
+        "backend": "dcmi",
+        "interval_sec": 1.0,
+    }
+
+    with pytest.raises(ab.ConfigError, match="resource_monitor.backend"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_resource_monitor_interval_must_be_positive(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {
+        "enabled": True,
+        "backend": "nvidia-smi",
+        "interval_sec": 0,
+    }
+
+    with pytest.raises(ab.ConfigError, match="resource_monitor.interval_sec"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_config_to_dict_includes_resource_monitor(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {
+        "enabled": True,
+        "backend": "nvidia-smi",
+        "interval_sec": 2.5,
+    }
+    config = ab.load_config(write_config(tmp_path, data))
+
+    payload = ab.config_to_dict(config)
+
+    assert payload["run"]["resource_monitor"] == {
+        "enabled": True,
+        "backend": "nvidia-smi",
+        "interval_sec": 2.5,
+    }
+
+
 def test_make_run_id_is_unique_within_same_second():
     first = ab.make_run_id("smoke", now=1782849600.0)
     second = ab.make_run_id("smoke", now=1782849600.0)
@@ -1095,6 +1155,46 @@ class FakeRunner:
         return ab.Completed(list(args), 0, "ok\n", "")
 
 
+class FakeResourceMonitor:
+    instances = []
+
+    def __init__(self, *, output_dir, interval_sec, enabled, backend):
+        self.output_dir = Path(output_dir)
+        self.interval_sec = interval_sec
+        self.enabled = enabled
+        self.backend = backend
+        self.started = False
+        self.stopped = False
+        FakeResourceMonitor.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+        summary = {
+            "available": True,
+            "sample_count": 1,
+            "aggregate": {"cpu_util_avg_pct": 12.5},
+        }
+        (self.output_dir / "resource_summary.json").write_text(
+            json.dumps(summary),
+            encoding="utf-8",
+        )
+        return summary
+
+
+class StartFailingResourceMonitor(FakeResourceMonitor):
+    def start(self):
+        raise RuntimeError("start failed")
+
+
+class StopFailingResourceMonitor(FakeResourceMonitor):
+    def stop(self):
+        self.stopped = True
+        raise RuntimeError("stop failed")
+
+
 def command_index(commands, prefix):
     for index, command in enumerate(commands):
         if command[:len(prefix)] == prefix:
@@ -1149,6 +1249,133 @@ def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
     assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
     assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_run_controller_starts_and_stops_resource_monitor(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+    FakeResourceMonitor.instances = []
+    summaries = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+    monkeypatch.setattr(
+        ab,
+        "append_summary_to_result_files",
+        lambda output_dir, summary: summaries.append((Path(output_dir), summary)),
+    )
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 0
+    assert len(FakeResourceMonitor.instances) == 1
+    monitor = FakeResourceMonitor.instances[0]
+    assert monitor.started is True
+    assert monitor.stopped is True
+    assert monitor.interval_sec == 1.0
+    assert monitor.backend == "nvidia-smi"
+    assert summaries[0][1]["aggregate"]["cpu_util_avg_pct"] == 12.5
+
+
+def test_run_controller_stops_resource_monitor_when_bench_fails(tmp_path, monkeypatch):
+    data = minimal_config(tmp_path)
+    config = ab.load_config(write_config(tmp_path, data))
+    runner = FakeRunner(failures={"docker run --rm": 7})
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+    monkeypatch.setattr(ab, "append_summary_to_result_files", lambda *args, **kwargs: None)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 1
+    assert len(FakeResourceMonitor.instances) == 1
+    assert FakeResourceMonitor.instances[0].stopped is True
+
+
+def test_run_controller_does_not_start_resource_monitor_for_dry_run(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+    assert result == 0
+    assert FakeResourceMonitor.instances == []
+
+
+def test_run_controller_does_not_start_resource_monitor_when_disabled(tmp_path, monkeypatch):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {"enabled": False}
+    config = ab.load_config(write_config(tmp_path, data))
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert FakeResourceMonitor.instances == []
+
+
+def test_run_controller_resource_monitor_start_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+    StartFailingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", StartFailingResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 0
+    assert len(bench_run_commands(runner.commands)) == 1
+    assert "resource monitor start failed" in caplog.text
+
+
+def test_run_controller_resource_monitor_stop_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    StopFailingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", StopFailingResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert "resource monitor stop failed" in caplog.text
+
+
+def test_run_controller_resource_monitor_result_merge_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    def fail_merge(*args, **kwargs):
+        raise RuntimeError("merge failed")
+
+    monkeypatch.setattr(ab, "append_summary_to_result_files", fail_merge)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert "resource monitor result merge failed" in caplog.text
 
 
 def test_network_create_command_has_ownership_labels(tmp_path):
@@ -4284,3 +4511,14 @@ def test_builtin_asr_dataset_manifest_is_valid():
     assert sum(path.stat().st_size for path in audio_paths) == manifest["total_audio_bytes"]
     assert (root / "ATTRIBUTION.md").is_file()
     assert (root / "LICENSE.LibriSpeech.txt").is_file()
+
+
+def test_example_config_includes_resource_monitor():
+    path = CONFIG_DIR / "auto_bench.example.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    assert data["run"]["resource_monitor"] == {
+        "enabled": True,
+        "backend": "nvidia-smi",
+        "interval_sec": 1.0,
+    }

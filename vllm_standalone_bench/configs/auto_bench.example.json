@@ -12,7 +12,12 @@
     "host_port": 18000,
     "api_key": "local-bench-key",
     "ready_timeout_sec": 1800,
-    "cooldown_sec": 20
+    "cooldown_sec": 20,
+    "resource_monitor": {
+      "enabled": true,
+      "backend": "nvidia-smi",
+      "interval_sec": 1.0
+    }
   },
   "mounts": {
     "models": "/Resource_Planning_Tool/model"
