@@ -965,6 +965,29 @@ def test_main_resume_detach_child_uses_saved_resume_state_after_parent_starting(
     assert controller_calls == [("run123", ("smoke2",), ("smoke",), "starting")]
 
 
+@pytest.mark.parametrize("lock_token", [None, "wrong"])
+def test_resume_child_startup_context_requires_matching_lock_token(tmp_path, lock_token):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    original_state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "starting",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 0, "total": 2},
+    })
+    ab.write_json_atomic(run_dir / ".resume-startup-state.json", original_state)
+    (run_dir / ".run.lock").write_text(
+        json.dumps({"pid": os.getpid(), "token": "tok", "created_at": 1.0}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ab.ConfigError, match="active.*starting"):
+        ab.load_resume_child_startup_context(tmp_path / "results", "run123", lock_token)
+
+
 def test_main_resume_empty_pending_does_not_start_controller(tmp_path, monkeypatch, capsys):
     config, run_dir = write_resolved_config_for_resume(tmp_path)
     cases = ab.expand_cases(config, run_id="run123")
