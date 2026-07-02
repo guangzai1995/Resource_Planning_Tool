@@ -75,6 +75,20 @@ def test_load_config_accepts_topology_profiles_without_serve_profiles(tmp_path):
     assert topology.frontend.host == "router"
 
 
+def test_topology_only_config_does_not_require_run_engine_images(tmp_path):
+    data = pd_topology_config(tmp_path)
+    del data["run"]["vllm_image"]
+    data["run"].pop("images", None)
+    data["topology_profiles"][0]["image"] = "lmsysorg/sglang:latest"
+    data["topology_profiles"][0]["router_image"] = "sglang-router:offline"
+
+    config = ab.load_config(write_config(tmp_path, data))
+    cases = ab.expand_cases(config, run_id="run123")
+
+    assert config.run.images == {}
+    assert cases[0].topology_profile.name == "sglang_pd_2p2d"
+
+
 def test_topology_profile_rejects_missing_host_reference(tmp_path):
     data = pd_topology_config(tmp_path)
     data["topology_profiles"][0]["prefill"][0]["host"] = "missing"

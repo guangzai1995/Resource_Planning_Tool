@@ -489,8 +489,6 @@ def _parse_engine_images(
         images = dict(raw)
     if vllm_image is not None:
         images.setdefault("vllm", vllm_image)
-    if not images:
-        raise ConfigError("run.images (or run.vllm_image) must define at least one engine image")
     return types.MappingProxyType(images)
 
 
