@@ -2898,7 +2898,7 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
                     serve_case,
                     serve_layout.run_dir,
                 )
-                for command in commands.values():
+                for command in _role_start_order(serve_case, commands):
                     print_cmd(command.masked_argv)
             else:
                 print_cmd(
