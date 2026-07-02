@@ -18,6 +18,16 @@ def run_manual_cli(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_auto_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["python3", "scripts/perf_auto.py", *args],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_manual_cli_dry_run_outputs_request_and_curl():
     result = run_manual_cli("--dry-run", "--input", "hello dry run")
 
@@ -95,3 +105,53 @@ def test_run_manual_shell_wrapper_forwards_to_manual_cli():
     assert "DRY RUN" in result.stdout
     assert "curl" in result.stdout
     assert "hello wrapper" in result.stdout
+
+
+def test_auto_cli_dry_run_outputs_plan_for_each_concurrency():
+    result = run_auto_cli("--dry-run", "--concurrency", "1,4", "--epochs", "3")
+
+    assert result.returncode == 0, result.stderr
+    assert "DRY RUN" in result.stdout
+    assert "config path:" in result.stdout
+    assert "configs/openai_chat.json" in result.stdout
+    assert "dataset path:" in result.stdout
+    assert "output dir: reports/latest" in result.stdout
+    assert "concurrency=1 request_count=3" in result.stdout
+    assert "concurrency=4 request_count=12" in result.stdout
+
+
+def test_run_auto_shell_wrapper_forwards_to_auto_cli():
+    result = subprocess.run(
+        ["scripts/run_auto.sh", "--dry-run", "--concurrency", "2", "--epochs", "2"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "DRY RUN" in result.stdout
+    assert "concurrency=2 request_count=4" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--concurrency", "0"),
+        ("--concurrency", "1,0"),
+        ("--concurrency", "1,nope"),
+        ("--timeout-seconds", "0"),
+        ("--timeout-seconds", "nan"),
+        ("--timeout-seconds", "inf"),
+        ("--max-error-rate", "-0.01"),
+        ("--max-error-rate", "1.01"),
+        ("--max-error-rate", "nan"),
+        ("--max-p90-latency-ms", "0"),
+        ("--max-p90-latency-ms", "inf"),
+    ],
+)
+def test_auto_cli_rejects_invalid_numeric_arguments(option, value):
+    result = run_auto_cli("--dry-run", option, value)
+
+    assert result.returncode != 0
+    assert "error:" in result.stderr
