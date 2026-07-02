@@ -106,6 +106,7 @@ def default_readers():
             check=True,
             capture_output=True,
             text=True,
+            timeout=10,
         ).stdout,
     )
 
@@ -238,14 +239,19 @@ class ResourceMonitor:
         if self._thread is not None:
             self._thread.join(timeout=max(self.interval_sec, 1.0) + 1.0)
 
+        with self._lock:
+            samples = list(self.samples)
+            gpu_samples = list(self.gpu_samples)
+            error_count = self.error_count
+
         summary = summarize_samples(
-            self.samples,
-            gpu_details=summarize_gpus(self.gpu_samples),
-            error_count=self.error_count,
+            samples,
+            gpu_details=summarize_gpus(gpu_samples),
+            error_count=error_count,
             interval_sec=self.interval_sec,
             backend=self.backend,
         )
-        write_samples_csv(self.output_dir / "resource_samples.csv", self.samples)
+        write_samples_csv(self.output_dir / "resource_samples.csv", samples)
         write_summary_json(self.output_dir / "resource_summary.json", summary)
         return summary
 
@@ -347,7 +353,8 @@ def network_rates_mb_s(previous, current, *, elapsed_s):
 
 
 def parse_diskstats(text):
-    devices = {}
+    all_devices = {}
+    main_devices = {}
     main_read_sectors = 0
     main_write_sectors = 0
     all_read_sectors = 0
@@ -360,27 +367,34 @@ def parse_diskstats(text):
             continue
 
         name = parts[2]
-        if name.startswith("loop") or name.startswith("ram"):
+        if (
+            name.startswith("loop")
+            or name.startswith("ram")
+            or name.startswith("dm-")
+            or name.startswith("md")
+        ):
             continue
 
         read_sectors = int(parts[5])
         write_sectors = int(parts[9])
-        devices[name] = {
+        device = {
             "read_sectors": read_sectors,
             "write_sectors": write_sectors,
         }
+        all_devices[name] = device
         all_read_sectors += read_sectors
         all_write_sectors += write_sectors
 
         if not _is_partition_device(name):
             saw_main_device = True
+            main_devices[name] = device
             main_read_sectors += read_sectors
             main_write_sectors += write_sectors
 
     return {
         "read_sectors": main_read_sectors if saw_main_device else all_read_sectors,
         "write_sectors": main_write_sectors if saw_main_device else all_write_sectors,
-        "devices": devices,
+        "devices": main_devices if saw_main_device else all_devices,
     }
 
 
@@ -613,10 +627,7 @@ def append_summary_to_result_files(output_dir, summary):
 
     xlsx_path = output_dir / "result.xlsx"
     if xlsx_path.exists():
-        try:
-            append_summary_to_xlsx(xlsx_path, values)
-        except Exception:
-            pass
+        append_summary_to_xlsx(xlsx_path, values)
 
 
 def append_summary_to_csv(path, values):

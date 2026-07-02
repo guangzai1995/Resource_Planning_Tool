@@ -15,6 +15,30 @@ def test_nvidia_smi_query_is_subprocess_argv():
     ]
 
 
+def test_default_readers_nvidia_smi_uses_timeout(monkeypatch):
+    calls = []
+
+    class Completed:
+        stdout = "0, NVIDIA H200, GPU-0, 50, 1000, 2000, 300, 70\n"
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(rm.subprocess, "run", fake_run)
+
+    assert rm.default_readers().nvidia_smi() == Completed.stdout
+    assert calls == [(
+        rm.NVIDIA_SMI_QUERY,
+        {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "timeout": 10,
+        },
+    )]
+
+
 def test_parse_cpu_stat_and_compute_utilization():
     first = rm.parse_proc_stat("cpu  100 0 50 850 0 0 0 0 0 0\n")
     second = rm.parse_proc_stat("cpu  180 0 70 950 0 0 0 0 0 0\n")
@@ -299,6 +323,45 @@ def test_resource_monitor_writes_samples_and_summary(tmp_path):
     assert summary["aggregate"]["gpu_count"] == 1
 
 
+def test_resource_monitor_stop_writes_samples_from_snapshot(tmp_path, monkeypatch):
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=lambda: "cpu  100 0 50 850 0 0 0 0 0 0\n",
+            meminfo=lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+            net_dev=lambda: "",
+            diskstats=lambda: "",
+            nvidia_smi=lambda: "0, NVIDIA H200, GPU-0, 50, 1000, 2000, 300, 70\n",
+        ),
+    )
+    captured = {}
+
+    def fake_write_samples_csv(path, samples):
+        monitor.samples.append({
+            "timestamp": "late",
+            "elapsed_s": 999.0,
+            "mem_total_mb": 1.0,
+            "mem_used_mb": 1.0,
+            "mem_available_mb": 0.0,
+            "mem_used_pct": 100.0,
+        })
+        captured["path"] = Path(path)
+        captured["samples"] = list(samples)
+
+    monkeypatch.setattr(rm, "write_samples_csv", fake_write_samples_csv)
+
+    monitor.sample_once(now=100.0)
+    summary = monitor.stop()
+
+    assert summary["sample_count"] == 1
+    assert captured["path"] == tmp_path / "resource_samples.csv"
+    assert len(captured["samples"]) == summary["sample_count"]
+    assert captured["samples"][0]["timestamp"] != "late"
+
+
 def test_resource_monitor_degrades_when_nvidia_smi_missing(tmp_path):
     def missing_gpu():
         raise FileNotFoundError("nvidia-smi")
@@ -366,6 +429,21 @@ def test_parse_diskstats_and_compute_rates():
 
     assert rates["disk_read_mb_s"] == pytest.approx(1.0)
     assert rates["disk_write_mb_s"] == pytest.approx(0.5)
+
+
+def test_parse_diskstats_skips_partitions_and_mapped_devices():
+    text = "\n".join([
+        "   8       0 sda 0 0 100 0 0 0 50 0 0 0 0 0 0 0 0 0",
+        "   8       1 sda1 0 0 10000 0 0 0 5000 0 0 0 0 0 0 0 0 0",
+        " 253       0 dm-0 0 0 20000 0 0 0 10000 0 0 0 0 0 0 0 0 0",
+        "   9       0 md0 0 0 40000 0 0 0 20000 0 0 0 0 0 0 0 0 0",
+    ])
+
+    stats = rm.parse_diskstats(text)
+
+    assert stats["read_sectors"] == 100
+    assert stats["write_sectors"] == 50
+    assert set(stats["devices"]) == {"sda"}
 
 
 def test_append_summary_to_result_csv_adds_resource_columns(tmp_path):
@@ -438,6 +516,21 @@ def test_append_summary_to_result_xlsx_adds_chinese_resource_headers(tmp_path):
     assert sheet.cell(row=3, column=available_column).value == "true"
     assert sheet.cell(row=3, column=sample_count_column).value == 2
     assert sheet.cell(row=3, column=cpu_avg_column).value == 50.0
+
+
+def test_append_summary_to_result_files_propagates_xlsx_write_errors(tmp_path, monkeypatch):
+    (tmp_path / "result.xlsx").write_bytes(b"not a workbook")
+
+    def fail_xlsx(path, values):
+        raise RuntimeError("xlsx failed")
+
+    monkeypatch.setattr(rm, "append_summary_to_xlsx", fail_xlsx)
+
+    with pytest.raises(RuntimeError, match="xlsx failed"):
+        rm.append_summary_to_result_files(
+            tmp_path,
+            {"available": True, "sample_count": 1, "aggregate": {}},
+        )
 
 
 def test_resource_monitor_disabled_writes_nothing(tmp_path):
