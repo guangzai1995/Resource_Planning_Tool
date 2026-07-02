@@ -21,6 +21,14 @@ python3 scripts/perf_auto.py --config configs/openai_chat.json --dry-run
 
 6. After execution, analyze success rate, throughput, latency percentiles, error types, stable concurrency, and bottleneck range.
 
+## Preferred script usage
+
+Prefer calling the packaged automation script instead of writing ad-hoc request loops:
+
+```bash
+python3 scripts/perf_auto.py --config configs/openai_chat.json --dry-run
+```
+
 ## Safety Rules
 
 - Do not treat 100% request failure as a performance bottleneck.

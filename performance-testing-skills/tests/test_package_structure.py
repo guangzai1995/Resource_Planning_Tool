@@ -26,6 +26,7 @@ def test_expected_package_files_exist():
         "datasets/text_prompts.example.jsonl",
         "datasets/audio_manifest.example.jsonl",
         "reports/.gitkeep",
+        "tests/test_package_structure.py",
     ]
     missing = [path for path in expected if not (ROOT / path).exists()]
     assert missing == []
@@ -42,3 +43,15 @@ def test_skill_frontmatter_is_valid():
         assert "\nname: " in text
         assert "\ndescription: " in text
         assert "\n---\n" in text[4:]
+
+
+def test_automated_skill_prefers_package_script_usage():
+    text = (
+        ROOT / "skills/automated-performance-testing/SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "## Preferred script usage" in text
+    assert (
+        "python3 scripts/perf_auto.py --config configs/openai_chat.json --dry-run"
+        in text
+    )
+    assert "ad-hoc" in text
