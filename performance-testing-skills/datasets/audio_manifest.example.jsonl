@@ -1,1 +1,1 @@
-{"audio_path": "sample.wav"}
+{"audio": "datasets/audio/sample.wav", "prompt": "Transcribe the audio.", "reference": "example transcript", "duration_s": 12.3}

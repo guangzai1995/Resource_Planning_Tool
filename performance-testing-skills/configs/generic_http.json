@@ -1,1 +1,25 @@
-{}
+{
+  "protocol": "generic_http",
+  "method": "POST",
+  "url": "http://127.0.0.1:8000/generate",
+  "headers": {
+    "Authorization": "Bearer ${API_KEY}",
+    "Content-Type": "application/json"
+  },
+  "body_template": {
+    "prompt": "${prompt}",
+    "max_tokens": "${expected_output_len}"
+  },
+  "dataset": {
+    "type": "text_prompts",
+    "path": "datasets/text_prompts.example.jsonl"
+  },
+  "bench": {
+    "concurrency": [1, 4, 8],
+    "epochs": 3,
+    "timeout": 60
+  },
+  "report": {
+    "formats": ["json", "csv", "md"]
+  }
+}

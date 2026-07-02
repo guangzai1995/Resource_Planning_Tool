@@ -1,1 +1,2 @@
-{"prompt": "Hello, world."}
+{"prompt": "Write a short introduction to API benchmarking.", "expected_output_len": 128, "metadata": {"case": "intro"}}
+{"prompt": "Summarize why latency percentiles matter.", "expected_output_len": 96, "metadata": {"case": "latency"}}
