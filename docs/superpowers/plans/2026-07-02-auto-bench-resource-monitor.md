@@ -1009,6 +1009,7 @@ git commit -m "feat(bench): monitor resources during auto bench cases"
 **文件：**
 - 修改：`vllm_standalone_bench/configs/auto_bench.example.json`
 - 修改：`vllm_standalone_bench/README.md`
+- 修改：`vllm_standalone_bench/tests/test_auto_bench.py`
 - 修改：`docs/superpowers/plans/2026-07-02-auto-bench-resource-monitor.md`
 
 - [x] **步骤 1：编写失败的文档/配置检查测试**

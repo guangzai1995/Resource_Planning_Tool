@@ -136,7 +136,7 @@ resource_samples.csv
 resource_summary.json
 ```
 
-`resource_samples.csv` 是按采样时间点记录的趋势数据；`resource_summary.json` 包含 avg、p95、max 汇总和单卡 GPU 明细。`result.csv` / `result.xlsx` 会追加 case 级资源汇总列。没有 NVIDIA GPU 或 `nvidia-smi` 不可用时，系统资源仍会采集，GPU 字段留空，benchmark 成败不受资源监控影响。
+`resource_samples.csv` 是按采样时间点记录的趋势数据；`resource_summary.json` 包含 avg、p95、max 汇总和单卡 GPU 明细。`result.csv` / `result.xlsx` 会追加 case 级资源汇总列。没有 NVIDIA GPU 或 `nvidia-smi` 不可用时，系统资源仍会采集，GPU 指标字段留空，`gpu_count` 为 0，benchmark 成败不受资源监控影响。
 
 可在配置中显式调整：
 
