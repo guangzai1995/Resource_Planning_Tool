@@ -1,0 +1,20 @@
+{
+  "protocol": "openai_chat",
+  "base_url": "http://127.0.0.1:8000/v1",
+  "model": "example-chat-model",
+  "headers": {
+    "Authorization": "Bearer ${API_KEY}"
+  },
+  "dataset": {
+    "type": "text_prompts",
+    "path": "datasets/text_prompts.example.jsonl"
+  },
+  "bench": {
+    "concurrency": [1, 4, 8],
+    "epochs": 3,
+    "timeout": 60
+  },
+  "report": {
+    "formats": ["json", "csv", "md"]
+  }
+}
