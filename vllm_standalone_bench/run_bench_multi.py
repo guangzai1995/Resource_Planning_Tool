@@ -154,6 +154,9 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
         )
         base.dataset_path = getattr(our_args, "dataset_path", None)
         base.language = getattr(our_args, "language", None) or "en"
+        base.audio_duration_s = getattr(our_args, "audio_duration_s", None)
+        base.audio_silence_ms = getattr(our_args, "audio_silence_ms", 500)
+        base.generated_audio_dir = getattr(our_args, "generated_audio_dir", None)
     else:
         dataset = getattr(our_args, 'dataset', 'random')
         if dataset == 'builtin_mtp_chat' and not our_args.tokenizer:
@@ -938,6 +941,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                        help='ASR JSONL 数据集路径；custom_audio 需要')
     bench.add_argument('--language', default='en',
                        help='OpenAI Audio transcription language 参数，默认 en')
+    bench.add_argument('--audio-duration-s', type=float, default=None,
+                       help='ASR/custom_audio: 运行时拼接源音频，生成每条请求的目标音频时长（秒）。'
+                            '不设置时直接使用数据集原始音频')
+    bench.add_argument('--audio-silence-ms', type=int, default=500,
+                       help='ASR/custom_audio: 动态拼接片段之间插入的静音长度（毫秒，默认 500）')
+    bench.add_argument('--generated-audio-dir', default=None,
+                       help='ASR/custom_audio: 动态拼接音频与 manifest 输出目录；'
+                            '不设置时使用临时目录')
     bench.add_argument('--prefix-ratio', type=float, default=0.0,
                        help='前缀缓存比例 [0.0~1.0]（默认: 0.0 = 不使用共享前缀）。'
                             '取值 0.5 表示每个请求中有 50%% 的 input_len 作为共享前缀。'
