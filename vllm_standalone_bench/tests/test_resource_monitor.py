@@ -1,5 +1,6 @@
 import csv
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -541,6 +542,43 @@ def test_resource_monitor_passthrough_exceptions_are_not_swallowed(
 
     with pytest.raises(PassthroughError, match="stop requested"):
         passthrough_monitor.sample_once(now=100.0)
+
+
+def test_resource_monitor_stop_reraises_background_passthrough_exception(tmp_path):
+    class PassthroughError(Exception):
+        pass
+
+    sample_attempts = 0
+    background_sample_started = threading.Event()
+
+    def proc_stat():
+        nonlocal sample_attempts
+        sample_attempts += 1
+        if sample_attempts == 2:
+            background_sample_started.set()
+            raise PassthroughError("background stop requested")
+        return "cpu  100 0 50 850 0 0 0 0 0 0\n"
+
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=0.01,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=proc_stat,
+            meminfo=lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+            net_dev=lambda: "",
+            diskstats=lambda: "",
+            nvidia_smi=lambda: "",
+        ),
+        passthrough_exceptions=(PassthroughError,),
+    )
+
+    monitor.start()
+    assert background_sample_started.wait(timeout=1.0)
+
+    with pytest.raises(PassthroughError, match="background stop requested"):
+        monitor.stop()
 
 
 def test_parse_diskstats_and_compute_rates():

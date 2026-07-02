@@ -137,6 +137,7 @@ class ResourceMonitor:
         self._previous_net = None
         self._previous_disk = None
         self._thread = None
+        self._thread_exception = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
 
@@ -146,6 +147,7 @@ class ResourceMonitor:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
+        self._thread_exception = None
         self.sample_once()
         self._thread = threading.Thread(
             target=self._run,
@@ -156,7 +158,17 @@ class ResourceMonitor:
 
     def _run(self):
         while not self._stop.wait(self.interval_sec):
-            self.sample_once()
+            try:
+                self.sample_once()
+            except Exception as exc:
+                if self.passthrough_exceptions and isinstance(
+                    exc,
+                    self.passthrough_exceptions,
+                ):
+                    self._thread_exception = exc
+                    self._stop.set()
+                    return
+                raise
 
     def sample_once(self, now=None):
         if not self.enabled:
@@ -249,6 +261,9 @@ class ResourceMonitor:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(self.interval_sec, 1.0) + 1.0)
+
+        if self._thread_exception is not None:
+            raise self._thread_exception
 
         if was_started and self._started_at is not None:
             self.sample_once()

@@ -1565,6 +1565,12 @@ class StopFailingResourceMonitor(FakeResourceMonitor):
         raise RuntimeError("stop failed")
 
 
+class StopRequestedResourceMonitor(FakeResourceMonitor):
+    def stop(self):
+        self.stopped = True
+        raise ab.StopRequested("monitor background interrupted")
+
+
 class SecondStartInterruptingResourceMonitor(FakeResourceMonitor):
     instances = []
 
@@ -1833,6 +1839,36 @@ def test_topology_remote_resource_monitor_stop_failed_does_not_fail_bench(
     assert len(bench_run_commands(local.commands)) == 1
     assert len(StopFailingResourceMonitor.instances) == 5
     assert all(monitor.stopped for monitor in StopFailingResourceMonitor.instances)
+
+
+def test_topology_remote_resource_monitor_stop_requested_interrupts_run(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    StopRequestedResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", StopRequestedResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 130
+    assert len(bench_run_commands(local.commands)) == 1
+    assert any(
+        cmd[1][:2] == ["docker", "stop"] and "router" in cmd[1][2]
+        for cmd in remote.commands
+    )
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert manifest["status"] == "interrupted"
+    assert manifest["cases"][0]["status"] == "interrupted"
+    assert "monitor background interrupted" in manifest["cases"][0]["error"]
 
 
 def test_topology_prefixed_resource_merge_failed_does_not_fail_bench(
