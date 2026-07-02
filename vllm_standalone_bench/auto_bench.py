@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
+from resource_monitor import ResourceMonitor, append_summary_to_result_files
 
 logger = logging.getLogger("auto_bench")
 
@@ -2315,21 +2316,61 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                                 f"{make_bench_container_name(case)}"
                             )
                         bench_interrupted: BaseException | None = None
+                        monitor = (
+                            ResourceMonitor(
+                                output_dir=layout.bench_dir,
+                                interval_sec=config.run.resource_monitor.interval_sec,
+                                enabled=True,
+                                backend=config.run.resource_monitor.backend,
+                            )
+                            if config.run.resource_monitor.enabled
+                            else None
+                        )
                         try:
-                            with (layout.bench_dir / "bench.log").open(
-                                "w",
-                                encoding="utf-8",
-                            ) as log:
-                                result = active_runner.run(
-                                    bench_cmd,
-                                    check=False,
-                                    capture=False,
-                                    stdout=log,
-                                    stderr=log,
-                                )
-                        except (StopRequested, KeyboardInterrupt) as exc:
-                            bench_interrupted = exc
-                            raise
+                            try:
+                                if monitor is not None:
+                                    monitor.start()
+                                with (layout.bench_dir / "bench.log").open(
+                                    "w",
+                                    encoding="utf-8",
+                                ) as log:
+                                    result = active_runner.run(
+                                        bench_cmd,
+                                        check=False,
+                                        capture=False,
+                                        stdout=log,
+                                        stderr=log,
+                                    )
+                            except (StopRequested, KeyboardInterrupt) as exc:
+                                bench_interrupted = exc
+                                raise
+                            finally:
+                                if monitor is not None:
+                                    resource_summary = None
+                                    try:
+                                        resource_summary = monitor.stop()
+                                    except (StopRequested, KeyboardInterrupt):
+                                        if bench_interrupted is None:
+                                            raise
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "resource monitor stop failed: %s",
+                                            exc,
+                                        )
+                                    if resource_summary is not None:
+                                        try:
+                                            append_summary_to_result_files(
+                                                layout.bench_dir,
+                                                resource_summary,
+                                            )
+                                        except (StopRequested, KeyboardInterrupt):
+                                            if bench_interrupted is None:
+                                                raise
+                                        except Exception as exc:
+                                            logger.warning(
+                                                "resource monitor result merge failed: %s",
+                                                exc,
+                                            )
                         finally:
                             try:
                                 cleanup_bench_container_if_owned(

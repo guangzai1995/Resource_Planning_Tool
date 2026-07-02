@@ -1155,6 +1155,35 @@ class FakeRunner:
         return ab.Completed(list(args), 0, "ok\n", "")
 
 
+class FakeResourceMonitor:
+    instances = []
+
+    def __init__(self, *, output_dir, interval_sec, enabled, backend):
+        self.output_dir = Path(output_dir)
+        self.interval_sec = interval_sec
+        self.enabled = enabled
+        self.backend = backend
+        self.started = False
+        self.stopped = False
+        FakeResourceMonitor.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+        summary = {
+            "available": True,
+            "sample_count": 1,
+            "aggregate": {"cpu_util_avg_pct": 12.5},
+        }
+        (self.output_dir / "resource_summary.json").write_text(
+            json.dumps(summary),
+            encoding="utf-8",
+        )
+        return summary
+
+
 def command_index(commands, prefix):
     for index, command in enumerate(commands):
         if command[:len(prefix)] == prefix:
@@ -1209,6 +1238,75 @@ def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
     assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
     assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_run_controller_starts_and_stops_resource_monitor(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    runner = FakeRunner()
+    FakeResourceMonitor.instances = []
+    summaries = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+    monkeypatch.setattr(
+        ab,
+        "append_summary_to_result_files",
+        lambda output_dir, summary: summaries.append((Path(output_dir), summary)),
+    )
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 0
+    assert len(FakeResourceMonitor.instances) == 1
+    monitor = FakeResourceMonitor.instances[0]
+    assert monitor.started is True
+    assert monitor.stopped is True
+    assert monitor.interval_sec == 1.0
+    assert monitor.backend == "nvidia-smi"
+    assert summaries[0][1]["aggregate"]["cpu_util_avg_pct"] == 12.5
+
+
+def test_run_controller_stops_resource_monitor_when_bench_fails(tmp_path, monkeypatch):
+    data = minimal_config(tmp_path)
+    config = ab.load_config(write_config(tmp_path, data))
+    runner = FakeRunner(failures={"docker run --rm": 7})
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+    monkeypatch.setattr(ab, "append_summary_to_result_files", lambda *args, **kwargs: None)
+
+    result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
+
+    assert result == 1
+    assert len(FakeResourceMonitor.instances) == 1
+    assert FakeResourceMonitor.instances[0].stopped is True
+
+
+def test_run_controller_does_not_start_resource_monitor_for_dry_run(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+    assert result == 0
+    assert FakeResourceMonitor.instances == []
+
+
+def test_run_controller_does_not_start_resource_monitor_when_disabled(tmp_path, monkeypatch):
+    data = minimal_config(tmp_path)
+    data["run"]["resource_monitor"] = {"enabled": False}
+    config = ab.load_config(write_config(tmp_path, data))
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert FakeResourceMonitor.instances == []
 
 
 def test_network_create_command_has_ownership_labels(tmp_path):
