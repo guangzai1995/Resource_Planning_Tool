@@ -179,8 +179,14 @@ def _print_dry_run(
     if args.duration_seconds is not None:
         print(f"duration_seconds={args.duration_seconds:g}")
     for concurrency in args.concurrency:
-        request_count = concurrency * args.epochs
-        print(f"concurrency={concurrency} request_count={request_count}")
+        if args.duration_seconds is not None:
+            print(
+                f"concurrency={concurrency} mode=duration "
+                f"duration_based=true initial_request_count={concurrency}"
+            )
+        else:
+            request_count = concurrency * args.epochs
+            print(f"concurrency={concurrency} request_count={request_count}")
 
 
 def _sample_for_index(dataset: list[dict[str, Any]], index: int) -> dict[str, Any]:

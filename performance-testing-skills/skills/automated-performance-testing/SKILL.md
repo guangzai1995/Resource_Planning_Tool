@@ -20,10 +20,12 @@ Confirm these inputs before sending load:
 5. Thresholds: optional `--max-error-rate`, `--max-p90-latency-ms`, and whether to use `--fail-fast`.
 6. Output location: `--output-dir`, especially when comparing multiple runs.
 
+`--fail-fast` stops only after a tier with zero completed requests, 100% request failure, or a `--max-error-rate` violation. The p90 threshold does not trigger fail-fast; a `--max-p90-latency-ms` violation is recorded and makes the command exit non-zero after the sweep completes.
+
 ## Required Workflow
 
 1. Run a manual smoke check first, or confirm one has already succeeded.
-2. Run automated dry-run to verify the config, dataset path, output directory, concurrency tiers, and request counts.
+2. Run automated dry-run to verify the config, dataset path, output directory, concurrency tiers, and request counts. In duration mode, dry-run marks the plan as duration-based because the final request count depends on response timing.
 3. Run a small-concurrency smoke tier, typically `--concurrency 1 --epochs 1`.
 4. Run the formal sweep with the agreed concurrency, epochs or duration, thresholds, and report directory.
 5. Read the generated reports before making any bottleneck claim.
@@ -35,7 +37,8 @@ Prefer the package wrapper over ad-hoc request loops:
 ```bash
 ./scripts/run_auto.sh --config configs/openai_chat.json --dry-run --concurrency 1,2 --epochs 2
 ./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1 --epochs 1 --output-dir reports/smoke
-./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2,4,8 --epochs 5 --max-error-rate 0.05 --max-p90-latency-ms 2000 --fail-fast --output-dir reports/sweep
+./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2,4,8 --epochs 5 --max-error-rate 0.05 --fail-fast --output-dir reports/sweep
+./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2,4,8 --epochs 5 --max-p90-latency-ms 2000 --output-dir reports/latency-check
 ```
 
 Direct Python entry points are also valid:
@@ -45,6 +48,8 @@ python3 scripts/perf_auto.py --config configs/openai_chat.json --dry-run
 python3 scripts/perf_auto.py --config configs/openai_asr.json --concurrency 1,2 --epochs 3 --output-dir reports/asr-sweep
 python3 scripts/perf_auto.py --config configs/generic_http.json --concurrency 1,2,4 --duration-seconds 30 --fail-fast --output-dir reports/generic-http
 ```
+
+When using `--duration-seconds`, the runner continuously submits replacement requests until the tier timer expires. Treat `metrics.json`, `metrics.csv`, and `summary.md` as the source of truth for total request counts.
 
 ## Reading Reports
 

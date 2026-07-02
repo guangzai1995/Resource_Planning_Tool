@@ -166,6 +166,22 @@ def test_auto_cli_dry_run_outputs_plan_for_each_concurrency():
     assert "concurrency=4 request_count=12" in result.stdout
 
 
+def test_auto_cli_duration_dry_run_marks_duration_mode():
+    result = run_auto_cli(
+        "--dry-run",
+        "--duration-seconds",
+        "30",
+        "--concurrency",
+        "2",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "duration_seconds=30" in result.stdout
+    assert "concurrency=2" in result.stdout
+    assert "mode=duration" in result.stdout
+    assert "initial_request_count=2" in result.stdout
+
+
 def test_auto_cli_dry_run_resolves_relative_output_dir_to_package_root():
     result = run_auto_cli("--dry-run", "--output-dir", "relative-reports")
 

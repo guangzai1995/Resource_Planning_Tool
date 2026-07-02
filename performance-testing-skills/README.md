@@ -148,10 +148,10 @@ Parameters:
 - `--dataset`: dataset path override for the config.
 - `--concurrency`: comma or space separated concurrency values, for example `1,2,4` or `1 2 4`.
 - `--epochs`: requests per worker for each concurrency value when `--duration-seconds` is not set.
-- `--duration-seconds`: optional time-based load duration per concurrency tier.
+- `--duration-seconds`: optional time-based load duration per concurrency tier. Duration mode keeps submitting replacement requests until the timer expires; total request count is known only after the run and should be read from `metrics.json`, `metrics.csv`, or `summary.md`.
 - `--max-error-rate`: optional threshold from `0` to `1`.
 - `--max-p90-latency-ms`: optional p90 latency threshold in milliseconds.
-- `--fail-fast`: stop after the first failed concurrency tier.
+- `--fail-fast`: stop after the first tier with zero completed requests, 100% request failure, or a `--max-error-rate` violation. The p90 threshold does not trigger fail-fast; a `--max-p90-latency-ms` violation is recorded and makes the command exit non-zero after the sweep completes.
 - `--output-dir`: report directory. Defaults to `reports/latest`.
 - `--dry-run`: print the plan without network traffic.
 
@@ -159,7 +159,8 @@ Recommended commands for Codex or Claude:
 
 ```bash
 ./scripts/run_auto.sh --config configs/openai_chat.json --dry-run --concurrency 1,2 --epochs 2
-./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2 --epochs 2 --max-error-rate 0.05 --max-p90-latency-ms 2000 --fail-fast --output-dir reports/latest
+./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2 --epochs 2 --max-error-rate 0.05 --fail-fast --output-dir reports/latest
+./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2 --epochs 2 --max-p90-latency-ms 2000 --output-dir reports/latency-check
 ./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2,4 --duration-seconds 30 --output-dir reports/sweep
 ```
 
@@ -168,7 +169,7 @@ Suggested flow:
 1. Run manual dry-run and curl checks.
 2. Run automated dry-run to verify the benchmark plan.
 3. Run a small smoke tier such as `--concurrency 1 --epochs 1`.
-4. Run the formal sweep with the planned concurrency, epochs or duration, thresholds, and output directory.
+4. Run the formal sweep with the planned concurrency, epochs or duration, thresholds, and output directory. In duration mode, reports are the source of truth for total request counts.
 
 ## Reports
 

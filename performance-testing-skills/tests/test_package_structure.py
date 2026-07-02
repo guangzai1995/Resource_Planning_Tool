@@ -118,3 +118,13 @@ def test_automated_skill_documents_run_auto_and_failure_safety():
     assert "run_auto.sh" in text
     assert "fail-fast" in text
     assert "100% request failure" in lowered
+
+
+def test_docs_clarify_p90_threshold_does_not_fail_fast():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8").lower()
+    automated_skill = (
+        ROOT / "skills/automated-performance-testing/SKILL.md"
+    ).read_text(encoding="utf-8").lower()
+
+    for text in [readme, automated_skill]:
+        assert "p90 threshold does not trigger fail-fast" in text
