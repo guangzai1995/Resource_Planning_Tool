@@ -73,6 +73,9 @@ def mask_command(
                 masked.append(arg)
                 redact_next = True
             continue
+        if arg.startswith("-") and "=" in arg:
+            masked.append(arg)
+            continue
         masked.append(_mask_env_assignment(arg))
 
     for secret in secrets:
@@ -214,6 +217,8 @@ def _command_secrets(command: Sequence[str]) -> tuple[str, ...]:
                 continue
             if value:
                 secrets.append(value)
+            continue
+        if arg.startswith("-") and "=" in arg:
             continue
         key, separator, value = arg.partition("=")
         if separator and value and _is_sensitive_env_key(key):

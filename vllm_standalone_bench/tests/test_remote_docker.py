@@ -148,6 +148,9 @@ def test_mask_command_redacts_flags_and_sensitive_env_assignments():
         "service-token-secret",
         "--tokenizer-path",
         "/models/tokenizer",
+        "--tokenizer-path=/models/inline-tokenizer",
+        "--host-tokenizer-path=/host/tokenizer",
+        "--key-path=/keys/id_rsa",
         "OPENAI_API_KEY=env-secret",
         "PASSWORD=password-secret",
         "TOKEN=token-secret",
@@ -181,6 +184,9 @@ def test_mask_command_redacts_flags_and_sensitive_env_assignments():
         "***",
         "--tokenizer-path",
         "/models/tokenizer",
+        "--tokenizer-path=/models/inline-tokenizer",
+        "--host-tokenizer-path=/host/tokenizer",
+        "--key-path=/keys/id_rsa",
         "OPENAI_API_KEY=***",
         "PASSWORD=***",
         "TOKEN=***",
@@ -227,13 +233,20 @@ def test_remote_runner_check_failure_redacts_command_secret_from_error(monkeypat
     with pytest.raises(RuntimeError) as exc_info:
         RemoteDockerRunner().run(
             host,
-            ["python", "serve.py", "--api-key", "api-secret"],
+            [
+                "python",
+                "serve.py",
+                "--api-key",
+                "api-secret",
+                "--tokenizer-path=/models/tokenizer",
+            ],
             check=True,
         )
 
     message = str(exc_info.value)
     assert "api-secret" not in message
     assert "--api-key ***" in message
+    assert "--tokenizer-path=/models/tokenizer" in message
 
 
 def test_remote_runner_supports_stdout_stderr_streams(monkeypatch):
