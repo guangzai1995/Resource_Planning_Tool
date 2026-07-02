@@ -20,7 +20,21 @@ def test_aggregate_results_computes_latency_and_success_rate():
     assert metrics["success_rate"] == 2 / 3
     assert metrics["latency_p50_ms"] == 200.0
     assert metrics["request_throughput_req_s"] == 0.2
-    assert metrics["audio_rtfx"] == 9.0
+    assert metrics["audio_duration_s_total"] == 60.0
+    assert metrics["audio_rtfx"] == 6.0
+
+
+def test_aggregate_results_ignores_failed_audio_duration_for_rtfx():
+    rows = [
+        {"success": False, "latency_ms": 100.0, "output_tokens": 0, "audio_duration_s": 30.0},
+        {"success": False, "latency_ms": 200.0, "output_tokens": 0, "audio_duration_s": 30.0},
+    ]
+
+    metrics = aggregate_results(rows, concurrency=2, duration_s=1.0)
+
+    assert metrics["n_success"] == 0
+    assert "audio_duration_s_total" not in metrics
+    assert "audio_rtfx" not in metrics
 
 
 def test_analyze_bottleneck_finds_stable_and_overloaded_concurrency():

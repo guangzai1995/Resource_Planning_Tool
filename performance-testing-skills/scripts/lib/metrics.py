@@ -47,7 +47,7 @@ def aggregate_results(rows, concurrency, duration_s):
 
     audio_durations = [
         float(row["audio_duration_s"])
-        for row in rows
+        for row in success_rows
         if row.get("audio_duration_s") is not None
     ]
     if audio_durations:
