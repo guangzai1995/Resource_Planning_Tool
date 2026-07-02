@@ -241,6 +241,34 @@ def test_topology_profile_rejects_missing_host_reference(tmp_path):
         ab.load_config(write_config(tmp_path, data))
 
 
+def test_topology_profile_rejects_duplicate_prefill_decode_role_names(tmp_path):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["decode"][0]["name"] = "p1"
+
+    with pytest.raises(ab.ConfigError) as exc_info:
+        ab.load_config(write_config(tmp_path, data))
+
+    message = str(exc_info.value)
+    assert "topology_profiles[0]" in message
+    assert "sglang_pd_2p2d" in message
+    assert "p1" in message
+    assert "duplicate" in message or "unique" in message
+
+
+def test_topology_profile_rejects_frontend_role_name_collision(tmp_path):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["prefill"][0]["name"] = "router"
+
+    with pytest.raises(ab.ConfigError) as exc_info:
+        ab.load_config(write_config(tmp_path, data))
+
+    message = str(exc_info.value)
+    assert "topology_profiles[0]" in message
+    assert "sglang_pd_2p2d" in message
+    assert "router" in message
+    assert "duplicate" in message or "unique" in message
+
+
 def test_config_to_dict_masks_inline_password(tmp_path):
     data = pd_topology_config(tmp_path)
     data["topology_profiles"][0]["hosts"]["p1"]["auth"] = {

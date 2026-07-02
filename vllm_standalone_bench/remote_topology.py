@@ -556,6 +556,7 @@ def parse_topology_profiles(
             hosts,
             error,
         )
+        _validate_role_names_unique(path, name, prefill, decode, frontend, error)
         parsed.append(TopologyProfile(
             name=name,
             engine=engine,
@@ -755,6 +756,29 @@ def _check_host_ref(host: str, path: str, hosts: Mapping[str, RemoteHost],
     if host not in hosts:
         raise error(f"{path}.host references unknown host: {host}")
     return host
+
+
+def _validate_role_names_unique(
+    path: str,
+    profile_name: str,
+    prefill: tuple[TopologyNode, ...],
+    decode: tuple[TopologyNode, ...],
+    frontend: TopologyFrontend,
+    error: ErrorFactory,
+) -> None:
+    role_names = [node.name for node in prefill]
+    role_names.extend(node.name for node in decode)
+    role_names.append(frontend.host)
+    duplicates = sorted({
+        name for name in role_names if role_names.count(name) > 1
+    })
+    if duplicates:
+        raise error(
+            f"topology profile {path} ({profile_name}) role names must be "
+            "unique across prefill/decode node.name and frontend.host; "
+            "duplicate role name: "
+            + ", ".join(duplicates)
+        )
 
 
 def _parse_nodes(
