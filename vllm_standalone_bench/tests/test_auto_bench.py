@@ -113,6 +113,19 @@ def test_load_config_applies_defaults_and_expands_cases(tmp_path):
     assert cases[0].container_name.startswith("bench-vllm-qwen2_5_1_5b-bf16_default-")
 
 
+def test_expand_cases_uses_topology_profiles(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
+    cases = ab.expand_cases(config, run_id="run123")
+
+    assert len(cases) == 1
+    case = cases[0]
+    assert case.serve_profile is None
+    assert case.topology_profile.name == "sglang_pd_2p2d"
+    assert case.serving_name == "sglang_pd_2p2d"
+
+
 def test_resource_monitor_defaults_enabled(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
 

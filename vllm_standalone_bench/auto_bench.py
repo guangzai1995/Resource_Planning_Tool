@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
+from remote_topology import TopologyProfile, parse_topology_profiles
 from resource_monitor import ResourceMonitor, append_summary_to_result_files
 
 logger = logging.getLogger("auto_bench")
@@ -154,16 +155,32 @@ class AutoBenchConfig:
     models: tuple[ModelConfig, ...]
     serve_profiles: tuple[ServeProfile, ...]
     bench_profiles: tuple[BenchProfile, ...]
+    topology_profiles: tuple[TopologyProfile, ...] = ()
 
 
 @dataclass(frozen=True)
 class BenchmarkCase:
     model: ModelConfig
-    serve_profile: ServeProfile
     bench_profile: BenchProfile
     run_id: str
-    container_name: str
     api_model_name: str
+    serve_profile: ServeProfile | None = None
+    topology_profile: TopologyProfile | None = None
+    container_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.serve_profile is None) == (self.topology_profile is None):
+            raise ConfigError(
+                "BenchmarkCase requires exactly one of serve_profile or topology_profile"
+            )
+
+    @property
+    def serving_name(self) -> str:
+        if self.serve_profile is not None:
+            return self.serve_profile.name
+        if self.topology_profile is not None:
+            return self.topology_profile.name
+        raise ConfigError("BenchmarkCase is missing serving profile information")
 
 
 @dataclass(frozen=True)
@@ -526,6 +543,8 @@ def _parse_models(data: dict[str, Any], mounts: MountConfig) -> tuple[ModelConfi
 
 def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
     raw_profiles = data.get("serve_profiles")
+    if raw_profiles is None:
+        return ()
     if not isinstance(raw_profiles, list) or not raw_profiles:
         raise ConfigError("serve_profiles must be a non-empty list")
 
@@ -554,6 +573,15 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
             ),
         ))
     return tuple(parsed)
+
+
+def _parse_topology_profiles(data: dict[str, Any]) -> tuple[TopologyProfile, ...]:
+    return parse_topology_profiles(
+        data,
+        error=ConfigError,
+        safe_name=_safe_name,
+        supported_engines=SUPPORTED_ENGINES,
+    )
 
 
 def _validate_serve_args(args: Sequence[str], path: str) -> None:
@@ -704,8 +732,18 @@ def load_config(path: str | Path) -> AutoBenchConfig:
     mounts = _parse_mounts(config_data, config_path.parent)
     models = _parse_models(config_data, mounts)
     serve_profiles = _parse_serve_profiles(config_data)
+    topology_profiles = _parse_topology_profiles(config_data)
+    if not serve_profiles and not topology_profiles:
+        raise ConfigError("serve_profiles or topology_profiles must be configured")
     bench_profiles = _parse_bench_profiles(config_data)
-    config = AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    config = AutoBenchConfig(
+        run,
+        mounts,
+        models,
+        serve_profiles,
+        bench_profiles,
+        topology_profiles,
+    )
     _validate_asr_dataset_mounts(config)
     _validate_images_cover_engines(config)
     return config
@@ -755,7 +793,7 @@ def make_container_name(model: ModelConfig, serve_profile: ServeProfile, run_id:
 
 def make_bench_container_name(case: BenchmarkCase) -> str:
     return (
-        f"bench-runner-{case.model.name}-{case.serve_profile.name}-"
+        f"bench-runner-{case.model.name}-{case.serving_name}-"
         f"{case.bench_profile.name}-{_safe_name(case.run_id, 'run_id')}"
     )
 
@@ -798,13 +836,21 @@ def default_vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str:
 
 
 def vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
-    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+    if (
+        case.serve_profile is None
+        or case.serve_profile.engine != "vllm"
+        or not config.run.vllm_cache.enabled
+    ):
         return None
     return case.serve_profile.cache_key or default_vllm_cache_key(config, case)
 
 
 def vllm_cache_key_source(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
-    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+    if (
+        case.serve_profile is None
+        or case.serve_profile.engine != "vllm"
+        or not config.run.vllm_cache.enabled
+    ):
         return None
     return "explicit" if case.serve_profile.cache_key else "default"
 
@@ -873,11 +919,21 @@ def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[Be
             for bench_profile in config.bench_profiles:
                 cases.append(BenchmarkCase(
                     model=model,
-                    serve_profile=serve_profile,
                     bench_profile=bench_profile,
                     run_id=resolved_run_id,
-                    container_name=make_container_name(model, serve_profile, resolved_run_id),
                     api_model_name=model.served_model_name or model.name,
+                    serve_profile=serve_profile,
+                    container_name=make_container_name(model, serve_profile, resolved_run_id),
+                ))
+        for topology_profile in config.topology_profiles:
+            for bench_profile in config.bench_profiles:
+                cases.append(BenchmarkCase(
+                    model=model,
+                    bench_profile=bench_profile,
+                    run_id=resolved_run_id,
+                    api_model_name=model.served_model_name or model.name,
+                    topology_profile=topology_profile,
+                    container_name=None,
                 ))
     return tuple(cases)
 
@@ -1079,7 +1135,7 @@ def validate_local_paths(config: AutoBenchConfig) -> None:
 
 def build_layout(config: AutoBenchConfig, run_id: str, case: BenchmarkCase) -> CaseLayout:
     run_dir = config.run.results_dir / run_id
-    serve_dir = run_dir / case.model.name / case.serve_profile.name
+    serve_dir = run_dir / case.model.name / case.serving_name
     bench_dir = serve_dir / case.bench_profile.name
     return CaseLayout(run_dir=run_dir, serve_dir=serve_dir, bench_dir=bench_dir)
 
@@ -1128,7 +1184,7 @@ class Manifest:
                error: str | None = None) -> None:
         row: dict[str, Any] = {
             "model": case.model.name,
-            "serve_profile": case.serve_profile.name,
+            "serve_profile": case.serving_name,
             "bench_profile": case.bench_profile.name,
             "status": status,
             "csv": str((layout.bench_dir / "result.csv").relative_to(layout.run_dir)),
@@ -1974,13 +2030,18 @@ def _jsonable(value: Any) -> Any:
 
 
 def config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
-    return _jsonable(config)
+    payload = _jsonable(config)
+    if not config.serve_profiles:
+        payload.pop("serve_profiles", None)
+    if not config.topology_profiles:
+        payload.pop("topology_profiles", None)
+    return payload
 
 
 def _case_ref(case: BenchmarkCase) -> dict[str, str]:
     return {
         "model": case.model.name,
-        "serve_profile": case.serve_profile.name,
+        "serve_profile": case.serving_name,
         "bench_profile": case.bench_profile.name,
     }
 
@@ -2039,7 +2100,7 @@ def write_terminal_state(run_dir: Path, run_id: str, manifest: Manifest,
 
 
 def _case_key(case: BenchmarkCase) -> tuple[str, str, str]:
-    return (case.model.name, case.serve_profile.name, case.bench_profile.name)
+    return (case.model.name, case.serving_name, case.bench_profile.name)
 
 
 def _manifest_case_keys(manifest: Manifest) -> set[tuple[str, str, str]]:
@@ -2156,7 +2217,7 @@ def _record_interrupted_group(manifest: Manifest, run_dir: Path, run_id: str,
 def _group_cases_by_serve(cases: tuple[BenchmarkCase, ...]) -> dict[tuple[str, str], list[BenchmarkCase]]:
     grouped: dict[tuple[str, str], list[BenchmarkCase]] = {}
     for case in cases:
-        grouped.setdefault((case.model.name, case.serve_profile.name), []).append(case)
+        grouped.setdefault((case.model.name, case.serving_name), []).append(case)
     return grouped
 
 
