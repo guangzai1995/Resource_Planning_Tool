@@ -6,14 +6,14 @@ import shlex
 import shutil
 import subprocess
 from collections.abc import Collection, Sequence
+from typing import Any
 
-from auto_bench import Completed, ConfigError
 from remote_topology import RemoteHost
 
 
 _REDACTED = "***"
 _SENSITIVE_VALUE_FLAGS = {"--password", "--api-key"}
-_SENSITIVE_ENV_TOKENS = ("PASSWORD", "SECRET", "TOKEN")
+_SENSITIVE_ENV_TOKENS = ("API_KEY", "PASSWORD", "SECRET", "TOKEN")
 
 
 def build_ssh_base_command(
@@ -33,13 +33,13 @@ def build_ssh_base_command(
         password = _resolve_password(host)
         resolved_sshpass = sshpass_path or shutil.which("sshpass")
         if resolved_sshpass is None:
-            raise ConfigError("password SSH auth requires sshpass in PATH")
+            raise _config_error("password SSH auth requires sshpass in PATH")
         return (
             [resolved_sshpass, "-e", "ssh", "-o", "BatchMode=no", target],
             {"SSHPASS": password},
         )
 
-    raise ConfigError(f"unsupported SSH auth type: {auth.type}")
+    raise _config_error(f"unsupported SSH auth type: {auth.type}")
 
 
 def mask_command(
@@ -80,34 +80,54 @@ class RemoteDockerRunner:
         command: list[str],
         *,
         check: bool = False,
-    ) -> Completed:
+        capture: bool = True,
+        text: bool = True,
+        stdout: Any = None,
+        stderr: Any = None,
+    ) -> "Completed":
         ssh_command, auth_env = build_ssh_base_command(
             host,
             sshpass_path=self.sshpass_path,
         )
-        args = [*ssh_command, shlex.join(command)]
+        args = [*ssh_command, "sh", "-s"]
+        script = f"exec {shlex.join(command)}\n"
+        input_data: str | bytes = script if text else script.encode()
         run_env = os.environ.copy()
         run_env.update(auth_env)
+        capture_output = capture if stdout is None and stderr is None else False
         completed = subprocess.run(
             args,
-            capture_output=True,
-            text=True,
+            check=False,
+            capture_output=capture_output,
+            text=text,
+            input=input_data,
             env=run_env,
+            stdout=stdout,
+            stderr=stderr,
         )
-        result = Completed(
-            args=args,
+        secrets = (*_auth_secrets(host), *_command_secrets(command))
+        result = _completed(
+            args=mask_command(args, secrets),
             returncode=completed.returncode,
             stdout=completed.stdout or "",
             stderr=completed.stderr or "",
         )
         if check and result.returncode != 0:
-            secrets = _auth_secrets(host)
-            masked_args = [*ssh_command, shlex.join(mask_command(command, secrets))]
-            raise RuntimeError(
+            ssh_display = shlex.join(mask_command(result.args, secrets))
+            remote_display = " ".join(mask_command(command, secrets))
+            stdout_text = _redact_text(result.stdout, secrets)
+            stderr_text = _redact_text(result.stderr, secrets)
+            details = [
                 "remote command failed "
                 f"({result.returncode}) on {host.name}: "
-                f"{shlex.join(mask_command(masked_args, secrets))}\n"
-                f"{_redact_text(result.stderr, secrets)}"
+                f"{ssh_display} << {remote_display}"
+            ]
+            if stdout_text:
+                details.append(stdout_text)
+            if stderr_text:
+                details.append(stderr_text)
+            raise RuntimeError(
+                "\n".join(details)
             )
         return result
 
@@ -145,15 +165,15 @@ def _resolve_password(host: RemoteHost) -> str:
     auth = host.auth
     if auth.type == "password_env":
         if auth.env is None:
-            raise ConfigError("password_env SSH auth requires auth.env")
+            raise _config_error("password_env SSH auth requires auth.env")
         if auth.env not in os.environ:
-            raise ConfigError(f"password SSH auth environment variable is not set: {auth.env}")
+            raise _config_error(f"password SSH auth environment variable is not set: {auth.env}")
         return os.environ[auth.env]
     if auth.type == "password":
         if auth.password is None:
-            raise ConfigError("password SSH auth requires auth.password")
+            raise _config_error("password SSH auth requires auth.password")
         return auth.password
-    raise ConfigError(f"unsupported SSH auth type: {auth.type}")
+    raise _config_error(f"unsupported SSH auth type: {auth.type}")
 
 
 def _auth_secrets(host: RemoteHost) -> tuple[str, ...]:
@@ -166,19 +186,74 @@ def _auth_secrets(host: RemoteHost) -> tuple[str, ...]:
     return tuple(secrets)
 
 
+def _command_secrets(command: Sequence[str]) -> tuple[str, ...]:
+    secrets: list[str] = []
+    redact_next = False
+    for arg in command:
+        if redact_next:
+            if arg:
+                secrets.append(arg)
+            redact_next = False
+            continue
+        if arg in _SENSITIVE_VALUE_FLAGS:
+            redact_next = True
+            continue
+        if any(arg.startswith(f"{flag}=") for flag in _SENSITIVE_VALUE_FLAGS):
+            _flag, _separator, value = arg.partition("=")
+            if value:
+                secrets.append(value)
+            continue
+        key, separator, value = arg.partition("=")
+        if separator and value and _is_sensitive_env_key(key):
+            secrets.append(value)
+    return tuple(secrets)
+
+
 def _mask_env_assignment(arg: str) -> str:
     key, separator, value = arg.partition("=")
     if not separator:
         return arg
-    upper_key = key.upper()
-    if any(token in upper_key for token in _SENSITIVE_ENV_TOKENS):
+    if _is_sensitive_env_key(key):
         return f"{key}={_REDACTED}"
     return f"{key}={value}"
 
 
-def _redact_text(text: str, secrets: Collection[str]) -> str:
-    redacted = text
+def _is_sensitive_env_key(key: str) -> bool:
+    upper_key = key.upper()
+    return any(token in upper_key for token in _SENSITIVE_ENV_TOKENS)
+
+
+def _redact_text(value: Any, secrets: Collection[str]) -> str:
+    if value is None:
+        redacted = ""
+    elif isinstance(value, bytes):
+        redacted = value.decode(errors="replace")
+    else:
+        redacted = str(value)
     for secret in secrets:
         if secret:
             redacted = redacted.replace(secret, _REDACTED)
     return redacted
+
+
+def _completed(
+    *,
+    args: list[str],
+    returncode: int,
+    stdout: Any = "",
+    stderr: Any = "",
+) -> "Completed":
+    from auto_bench import Completed
+
+    return Completed(
+        args=args,
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def _config_error(message: str) -> Exception:
+    from auto_bench import ConfigError
+
+    return ConfigError(message)

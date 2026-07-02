@@ -1,12 +1,11 @@
 import json
-import shlex
 import shutil
 import subprocess
 
 import pytest
 
 from auto_bench import ConfigError
-from remote_docker import RemoteDockerRunner, build_ssh_base_command
+from remote_docker import RemoteDockerRunner, build_ssh_base_command, mask_command
 from remote_topology import RemoteAuth, RemoteHost
 
 
@@ -79,11 +78,12 @@ def test_remote_runner_runs_ssh_command_without_password_in_args(monkeypatch):
     monkeypatch.setenv("P1_PASSWORD", "secret-pass")
     captured = {}
 
-    def fake_run(args, *, capture_output, text, env):
+    def fake_run(args, **kwargs):
         captured["args"] = args
-        captured["env"] = env
-        captured["capture_output"] = capture_output
-        captured["text"] = text
+        captured["env"] = kwargs["env"]
+        captured["capture_output"] = kwargs["capture_output"]
+        captured["input"] = kwargs.get("input")
+        captured["text"] = kwargs["text"]
         return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -100,17 +100,81 @@ def test_remote_runner_runs_ssh_command_without_password_in_args(monkeypatch):
     )
 
     assert result.returncode == 0
-    assert captured["args"][-1] == shlex.join(["docker", "ps"])
+    assert captured["input"] == "exec docker ps\n"
+    assert captured["args"][-2:] == ["sh", "-s"]
     assert "secret-pass" not in " ".join(captured["args"])
     assert captured["env"]["SSHPASS"] == "secret-pass"
     assert captured["capture_output"] is True
     assert captured["text"] is True
 
 
+def test_remote_runner_does_not_put_api_key_in_process_args_or_completed_args(monkeypatch):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["input"] = kwargs.get("input")
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    host = RemoteHost("p1", "10.0.0.11", "root", RemoteAuth("key"))
+
+    result = RemoteDockerRunner().run(
+        host,
+        ["python", "serve.py", "--api-key", "api-secret"],
+    )
+
+    assert "api-secret" not in " ".join(captured["args"])
+    assert "api-secret" not in " ".join(result.args)
+    assert "api-secret" in captured["input"]
+    assert captured["args"][-2:] == ["sh", "-s"]
+
+
+def test_mask_command_redacts_flags_and_sensitive_env_assignments():
+    masked = mask_command([
+        "python",
+        "serve.py",
+        "--api-key",
+        "api-secret",
+        "--api-key=equal-api-secret",
+        "--password",
+        "password-secret",
+        "--password=inline-secret",
+        "OPENAI_API_KEY=env-secret",
+        "PASSWORD=password-secret",
+        "TOKEN=token-secret",
+        "SECRET=secret-secret",
+    ])
+
+    rendered = " ".join(masked)
+    assert "api-secret" not in rendered
+    assert "equal-api-secret" not in rendered
+    assert "password-secret" not in rendered
+    assert "inline-secret" not in rendered
+    assert "env-secret" not in rendered
+    assert "token-secret" not in rendered
+    assert "secret-secret" not in rendered
+    assert masked == [
+        "python",
+        "serve.py",
+        "--api-key",
+        "***",
+        "--api-key=***",
+        "--password",
+        "***",
+        "--password=***",
+        "OPENAI_API_KEY=***",
+        "PASSWORD=***",
+        "TOKEN=***",
+        "SECRET=***",
+    ]
+
+
 def test_remote_runner_check_failure_masks_password(monkeypatch):
     monkeypatch.setenv("P1_PASSWORD", "secret-pass")
 
-    def fake_run(args, *, capture_output, text, env):
+    def fake_run(args, **kwargs):
         return subprocess.CompletedProcess(args, 1, stdout="", stderr="failed")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -131,10 +195,78 @@ def test_remote_runner_check_failure_masks_password(monkeypatch):
     assert "secret-pass" not in str(exc_info.value)
 
 
+def test_remote_runner_check_failure_redacts_command_secret_from_error(monkeypatch):
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args,
+            1,
+            stdout="api-secret stdout",
+            stderr="api-secret failed",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    host = RemoteHost("p1", "10.0.0.11", "root", RemoteAuth("key"))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        RemoteDockerRunner().run(
+            host,
+            ["python", "serve.py", "--api-key", "api-secret"],
+            check=True,
+        )
+
+    message = str(exc_info.value)
+    assert "api-secret" not in message
+    assert "--api-key ***" in message
+
+
+def test_remote_runner_supports_stdout_stderr_streams(monkeypatch):
+    captured = {}
+    stdout_stream = object()
+    stderr_stream = object()
+
+    def fake_run(args, **kwargs):
+        captured["capture_output"] = kwargs["capture_output"]
+        captured["stdout"] = kwargs["stdout"]
+        captured["stderr"] = kwargs["stderr"]
+        return subprocess.CompletedProcess(args, 0, stdout=None, stderr=None)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    host = RemoteHost("p1", "10.0.0.11", "root", RemoteAuth("key"))
+
+    RemoteDockerRunner().run(
+        host,
+        ["docker", "ps"],
+        stdout=stdout_stream,
+        stderr=stderr_stream,
+    )
+
+    assert captured["capture_output"] is False
+    assert captured["stdout"] is stdout_stream
+    assert captured["stderr"] is stderr_stream
+
+
+def test_remote_runner_uses_bytes_input_when_text_false(monkeypatch):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["input"] = kwargs["input"]
+        captured["text"] = kwargs["text"]
+        return subprocess.CompletedProcess(args, 0, stdout=b"ok", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    host = RemoteHost("p1", "10.0.0.11", "root", RemoteAuth("key"))
+
+    result = RemoteDockerRunner().run(host, ["docker", "ps"], text=False)
+
+    assert captured["input"] == b"exec docker ps\n"
+    assert captured["text"] is False
+    assert result.stdout == b"ok"
+
+
 def test_inspect_labels_parses_remote_docker_labels(monkeypatch):
     labels = {"bench.role": "prefill", "bench.run_id": "run123"}
 
-    def fake_run(args, *, capture_output, text, env):
+    def fake_run(args, **kwargs):
         return subprocess.CompletedProcess(
             args,
             0,
@@ -146,3 +278,27 @@ def test_inspect_labels_parses_remote_docker_labels(monkeypatch):
     host = RemoteHost("p1", "10.0.0.11", "root", RemoteAuth("key"))
 
     assert RemoteDockerRunner().inspect_labels(host, "bench-p1") == labels
+
+
+def test_inspect_labels_nonzero_returns_none(monkeypatch):
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="missing")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    host = RemoteHost("p1", "10.0.0.11", "root", RemoteAuth("key"))
+
+    assert RemoteDockerRunner().inspect_labels(host, "bench-p1") is None
+
+
+@pytest.mark.parametrize("payload", ["not json", "null", "[]", '"label"'])
+def test_inspect_labels_invalid_or_non_dict_payload_returns_empty_dict(
+    monkeypatch,
+    payload,
+):
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    host = RemoteHost("p1", "10.0.0.11", "root", RemoteAuth("key"))
+
+    assert RemoteDockerRunner().inspect_labels(host, "bench-p1") == {}
