@@ -1817,6 +1817,8 @@ def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
                         case: BenchmarkCase, layout: CaseLayout) -> None:
     require_legacy_case(case)
     container_name = case.container_name
+    serve_command = build_serve_run_command(config, case, layout.run_dir)
+    secrets_to_redact = _legacy_secret_values(config, serve_command)
     layout.serve_dir.mkdir(parents=True, exist_ok=True)
     logs = runner.run(["docker", "logs", "--timestamps", container_name], check=False)
     (layout.serve_dir / "vllm.log").write_text(
@@ -1824,13 +1826,12 @@ def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
         encoding="utf-8",
     )
     inspect = runner.run(["docker", "inspect", container_name], check=False)
-    (layout.serve_dir / "docker.inspect.json").write_text(inspect.stdout, encoding="utf-8")
+    (layout.serve_dir / "docker.inspect.json").write_text(
+        redact_inspect_stdout(inspect.stdout, secrets_to_redact),
+        encoding="utf-8",
+    )
     (layout.serve_dir / "serve_command.txt").write_text(
-        shlex.join(
-            mask_command_for_display(
-                build_serve_run_command(config, case, layout.run_dir)
-            )
-        ) + "\n",
+        shlex.join(mask_command_for_display(serve_command)) + "\n",
         encoding="utf-8",
     )
 
@@ -1954,6 +1955,15 @@ def _secret_values_from_masked_args(argv: Sequence[str]) -> set[str]:
     return secrets_to_redact
 
 
+def _legacy_secret_values(config: AutoBenchConfig,
+                          serve_command: Sequence[str]) -> set[str]:
+    secrets_to_redact: set[str] = set()
+    if config.run.api_key:
+        secrets_to_redact.add(config.run.api_key)
+    secrets_to_redact.update(_secret_values_from_masked_args(serve_command))
+    return {value for value in secrets_to_redact if value}
+
+
 def _topology_secret_values(config: AutoBenchConfig,
                             case: BenchmarkCase,
                             role_commands: Mapping[str, RoleCommand]) -> set[str]:
@@ -2012,14 +2022,18 @@ def _redact_inspect_value(value: Any, secrets_to_redact: set[str],
     return value
 
 
-def redact_topology_inspect_stdout(stdout: str,
-                                   secrets_to_redact: set[str]) -> str:
+def redact_inspect_stdout(stdout: str, secrets_to_redact: set[str]) -> str:
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError:
         return _redact_known_secrets(stdout, secrets_to_redact)
     redacted = _redact_inspect_value(payload, secrets_to_redact)
     return json.dumps(redacted, ensure_ascii=True, indent=2) + "\n"
+
+
+def redact_topology_inspect_stdout(stdout: str,
+                                   secrets_to_redact: set[str]) -> str:
+    return redact_inspect_stdout(stdout, secrets_to_redact)
 
 
 def save_topology_artifacts(config: AutoBenchConfig,

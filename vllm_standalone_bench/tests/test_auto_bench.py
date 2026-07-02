@@ -567,6 +567,71 @@ def test_save_vllm_artifacts_masks_api_key_in_serve_command(tmp_path):
     assert "***" in serve_command
 
 
+def test_save_vllm_artifacts_redacts_secrets_in_docker_inspect(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["api_key"] = "legacy-api-secret"
+    data["serve_profiles"][0]["args"] = [
+        "--dtype",
+        "bfloat16",
+        "--db-password",
+        "db-secret",
+        "--service-token=token-secret",
+    ]
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+
+    class InspectSecretRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True,
+                stdout=None, stderr=None):
+            if args[:2] == ["docker", "inspect"]:
+                payload = [{
+                    "Config": {
+                        "Cmd": [
+                            "vllm",
+                            "serve",
+                            "--api-key",
+                            "legacy-api-secret",
+                            "--db-password",
+                            "db-secret",
+                            "--service-token=token-secret",
+                            "--visible-flag",
+                            "ordinary-value",
+                        ],
+                        "Args": ["--service-token=token-secret"],
+                    },
+                    "Plain": "ordinary-value",
+                    "Raw": "legacy-api-secret db-secret token-secret",
+                }]
+                return ab.Completed(list(args), 0, json.dumps(payload), "")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    ab.save_vllm_artifacts(config, InspectSecretRunner(), case, layout)
+
+    inspect_text = (layout.serve_dir / "docker.inspect.json").read_text(
+        encoding="utf-8"
+    )
+    serve_command = (layout.serve_dir / "serve_command.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "legacy-api-secret" not in inspect_text
+    assert "db-secret" not in inspect_text
+    assert "token-secret" not in inspect_text
+    assert "***" in inspect_text
+    assert "ordinary-value" in inspect_text
+    assert "legacy-api-secret" not in serve_command
+    assert "db-secret" not in serve_command
+    assert "token-secret" not in serve_command
+    assert "***" in serve_command
+
+
 def test_build_vllm_command_includes_ownership_labels(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     case = ab.expand_cases(config, run_id="run123")[0]
