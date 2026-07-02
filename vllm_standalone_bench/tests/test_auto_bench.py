@@ -581,6 +581,7 @@ def test_plan_resume_cases_keeps_passed_and_selects_pending(tmp_path):
                 "status": "passed",
                 "csv": str((first_layout.bench_dir / "result.csv").relative_to(first_layout.run_dir)),
                 "xlsx": str((first_layout.bench_dir / "result.xlsx").relative_to(first_layout.run_dir)),
+                "extra": {"source": "old"},
             },
             {
                 "model": cases[1].model.name,
@@ -602,6 +603,7 @@ def test_plan_resume_cases_keeps_passed_and_selects_pending(tmp_path):
     assert unknown == []
     assert [row["bench_profile"] for row in initial_manifest.cases] == ["smoke"]
     assert initial_manifest.cases[0]["status"] == "passed"
+    assert initial_manifest.cases[0]["extra"] == {"source": "old"}
     assert [case.bench_profile.name for case in pending] == ["smoke2"]
     assert initial_manifest.total == 2
 
@@ -645,6 +647,35 @@ def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
     assert unknown == []
     assert initial_manifest.cases == []
     assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2", "smoke3"]
+
+
+@pytest.mark.parametrize(("manifest_data", "match"), [
+    ({"run_id": "run123", "cases": "bad"}, "manifest cases must be a list"),
+    ({"run_id": "run123", "cases": ["bad"]}, "manifest cases must contain objects"),
+    (
+        {
+            "run_id": "run123",
+            "cases": [{
+                "model": "qwen2_5_1_5b",
+                "serve_profile": "bf16_default",
+                "bench_profile": None,
+                "status": "passed",
+            }],
+        },
+        "manifest case row is missing model/serve_profile/bench_profile",
+    ),
+    ({"run_id": "other", "cases": []}, "manifest run_id mismatch"),
+])
+def test_plan_resume_cases_rejects_invalid_manifest(tmp_path, manifest_data, match):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+
+    with pytest.raises(ab.ConfigError, match=match):
+        ab.plan_resume_cases(
+            run_id="run123",
+            cases=cases,
+            manifest_data=manifest_data,
+        )
 
 
 def test_plan_resume_cases_reports_manifest_rows_not_in_config(tmp_path):

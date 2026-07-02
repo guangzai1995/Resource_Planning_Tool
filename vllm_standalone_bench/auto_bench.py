@@ -1943,8 +1943,9 @@ def _manifest_row_key(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
 def _copy_manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
     copied: dict[str, Any] = {}
     for key, value in row.items():
-        if isinstance(key, str) and isinstance(value, (str, int, float, bool, type(None))):
-            copied[key] = value
+        if not isinstance(key, str):
+            raise ConfigError("manifest case row keys must be strings")
+        copied[key] = value
     return copied
 
 
