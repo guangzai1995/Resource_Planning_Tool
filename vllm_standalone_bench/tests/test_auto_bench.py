@@ -208,7 +208,17 @@ def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, c
         "type": "password",
         "password": "secret-p1-password",
     }
+    topology["hosts"]["p2"]["auth"]["key_path"] = "/home/bench/.ssh/id_ed25519"
     topology["frontend"]["args"] = ["--api-key", "router-secret"]
+    topology["env"] = {
+        "OPENAI_API_KEY": "profile-openai-secret",
+        "DB_PASSWORD": "profile-db-password",
+        "VISIBLE_ENV": "profile-visible",
+    }
+    topology["prefill"][0]["env"] = {
+        "SERVICE_TOKEN": "node-service-token",
+        "VISIBLE_NODE_ENV": "node-visible",
+    }
     config = ab.load_config(write_config(tmp_path, data))
 
     result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
@@ -233,11 +243,25 @@ def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, c
     assert "secret-p1-password" not in rendered_resolved
     assert "router-secret" not in rendered_resolved
     assert "local-bench-key" not in rendered_resolved
+    assert "profile-openai-secret" not in rendered_resolved
+    assert "profile-db-password" not in rendered_resolved
+    assert "node-service-token" not in rendered_resolved
     assert resolved["run"]["api_key"] == "***"
     assert resolved["topology_profiles"][0]["frontend"]["args"] == [
         "--api-key",
         "***",
     ]
+    assert resolved["topology_profiles"][0]["env"]["OPENAI_API_KEY"] == "***"
+    assert resolved["topology_profiles"][0]["env"]["DB_PASSWORD"] == "***"
+    assert resolved["topology_profiles"][0]["env"]["VISIBLE_ENV"] == "profile-visible"
+    assert (
+        resolved["topology_profiles"][0]["hosts"]["p2"]["auth"]["key_path"]
+        == "/home/bench/.ssh/id_ed25519"
+    )
+    assert resolved["topology_profiles"][0]["prefill"][0]["env"] == {
+        "SERVICE_TOKEN": "***",
+        "VISIBLE_NODE_ENV": "node-visible",
+    }
     assert (
         resolved["topology_profiles"][0]["hosts"]["p1"]["auth"].get("password")
         == "***"

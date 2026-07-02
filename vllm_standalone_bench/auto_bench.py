@@ -2103,11 +2103,18 @@ def config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
     return payload
 
 
+def _is_sensitive_dry_run_key(key: object) -> bool:
+    normalized = str(key).lower()
+    if normalized == "api_key" or normalized.endswith("_api_key"):
+        return True
+    return any(token in normalized for token in ("password", "token", "secret"))
+
+
 def _mask_dry_run_resolved_value(value: Any) -> Any:
     if isinstance(value, dict):
         masked: dict[str, Any] = {}
         for key, item in value.items():
-            if key == "api_key" and item is not None:
+            if _is_sensitive_dry_run_key(key) and item is not None:
                 masked[key] = "***"
             else:
                 masked[key] = _mask_dry_run_resolved_value(item)
