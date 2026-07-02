@@ -9,6 +9,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -20,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
-from remote_docker import RemoteDockerRunner
+from remote_docker import RemoteDockerRunner, mask_command
 from remote_topology import RemoteAuth, RoleCommand, TopologyProfile, parse_topology_profiles
 from resource_monitor import ResourceMonitor, append_summary_to_result_files
 
@@ -1669,7 +1670,8 @@ def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
 
 def _run_bench_case(config: AutoBenchConfig, runner: Runner,
                     case: BenchmarkCase, layout: CaseLayout,
-                    dry_run: bool) -> tuple[str, str | None]:
+                    dry_run: bool,
+                    monitor_resources: bool = True) -> tuple[str, str | None]:
     bench_cmd = build_bench_run_command(config, case, layout.bench_dir)
     if dry_run:
         print_cmd(bench_cmd)
@@ -1694,6 +1696,7 @@ def _run_bench_case(config: AutoBenchConfig, runner: Runner,
             backend=config.run.resource_monitor.backend,
         )
         if config.run.resource_monitor.enabled
+        and monitor_resources
         else None
     )
     try:
@@ -1883,6 +1886,90 @@ def _topology_resolved_dict(config: AutoBenchConfig,
     return {"topology_profiles": selected}
 
 
+def _secret_values_from_masked_args(argv: Sequence[str]) -> set[str]:
+    secrets_to_redact: set[str] = set()
+    masked = mask_command(argv)
+    for original, display in zip(argv, masked):
+        if original == display or "***" not in display:
+            continue
+        if display == "***":
+            secrets_to_redact.add(original)
+            continue
+        if display.endswith("=***") and "=" in original:
+            _key, _separator, value = original.partition("=")
+            if value:
+                secrets_to_redact.add(value)
+    return secrets_to_redact
+
+
+def _topology_secret_values(config: AutoBenchConfig,
+                            case: BenchmarkCase,
+                            role_commands: Mapping[str, RoleCommand]) -> set[str]:
+    topology = require_topology_case(case)
+    secrets_to_redact: set[str] = set()
+    if config.run.api_key:
+        secrets_to_redact.add(config.run.api_key)
+    for host in topology.hosts.values():
+        auth = host.auth
+        if auth.password:
+            secrets_to_redact.add(auth.password)
+        if auth.env and auth.env in os.environ:
+            secrets_to_redact.add(os.environ[auth.env])
+    for key, value in topology.env.items():
+        if _is_sensitive_dry_run_key(key) and value:
+            secrets_to_redact.add(str(value))
+    for node in (*topology.prefill, *topology.decode):
+        for key, value in node.env.items():
+            if _is_sensitive_dry_run_key(key) and value:
+                secrets_to_redact.add(str(value))
+    for role_command in role_commands.values():
+        secrets_to_redact.update(_secret_values_from_masked_args(role_command.argv))
+    return {value for value in secrets_to_redact if value}
+
+
+def _redact_known_secrets(value: str, secrets_to_redact: set[str]) -> str:
+    redacted = value
+    for secret_value in sorted(secrets_to_redact, key=len, reverse=True):
+        if secret_value:
+            redacted = redacted.replace(secret_value, "***")
+    return redacted
+
+
+def _redact_inspect_value(value: Any, secrets_to_redact: set[str],
+                          key: str | None = None) -> Any:
+    if key is not None and _is_sensitive_dry_run_key(key) and value is not None:
+        return "***"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _redact_inspect_value(
+                item,
+                secrets_to_redact,
+                str(item_key),
+            )
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            return mask_command(value, secrets_to_redact)
+        return [
+            _redact_inspect_value(item, secrets_to_redact)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return _redact_known_secrets(value, secrets_to_redact)
+    return value
+
+
+def redact_topology_inspect_stdout(stdout: str,
+                                   secrets_to_redact: set[str]) -> str:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return _redact_known_secrets(stdout, secrets_to_redact)
+    redacted = _redact_inspect_value(payload, secrets_to_redact)
+    return json.dumps(redacted, ensure_ascii=True, indent=2) + "\n"
+
+
 def save_topology_artifacts(config: AutoBenchConfig,
                             remote_runner: RemoteDockerRunner,
                             case: BenchmarkCase,
@@ -1900,9 +1987,10 @@ def save_topology_artifacts(config: AutoBenchConfig,
         layout.bench_dir / "topology.resolved.json",
         _topology_resolved_dict(config, case),
     )
+    secrets_to_redact = _topology_secret_values(config, case, role_commands)
     for role_command in _role_start_order(case, role_commands):
         (command_dir / f"{role_command.role_name}.txt").write_text(
-            " ".join(role_command.masked_argv) + "\n",
+            shlex.join(role_command.masked_argv) + "\n",
             encoding="utf-8",
         )
     for role_command in started_roles:
@@ -1922,7 +2010,7 @@ def save_topology_artifacts(config: AutoBenchConfig,
             check=False,
         )
         (inspect_dir / f"{role_command.role_name}.json").write_text(
-            inspect.stdout,
+            redact_topology_inspect_stdout(inspect.stdout, secrets_to_redact),
             encoding="utf-8",
         )
 
@@ -2693,6 +2781,7 @@ def run_topology_group(config: AutoBenchConfig, run_id: str,
                 case,
                 layout,
                 dry_run=False,
+                monitor_resources=False,
             )
             if status != "passed":
                 group_exit_code = 1

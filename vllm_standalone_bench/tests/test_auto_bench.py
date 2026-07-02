@@ -1390,6 +1390,84 @@ class FakeRemoteDockerRunner:
         return json.loads(result.stdout.strip() or "{}")
 
 
+class InspectSecretRemoteRunner(FakeRemoteDockerRunner):
+    def run(self, host, command, *, check=False, capture=True, text=True,
+            stdout=None, stderr=None):
+        if command[:2] == ["docker", "inspect"] and command[:3] != [
+            "docker",
+            "inspect",
+            "--format",
+        ]:
+            self.commands.append((host.name, list(command)))
+            payload = [{
+                "Config": {
+                    "Env": [
+                        "OPENAI_API_KEY=remote-env-secret",
+                        "DB_PASSWORD=remote-db-secret",
+                        "VISIBLE=value",
+                    ],
+                    "Cmd": [
+                        "python",
+                        "-m",
+                        "server",
+                        "--api-key",
+                        "router-secret",
+                    ],
+                    "Args": [
+                        "--password",
+                        "arg-password",
+                    ],
+                },
+                "Args": ["--token", "arg-token"],
+                "Raw": "remote-env-secret router-secret arg-password arg-token",
+            }]
+            return ab.Completed(list(command), 0, json.dumps(payload), "")
+        return super().run(
+            host,
+            command,
+            check=check,
+            capture=capture,
+            text=text,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+class ArtifactFailingRemoteRunner(FakeRemoteDockerRunner):
+    def run(self, host, command, *, check=False, capture=True, text=True,
+            stdout=None, stderr=None):
+        if command[:2] == ["docker", "logs"]:
+            self.commands.append((host.name, list(command)))
+            raise RuntimeError("logs unavailable")
+        return super().run(
+            host,
+            command,
+            check=check,
+            capture=capture,
+            text=text,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+class ForeignLabelRemoteRunner(FakeRemoteDockerRunner):
+    def inspect_labels(self, host, container_name):
+        self.commands.append((
+            host.name,
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .Config.Labels}}",
+                container_name,
+            ],
+        ))
+        return {
+            "vllm_auto_bench.managed": "true",
+            "vllm_auto_bench.run_id": "foreign-run",
+        }
+
+
 class FakeResourceMonitor:
     instances = []
 
@@ -1469,6 +1547,14 @@ def network_create_command(commands):
     raise AssertionError("docker network create command not found")
 
 
+def topology_config_with_image(tmp_path):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["image"] = "sglang:pd"
+    return ab.load_config(write_config(tmp_path, data))
+
+
 def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatch):
     from test_remote_topology import pd_topology_config, write_config
 
@@ -1481,8 +1567,14 @@ def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatc
     config = ab.load_config(write_config(tmp_path, data))
     remote = FakeRemoteDockerRunner()
     local = FakeRunner()
+    ready_roles = []
     monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
-    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(
+        ab,
+        "wait_for_remote_ready",
+        lambda _config, _case, role_name: ready_roles.append(role_name) or True,
+        raising=False,
+    )
 
     result = ab.run_controller(config, run_id="run123", runner=local)
 
@@ -1499,6 +1591,7 @@ def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatc
         "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-d2",
         "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-router",
     ]
+    assert ready_roles == ["p1", "p2", "d1", "d2", "router"]
     assert len(bench_run_commands(local.commands)) == 1
     assert any(
         cmd[1][:2] == ["docker", "stop"] and "router" in cmd[1][2]
@@ -1521,6 +1614,110 @@ def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatc
     assert "inline-secret" not in topology_text
     resolved = json.loads(topology_text)
     assert resolved["topology_profiles"][0]["hosts"]["p1"]["auth"]["password"] == "***"
+
+
+def test_topology_run_does_not_start_local_resource_monitor(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    assert FakeResourceMonitor.instances == []
+
+
+def test_wait_for_remote_ready_uses_api_key_only_for_router(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    case = ab.expand_cases(config, run_id="run123")[0]
+    probes = []
+
+    def fake_wait_for_ready(url, api_key, timeout_sec):
+        probes.append((url, api_key, timeout_sec))
+        return True
+
+    monkeypatch.setattr(ab, "wait_for_ready", fake_wait_for_ready)
+
+    assert ab.wait_for_remote_ready(config, case, "p1") is True
+    assert ab.wait_for_remote_ready(config, case, "router") is True
+
+    assert probes == [
+        ("http://10.0.0.11:30000/v1", None, 30),
+        ("http://10.0.0.31:8000/v1", "local-bench-key", 30),
+    ]
+
+
+def test_topology_inspect_artifact_redacts_secrets(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["env"] = {
+        "OPENAI_API_KEY": "remote-env-secret",
+        "DB_PASSWORD": "remote-db-secret",
+    }
+    topology["frontend"]["args"] = ["--api-key", "router-secret"]
+    topology["prefill"][0]["args"] = ["--password", "arg-password"]
+    topology["decode"][0]["args"] = ["--token", "arg-token"]
+    config = ab.load_config(write_config(tmp_path, data))
+    remote = InspectSecretRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    inspect_text = (layout.bench_dir / "inspect" / "router.json").read_text(
+        encoding="utf-8"
+    )
+    assert "remote-env-secret" not in inspect_text
+    assert "remote-db-secret" not in inspect_text
+    assert "router-secret" not in inspect_text
+    assert "arg-password" not in inspect_text
+    assert "arg-token" not in inspect_text
+    assert "***" in inspect_text
+
+
+def test_topology_foreign_labels_skip_cleanup(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    remote = ForeignLabelRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    assert not any(cmd[1][:2] == ["docker", "stop"] for cmd in remote.commands)
+    assert not any(cmd[1][:3] == ["docker", "rm", "-f"] for cmd in remote.commands)
+
+
+def test_topology_artifact_failure_still_cleans_up_and_passes(tmp_path, monkeypatch):
+    config = topology_config_with_image(tmp_path)
+    remote = ArtifactFailingRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    assert any(cmd[1][:2] == ["docker", "stop"] for cmd in remote.commands)
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["cases"][0]["status"] == "passed"
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    assert "failed to save topology artifacts" in (
+        layout.bench_dir / "artifact.warning.txt"
+    ).read_text(encoding="utf-8")
 
 
 def test_topology_prefill_start_failure_cleans_started_roles(tmp_path, monkeypatch):
