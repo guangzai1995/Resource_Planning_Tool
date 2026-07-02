@@ -1,7 +1,10 @@
+import urllib.error
+
 from scripts.lib.clients import (
     build_request,
     classify_error,
     make_curl,
+    send_request,
 )
 from scripts.lib.config import load_config
 from scripts.lib.datasets import load_dataset
@@ -85,3 +88,26 @@ def test_classify_error_maps_common_status_codes():
     assert classify_error(status_code=404, exception=None) == "not_found"
     assert classify_error(status_code=422, exception=None) == "bad_request"
     assert classify_error(status_code=500, exception=None) == "http_5xx"
+
+
+def test_send_request_classifies_missing_multipart_file():
+    result = send_request(
+        "req-missing-file",
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:1/audio/transcriptions",
+            "multipart": {"model": "asr"},
+            "multipart_file": "does-not-exist.wav",
+        },
+        timeout_seconds=1,
+    )
+
+    assert result["success"] is False
+    assert result["status_code"] is None
+    assert result["error_type"] == "file_not_found"
+
+
+def test_classify_error_keeps_network_urlerror_separate_from_file_reads():
+    error = urllib.error.URLError(OSError("network unreachable"))
+
+    assert classify_error(status_code=None, exception=error) == "unknown_error"

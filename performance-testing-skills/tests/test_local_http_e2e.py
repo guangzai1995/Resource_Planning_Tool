@@ -12,7 +12,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.loads(body.decode("utf-8"))
         response = {
             "choices": [{"message": {"content": "ok"}}],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            "usage": {"input_tokens": 3, "output_tokens": 2},
             "echo": payload,
         }
         encoded = json.dumps(response).encode("utf-8")
@@ -50,9 +50,11 @@ def test_send_request_posts_json_to_local_server():
     finally:
         server.shutdown()
         thread.join(timeout=5)
+        server.server_close()
 
     assert result["success"] is True
     assert result["status_code"] == 200
+    assert result["input_tokens"] == 3
     assert result["output_tokens"] == 2
     assert result["latency_ms"] >= 0
 
@@ -71,6 +73,7 @@ def test_send_request_returns_failure_metadata_for_http_error():
     finally:
         server.shutdown()
         thread.join(timeout=5)
+        server.server_close()
 
     assert result["success"] is False
     assert result["status_code"] == 422

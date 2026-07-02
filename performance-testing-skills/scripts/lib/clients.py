@@ -151,6 +151,10 @@ def classify_error(status_code: int | None, exception: BaseException | None) -> 
             return "disconnect"
         if "connection reset" in message:
             return "connection_reset"
+        if isinstance(exception, FileNotFoundError):
+            return "file_not_found"
+        if isinstance(exception, OSError) and not isinstance(exception, urllib.error.URLError):
+            return "file_read_error"
 
     return "unknown_error"
 
@@ -185,7 +189,15 @@ def _extract_usage(payload: Any) -> tuple[int, int]:
         return 0, 0
 
     usage = payload["usage"]
-    return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+    input_tokens = usage.get("prompt_tokens")
+    if input_tokens is None:
+        input_tokens = usage.get("input_tokens")
+
+    output_tokens = usage.get("completion_tokens")
+    if output_tokens is None:
+        output_tokens = usage.get("output_tokens")
+
+    return int(input_tokens or 0), int(output_tokens or 0)
 
 
 def _encode_json_request(request: dict[str, Any], headers: dict[str, str]) -> bytes | None:
