@@ -215,7 +215,6 @@ class TopologyProfile:
             "-m",
             "sglang_router.launch_router",
             "--pd-disaggregation",
-            "repeated",
         ])
         for node in self.prefill:
             host = self.hosts[node.host]

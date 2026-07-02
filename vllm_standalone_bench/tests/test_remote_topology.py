@@ -99,6 +99,9 @@ def test_sglang_pd_commands_render_worker_and_router_flags(tmp_path):
     assert "sglang.launch_server" in p1
     assert value_after(p1, "--disaggregation-mode") == "prefill"
     assert value_after(p1, "--disaggregation-bootstrap-port") == "12335"
+    pd_flag_index = router.index("--pd-disaggregation")
+    assert router[pd_flag_index + 1] == "--prefill"
+    assert "repeated" not in router
     assert values_after(router, "--prefill") == [
         "http://10.0.0.11:30000",
         "http://10.0.0.12:30000",
