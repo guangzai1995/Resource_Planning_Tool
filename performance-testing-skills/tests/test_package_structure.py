@@ -1,4 +1,5 @@
 from pathlib import Path
+import stat
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,3 +56,65 @@ def test_automated_skill_prefers_package_script_usage():
         in text
     )
     assert "ad-hoc" in text
+
+
+def test_readme_documents_portable_package_usage():
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    lowered = text.lower()
+
+    assert "portable package" in lowered
+    assert "independent" in lowered
+    assert "does not depend on this repository" in lowered
+    assert "copy" in lowered
+    for directory in ["skills/", "configs/", "datasets/", "scripts/", "reports/", "tests/"]:
+        assert directory in text
+    for protocol in [
+        "openai_chat",
+        "openai_completion",
+        "openai_asr",
+        "generic_http",
+    ]:
+        assert protocol in text
+    for command in [
+        "./scripts/run_manual.sh --config configs/openai_chat.json --dry-run",
+        "./scripts/run_manual.sh --config configs/openai_chat.json --mode curl",
+        "./scripts/run_auto.sh --config configs/openai_chat.json --dry-run",
+        "./scripts/run_auto.sh --config configs/openai_chat.json --concurrency 1,2 --epochs 2",
+    ]:
+        assert command in text
+    for report_name in [
+        "summary.md",
+        "metrics.json",
+        "metrics.csv",
+        "requests.jsonl",
+        "errors.jsonl",
+    ]:
+        assert report_name in text
+    assert "100% request failure" in text
+
+
+def test_shell_wrappers_are_executable():
+    for script_name in ["scripts/run_manual.sh", "scripts/run_auto.sh"]:
+        mode = (ROOT / script_name).stat().st_mode
+        assert mode & stat.S_IXUSR, f"{script_name} is not executable by the owner"
+
+
+def test_manual_skill_documents_current_cli_modes():
+    text = (
+        ROOT / "skills/manual-interface-performance-testing/SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert "--mode smoke" not in text
+    assert "--mode curl" in text
+    assert "--dry-run" in text
+
+
+def test_automated_skill_documents_run_auto_and_failure_safety():
+    text = (
+        ROOT / "skills/automated-performance-testing/SKILL.md"
+    ).read_text(encoding="utf-8")
+    lowered = text.lower()
+
+    assert "run_auto.sh" in text
+    assert "fail-fast" in text
+    assert "100% request failure" in lowered
