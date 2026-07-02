@@ -1571,6 +1571,16 @@ class StopRequestedResourceMonitor(FakeResourceMonitor):
         raise ab.StopRequested("monitor background interrupted")
 
 
+class MiddleStopRequestedResourceMonitor(FakeResourceMonitor):
+    instances = []
+
+    def stop(self):
+        self.stopped = True
+        if self.output_dir.name == "p2":
+            raise ab.StopRequested("p2 monitor background interrupted")
+        return super().stop()
+
+
 class SecondStartInterruptingResourceMonitor(FakeResourceMonitor):
     instances = []
 
@@ -1578,6 +1588,21 @@ class SecondStartInterruptingResourceMonitor(FakeResourceMonitor):
         self.started = True
         if len(type(self).instances) == 2:
             raise ab.StopRequested("monitor interrupted")
+
+
+class SecondStartFailsCleanupStopRequestedResourceMonitor(FakeResourceMonitor):
+    instances = []
+
+    def start(self):
+        self.started = True
+        if self.output_dir.name == "p2":
+            raise RuntimeError("start failed")
+
+    def stop(self):
+        self.stopped = True
+        if self.output_dir.name == "p2":
+            raise ab.StopRequested("cleanup stop requested")
+        return super().stop()
 
 
 class ReaderStopRequestedRemoteRunner(FakeRemoteDockerRunner):
@@ -1793,6 +1818,41 @@ def test_topology_resource_monitor_start_interrupt_stops_started_monitors(
     ]
 
 
+def test_topology_resource_monitor_start_failure_cleanup_stop_requested_stops_started(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    role_commands = case.topology_profile.build_commands(config, case, layout.run_dir)
+    started_roles = [role_commands["p1"], role_commands["p2"]]
+    SecondStartFailsCleanupStopRequestedResourceMonitor.instances = []
+    monkeypatch.setattr(
+        ab,
+        "ResourceMonitor",
+        SecondStartFailsCleanupStopRequestedResourceMonitor,
+    )
+
+    with pytest.raises(ab.StopRequested, match="cleanup stop requested"):
+        ab._start_topology_resource_monitors(
+            config,
+            remote,
+            case,
+            layout,
+            started_roles,
+        )
+
+    monitors_by_role = {
+        monitor.output_dir.name: monitor
+        for monitor in SecondStartFailsCleanupStopRequestedResourceMonitor.instances
+    }
+    assert set(monitors_by_role) == {"p1", "p2"}
+    assert monitors_by_role["p1"].stopped is True
+    assert monitors_by_role["p2"].stopped is True
+
+
 def test_topology_remote_reader_stop_requested_interrupts_start_and_stops_started_monitor(
     tmp_path,
 ):
@@ -1869,6 +1929,43 @@ def test_topology_remote_resource_monitor_stop_requested_interrupts_run(
     assert manifest["status"] == "interrupted"
     assert manifest["cases"][0]["status"] == "interrupted"
     assert "monitor background interrupted" in manifest["cases"][0]["error"]
+
+
+def test_topology_remote_resource_monitor_stop_requested_stops_remaining_monitors(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    MiddleStopRequestedResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", MiddleStopRequestedResourceMonitor)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 130
+    assert len(MiddleStopRequestedResourceMonitor.instances) == 5
+    monitors_by_role = {
+        monitor.output_dir.name: monitor
+        for monitor in MiddleStopRequestedResourceMonitor.instances
+    }
+    assert [role for role, monitor in monitors_by_role.items() if monitor.stopped] == [
+        "p1",
+        "p2",
+        "d1",
+        "d2",
+        "router",
+    ]
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert manifest["status"] == "interrupted"
+    assert manifest["cases"][0]["status"] == "interrupted"
+    assert "p2 monitor background interrupted" in manifest["cases"][0]["error"]
 
 
 def test_topology_prefixed_resource_merge_failed_does_not_fail_bench(

@@ -2769,12 +2769,18 @@ def _start_topology_resource_monitors(
                 passthrough_exceptions=(StopRequested,),
             )
             monitor.start()
-        except (StopRequested, KeyboardInterrupt):
+        except (StopRequested, KeyboardInterrupt) as exc:
             _stop_topology_resource_monitor_best_effort(role_name, monitor)
             _stop_topology_resource_monitors_best_effort(monitors)
-            raise
+            raise exc
         except Exception as exc:
-            _stop_topology_resource_monitor_best_effort(role_name, monitor)
+            cleanup_interrupt = _stop_topology_resource_monitor_best_effort(
+                role_name,
+                monitor,
+            )
+            if cleanup_interrupt is not None:
+                _stop_topology_resource_monitors_best_effort(monitors)
+                raise cleanup_interrupt
             logger.warning(
                 "remote resource monitor start failed for %s: %s",
                 role_name,
@@ -2785,9 +2791,12 @@ def _start_topology_resource_monitors(
     return monitors
 
 
-def _stop_topology_resource_monitor_best_effort(role_name: str, monitor: Any) -> None:
+def _stop_topology_resource_monitor_best_effort(
+    role_name: str,
+    monitor: Any,
+) -> BaseException | None:
     if monitor is None:
-        return
+        return None
     try:
         monitor.stop()
     except (StopRequested, KeyboardInterrupt) as exc:
@@ -2796,17 +2805,25 @@ def _stop_topology_resource_monitor_best_effort(role_name: str, monitor: Any) ->
             role_name,
             exc,
         )
+        return exc
     except Exception as exc:
         logger.warning(
             "remote resource monitor cleanup failed for %s: %s",
             role_name,
             exc,
         )
+    return None
 
 
-def _stop_topology_resource_monitors_best_effort(monitors: Mapping[str, Any]) -> None:
+def _stop_topology_resource_monitors_best_effort(
+    monitors: Mapping[str, Any],
+) -> BaseException | None:
+    first_interrupt: BaseException | None = None
     for role_name, monitor in monitors.items():
-        _stop_topology_resource_monitor_best_effort(role_name, monitor)
+        interrupt = _stop_topology_resource_monitor_best_effort(role_name, monitor)
+        if first_interrupt is None and interrupt is not None:
+            first_interrupt = interrupt
+    return first_interrupt
 
 
 def _stop_topology_resource_monitors(
@@ -2814,11 +2831,14 @@ def _stop_topology_resource_monitors(
     layout: CaseLayout,
 ) -> None:
     summaries = {}
+    first_interrupt: BaseException | None = None
     for role_name, monitor in monitors.items():
         try:
             summary = monitor.stop()
-        except (StopRequested, KeyboardInterrupt):
-            raise
+        except (StopRequested, KeyboardInterrupt) as exc:
+            if first_interrupt is None:
+                first_interrupt = exc
+            continue
         except Exception as exc:
             logger.warning(
                 "remote resource monitor stop failed for %s: %s",
@@ -2828,6 +2848,9 @@ def _stop_topology_resource_monitors(
             continue
         if summary is not None:
             summaries[role_name] = summary
+
+    if first_interrupt is not None:
+        raise first_interrupt
 
     if not summaries:
         return
