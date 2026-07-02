@@ -1593,6 +1593,16 @@ class RunLock:
     token: str
 
 
+@dataclass(frozen=True)
+class ResumeContext:
+    config: AutoBenchConfig
+    run_id: str
+    run_dir: Path
+    initial_manifest: Manifest
+    pending_cases: tuple[BenchmarkCase, ...]
+    unknown_manifest_cases: tuple[tuple[str, str, str], ...]
+
+
 def run_lock_path(run_dir: Path) -> Path:
     return run_dir / RUN_LOCK_FILE
 
@@ -1619,6 +1629,16 @@ def _read_run_state(run_dir: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return state if isinstance(state, dict) else None
+
+
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"{label} invalid: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ConfigError(f"{label} must be a JSON object: {path}")
+    return payload
 
 
 def run_lock_token_matches(run_dir: Path, token: str | None) -> bool:
@@ -1834,6 +1854,42 @@ def reject_active_run(run_dir: Path, *, allow_pid: int | None = None,
         return False
     print(f"run is already active: {run_dir} (pid {pid})", file=sys.stderr)
     return True
+
+
+def _config_with_results_dir(config: AutoBenchConfig, results_dir: Path) -> AutoBenchConfig:
+    return replace(config, run=replace(config.run, results_dir=results_dir))
+
+
+def load_resume_context(results_dir: Path, run_id: str) -> ResumeContext:
+    _safe_name(run_id, "run_id")
+    resolved_results_dir = Path(results_dir)
+    run_dir = resolved_results_dir / run_id
+    state = _read_json_object(run_dir / "state.json", "state")
+    status = state.get("status")
+    if state.get("run_id") not in (None, run_id):
+        raise ConfigError(f"state run_id mismatch: expected {run_id}, got {state.get('run_id')}")
+    if status in ("starting", "running"):
+        raise ConfigError(f"run is active and cannot be resumed: {status}")
+
+    config = load_config(run_dir / "config.resolved.json")
+    config = _config_with_results_dir(config, resolved_results_dir)
+    cases = expand_cases(config, run_id=run_id)
+    manifest_data = _read_json_object(run_dir / "manifest.json", "manifest")
+    initial_manifest, pending, unknown = plan_resume_cases(
+        run_id=run_id,
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+    if status not in RESUMABLE_RUN_STATUSES and pending:
+        raise ConfigError(f"run status cannot be resumed: {status}")
+    return ResumeContext(
+        config=config,
+        run_id=run_id,
+        run_dir=run_dir,
+        initial_manifest=initial_manifest,
+        pending_cases=pending,
+        unknown_manifest_cases=tuple(unknown),
+    )
 
 
 def _jsonable(value: Any) -> Any:

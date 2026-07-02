@@ -707,6 +707,75 @@ def test_plan_resume_cases_reports_manifest_rows_not_in_config(tmp_path):
     assert unknown == [("old_model", "old_serve", "old_bench")]
 
 
+def write_resume_state(run_dir, status="interrupted"):
+    ab.write_state(run_dir, {
+        "run_id": run_dir.name,
+        "status": status,
+        "current": None,
+        "counts": {"passed": 1, "failed": 0, "skipped": 0, "running": 0, "total": 2},
+    })
+
+
+def write_resume_manifest(run_dir, cases, config, statuses):
+    rows = []
+    for case, status in zip(cases, statuses):
+        layout = ab.build_layout(config, run_dir.name, case)
+        rows.append({
+            "model": case.model.name,
+            "serve_profile": case.serve_profile.name,
+            "bench_profile": case.bench_profile.name,
+            "status": status,
+            "csv": str((layout.bench_dir / "result.csv").relative_to(layout.run_dir)),
+            "xlsx": str((layout.bench_dir / "result.xlsx").relative_to(layout.run_dir)),
+        })
+    ab.write_json_atomic(run_dir / "manifest.json", {
+        "run_id": run_dir.name,
+        "status": "interrupted",
+        "cases": rows,
+    })
+
+
+def test_load_resume_context_uses_cli_results_dir_over_resolved_config(tmp_path):
+    original_data = two_bench_config(tmp_path)
+    config, original_run_dir = write_resolved_config_for_resume(tmp_path, original_data)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(original_run_dir)
+    write_resume_manifest(original_run_dir, cases[:1], config, ["passed"])
+
+    other_results = tmp_path / "other-results"
+    moved_run_dir = other_results / "run123"
+    moved_run_dir.parent.mkdir()
+    original_run_dir.rename(moved_run_dir)
+
+    context = ab.load_resume_context(other_results, "run123")
+
+    assert context.config.run.results_dir == other_results
+    assert [case.bench_profile.name for case in context.pending_cases] == ["smoke2"]
+    assert [row["bench_profile"] for row in context.initial_manifest.cases] == ["smoke"]
+
+
+def test_load_resume_context_rejects_active_state(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status="running")
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+
+    with pytest.raises(ab.ConfigError, match="active|running"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+def test_load_resume_context_completed_with_no_pending_is_empty(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status="completed")
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+
+    context = ab.load_resume_context(tmp_path / "results", "run123")
+
+    assert context.pending_cases == ()
+    assert [row["status"] for row in context.initial_manifest.cases] == ["passed", "passed"]
+
+
 class FakeRunner:
     def __init__(self, failures=None):
         self.commands = []
