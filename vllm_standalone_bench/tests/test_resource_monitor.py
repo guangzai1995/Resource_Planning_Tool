@@ -495,6 +495,54 @@ def test_resource_monitor_reports_unavailable_when_all_readers_fail(tmp_path):
     assert summary["error_count"] > 0
 
 
+@pytest.mark.parametrize(
+    "failing_reader",
+    ["proc_stat", "meminfo", "net_dev", "diskstats", "nvidia_smi"],
+)
+def test_resource_monitor_passthrough_exceptions_are_not_swallowed(
+    tmp_path,
+    failing_reader,
+):
+    class PassthroughError(Exception):
+        pass
+
+    def fail():
+        raise PassthroughError("stop requested")
+
+    reader_values = {
+        "proc_stat": lambda: "cpu  100 0 50 850 0 0 0 0 0 0\n",
+        "meminfo": lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+        "net_dev": lambda: "",
+        "diskstats": lambda: "",
+        "nvidia_smi": lambda: "",
+    }
+    reader_values[failing_reader] = fail
+    readers = rm.ResourceReaders(**reader_values)
+    degraded_monitor = rm.ResourceMonitor(
+        output_dir=tmp_path / "degraded",
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=readers,
+    )
+
+    degraded_monitor.sample_once(now=100.0)
+
+    assert degraded_monitor.error_count >= 1
+
+    passthrough_monitor = rm.ResourceMonitor(
+        output_dir=tmp_path / "passthrough",
+        interval_sec=1.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=readers,
+        passthrough_exceptions=(PassthroughError,),
+    )
+
+    with pytest.raises(PassthroughError, match="stop requested"):
+        passthrough_monitor.sample_once(now=100.0)
+
+
 def test_parse_diskstats_and_compute_rates():
     before = "   8       0 sda 10 0 100 0 5 0 20 0 0 0 0 0 0 0 0 0 0\n"
     after = "   8       0 sda 20 0 4196 0 7 0 2068 0 0 0 0 0 0 0 0 0 0\n"

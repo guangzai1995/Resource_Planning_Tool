@@ -1698,6 +1698,7 @@ def _run_bench_case(config: AutoBenchConfig, runner: Runner,
             interval_sec=config.run.resource_monitor.interval_sec,
             enabled=True,
             backend=config.run.resource_monitor.backend,
+            passthrough_exceptions=(StopRequested,),
         )
         if config.run.resource_monitor.enabled
         and monitor_resources
@@ -2765,6 +2766,7 @@ def _start_topology_resource_monitors(
                 enabled=True,
                 backend=config.run.resource_monitor.backend,
                 readers=RemoteResourceReaders(remote_runner, host),
+                passthrough_exceptions=(StopRequested,),
             )
             monitor.start()
         except (StopRequested, KeyboardInterrupt):

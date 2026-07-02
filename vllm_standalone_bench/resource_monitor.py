@@ -120,12 +120,14 @@ class ResourceMonitor:
         enabled=True,
         backend="nvidia-smi",
         readers=None,
+        passthrough_exceptions=(),
     ):
         self.output_dir = Path(output_dir)
         self.interval_sec = float(interval_sec)
         self.enabled = enabled
         self.backend = backend
         self.readers = readers or default_readers()
+        self.passthrough_exceptions = tuple(passthrough_exceptions)
         self.samples = []
         self.gpu_samples = []
         self.error_count = 0
@@ -187,13 +189,13 @@ class ResourceMonitor:
                 else None
             )
             self._previous_cpu = current_cpu
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
 
         try:
             sample.update(parse_meminfo(self.readers.meminfo()))
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
 
         try:
             current_net = parse_net_dev(self.readers.net_dev())
@@ -203,8 +205,8 @@ class ResourceMonitor:
                 else {"net_rx_mb_s": None, "net_tx_mb_s": None}
             )
             self._previous_net = current_net
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
 
         try:
             current_disk = parse_diskstats(self.readers.diskstats())
@@ -214,8 +216,8 @@ class ResourceMonitor:
                 else {"disk_read_mb_s": None, "disk_write_mb_s": None}
             )
             self._previous_disk = current_disk
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
 
     def _sample_gpu(self, sample):
         if self.backend != "nvidia-smi":
@@ -224,12 +226,20 @@ class ResourceMonitor:
 
         try:
             gpus = parse_nvidia_smi_csv(self.readers.nvidia_smi())
-        except Exception:
-            self.error_count += 1
+        except Exception as exc:
+            self._handle_sample_error(exc)
             gpus = []
 
         self.gpu_samples.extend(gpus)
         apply_gpu_aggregate(sample, gpus)
+
+    def _handle_sample_error(self, exc):
+        if self.passthrough_exceptions and isinstance(
+            exc,
+            self.passthrough_exceptions,
+        ):
+            raise exc
+        self.error_count += 1
 
     def stop(self):
         if not self.enabled:

@@ -1513,12 +1513,22 @@ class ForeignSameNameRemoteRunner(FakeRemoteDockerRunner):
 class FakeResourceMonitor:
     instances = []
 
-    def __init__(self, *, output_dir, interval_sec, enabled, backend, readers=None):
+    def __init__(
+        self,
+        *,
+        output_dir,
+        interval_sec,
+        enabled,
+        backend,
+        readers=None,
+        passthrough_exceptions=(),
+    ):
         self.output_dir = Path(output_dir)
         self.interval_sec = interval_sec
         self.enabled = enabled
         self.backend = backend
         self.readers = readers
+        self.passthrough_exceptions = tuple(passthrough_exceptions)
         self.started = False
         self.stopped = False
         type(self).instances.append(self)
@@ -1562,6 +1572,30 @@ class SecondStartInterruptingResourceMonitor(FakeResourceMonitor):
         self.started = True
         if len(type(self).instances) == 2:
             raise ab.StopRequested("monitor interrupted")
+
+
+class ReaderStopRequestedRemoteRunner(FakeRemoteDockerRunner):
+    def __init__(self, interrupt_host):
+        super().__init__()
+        self.interrupt_host = interrupt_host
+        self.capture_calls = []
+
+    def capture(self, host, command):
+        self.capture_calls.append((host.name, list(command)))
+        if host.name == self.interrupt_host:
+            raise ab.StopRequested("reader interrupted")
+        if command == ["cat", "/proc/stat"]:
+            return "cpu  100 0 50 850 0 0 0 0 0 0\n"
+        if command == ["cat", "/proc/meminfo"]:
+            return "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n"
+        if command in (
+            ["cat", "/proc/net/dev"],
+            ["cat", "/proc/diskstats"],
+        ):
+            return ""
+        if command[:1] == ["nvidia-smi"]:
+            return ""
+        raise AssertionError(f"unexpected capture command: {command!r}")
 
 
 def command_index(commands, prefix):
@@ -1751,6 +1785,34 @@ def test_topology_resource_monitor_start_interrupt_stops_started_monitors(
         True,
         True,
     ]
+
+
+def test_topology_remote_reader_stop_requested_interrupts_start_and_stops_started_monitor(
+    tmp_path,
+):
+    config = topology_config_with_image(tmp_path)
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    role_commands = case.topology_profile.build_commands(config, case, layout.run_dir)
+    started_roles = [role_commands["p1"], role_commands["p2"]]
+    remote = ReaderStopRequestedRemoteRunner(
+        interrupt_host=role_commands["p2"].host_name,
+    )
+
+    with pytest.raises(ab.StopRequested, match="reader interrupted"):
+        ab._start_topology_resource_monitors(
+            config,
+            remote,
+            case,
+            layout,
+            started_roles,
+        )
+
+    assert (
+        role_commands["p2"].host_name,
+        ["cat", "/proc/stat"],
+    ) in remote.capture_calls
+    assert (layout.bench_dir / "resources" / "p1" / "resource_summary.json").is_file()
 
 
 def test_topology_remote_resource_monitor_stop_failed_does_not_fail_bench(
