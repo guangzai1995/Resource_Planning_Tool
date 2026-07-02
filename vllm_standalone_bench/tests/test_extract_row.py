@@ -48,11 +48,12 @@ def test_derive_prefix_suffix_tokens_rejects_invalid_ratio(ratio):
 
 # ---------- _extract_row: 真实 avg（不再回显 requested） ----------
 def _result(total_in=30, total_out=24, completed=3, usage_reported=3,
-            finish_reason_length=3, tokenizer_fallback=0):
+            finish_reason_length=3, tokenizer_fallback=0, total_cached=0):
     """构造 serve.main_async 风格的最小 result dict（仅本测试关心的键）。"""
     return {
         "completed": completed, "failed": 0,
         "total_input_tokens": total_in, "total_output_tokens": total_out,
+        "total_cached_tokens": total_cached,
         "usage_reported_count": usage_reported,
         "tokenizer_fallback_count": tokenizer_fallback,
         "finish_reason_length": finish_reason_length,
@@ -119,6 +120,131 @@ def test_extract_row_prefix_total_input_len_uses_total_input_budget():
     assert row["input_compliance"] == 100.0
 
 
+def test_extract_row_cache_hit_rate_token_weighted():
+    """cache_hit_rate = total_cached / total_input * 100（token 加权）；avg_cached per 请求。"""
+    row = m._extract_row(
+        _result(total_in=300, total_out=24, completed=3, total_cached=150),
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+    assert row["cache_hit_rate"] == 50.0        # 150 / 300 * 100
+    assert row["avg_cached_tokens"] == 50.0     # 150 / 3
+
+
+def test_extract_row_cache_hit_rate_zero_when_no_cache():
+    """无缓存数据（total_cached=0）→ 命中率 0、avg 0，不报错。"""
+    row = m._extract_row(
+        _result(total_in=300, total_out=24, completed=3, total_cached=0),
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+    assert row["cache_hit_rate"] == 0.0
+    assert row["avg_cached_tokens"] == 0.0
+
+
+def test_extract_row_cache_hit_rate_safe_when_totals_zero():
+    """全失败（completed=0、total_in=0）或键缺失 → 命中率回退 0，不抛除零。"""
+    # completed=0 / total_in=0
+    row_zero = m._extract_row(
+        _result(total_in=0, total_out=0, completed=0, total_cached=0,
+                usage_reported=0, finish_reason_length=0),
+        in_len=10, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+    assert row_zero["cache_hit_rate"] == 0.0
+    assert row_zero["avg_cached_tokens"] == 0.0
+    # 结果字典缺 total_cached_tokens 键（旧 serve 产物）
+    row_missing = m._extract_row(
+        {"completed": 3, "total_input_tokens": 300, "total_output_tokens": 24,
+         "usage_reported_count": 3, "tokenizer_fallback_count": 0,
+         "finish_reason_length": 3, "num_prompts": 3,
+         "request_throughput": 1.0, "output_throughput": 12.0, "duration": 2.0},
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+    assert row_missing["cache_hit_rate"] == 0.0
+    assert row_missing["avg_cached_tokens"] == 0.0
+
+
+def test_extract_row_includes_spec_decode_metrics():
+    result = {
+        **_result(),
+        "spec_decode_acceptance_rate": 75.0,
+        "spec_decode_system_efficiency": 0.82,
+        "spec_decode_num_drafts": 12,
+        "spec_decode_num_accepted_tokens": 9,
+        "spec_decode_num_draft_tokens": 12,
+        "spec_decode_per_position_acceptance_rates": [90.0, 60.0],
+    }
+
+    row = m._extract_row(
+        result,
+        in_len=1024, out_len=512, parallel_num=4, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+
+    assert row["spec_decode_acceptance_rate"] == 75.0
+    assert row["spec_decode_system_efficiency"] == 0.82
+    assert row["spec_decode_num_drafts"] == 12
+    assert row["spec_decode_num_accepted_tokens"] == 9
+    assert row["spec_decode_num_draft_tokens"] == 12
+    assert row["spec_decode_per_position_acceptance_rates"] == "[90.0,60.0]"
+
+
+def test_extract_row_spec_decode_defaults_when_metrics_missing():
+    row = m._extract_row(
+        _result(total_in=300, total_out=24, completed=3),
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True)
+
+    assert row["spec_decode_acceptance_rate"] == 0.0
+    assert row["spec_decode_system_efficiency"] == 0.0
+    assert row["spec_decode_num_drafts"] == 0
+    assert row["spec_decode_num_accepted_tokens"] == 0
+    assert row["spec_decode_num_draft_tokens"] == 0
+    assert row["spec_decode_per_position_acceptance_rates"] == "[]"
+
+
+def test_extract_row_includes_gpu_kv_cache_usage():
+    result = {
+        **_result(),
+        "avg_gpu_kv_cache_usage": 9.12345,
+        "peak_gpu_kv_cache_usage": 12.67891,
+    }
+
+    row = m._extract_row(
+        result,
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True,
+    )
+
+    assert row["avg_gpu_kv_cache_usage"] == 9.1235
+    assert row["peak_gpu_kv_cache_usage"] == 12.6789
+
+
+def test_extract_row_gpu_kv_cache_usage_defaults_when_missing():
+    row = m._extract_row(
+        _result(),
+        in_len=100, out_len=8, parallel_num=3, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True,
+    )
+
+    assert row["avg_gpu_kv_cache_usage"] == 0.0
+    assert row["peak_gpu_kv_cache_usage"] == 0.0
+
+
+def test_extract_row_spec_decode_token_aliases_from_serve_result():
+    result = {
+        **_result(),
+        "spec_decode_accepted_tokens": 61,
+        "spec_decode_draft_tokens": 280,
+    }
+
+    row = m._extract_row(
+        result,
+        in_len=1024, out_len=512, parallel_num=4, epochs=1,
+        model="m", backend="openai-chat", has_tokenizer=True,
+    )
+
+    assert row["spec_decode_num_accepted_tokens"] == 61
+    assert row["spec_decode_num_draft_tokens"] == 280
+
+
 def test_token_source_tokenizer_fallback_when_no_usage():
     row = m._extract_row(
         _result(total_out=24, completed=3, usage_reported=0,
@@ -181,7 +307,15 @@ def test_csv_headers_match_row_keys():
     for required in ("total_input_len", "input_compliance", "output_compliance",
                      "finish_reason_length_pct", "token_source", "seed",
                      "input_throughput_tok_s", "prefill_effective_tok_s",
-                     "decode_effective_tok_s"):
+                     "decode_effective_tok_s",
+                     "avg_cached_tokens", "cache_hit_rate",
+                     "avg_gpu_kv_cache_usage", "peak_gpu_kv_cache_usage",
+                     "spec_decode_acceptance_rate",
+                     "spec_decode_system_efficiency",
+                     "spec_decode_num_drafts",
+                     "spec_decode_num_accepted_tokens",
+                     "spec_decode_num_draft_tokens",
+                     "spec_decode_per_position_acceptance_rates"):
         assert required in m.CSV_HEADERS, f"新列 {required} 未进 CSV_HEADERS"
     assert "total_throughput_tok_s" not in m.CSV_HEADERS
     assert row["seed"] == 0

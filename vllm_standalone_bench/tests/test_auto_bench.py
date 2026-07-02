@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import sys
@@ -6,6 +7,8 @@ from pathlib import Path
 import pytest
 
 import auto_bench as ab
+
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 
 def write_config(tmp_path, data):
@@ -72,6 +75,23 @@ def minimal_config(tmp_path):
             "warmup_requests": 0
         }]
     }
+
+
+def asr_config(tmp_path):
+    data = minimal_config(tmp_path)
+    data["models"][0]["name"] = "qwen3_asr_1_7b"
+    data["models"][0]["served_model_name"] = "qwen3-asr"
+    data["bench_profiles"][0] = {
+        "name": "asr_smoke",
+        "backend": "openai-audio",
+        "output_lens": [128],
+        "parallel_nums": [1, 4],
+        "epochs": 1,
+        "warmup_requests": 0,
+        "dataset_name": "custom_audio",
+        "language": "en",
+    }
+    return data
 
 
 def test_load_config_applies_defaults_and_expands_cases(tmp_path):
@@ -237,10 +257,178 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert "--model" in cmd
     assert "qwen2_5_1_5b" in cmd
     assert value_after(cmd, "--model") == "qwen2_5_1_5b"
+    assert value_after(cmd, "--tokenizer") == "/models/Qwen2.5-1.5B-Instruct"
+    assert value_after(cmd, "--input-lens") == "64"
+    assert "--prefix-ratio" not in cmd
     assert "--output-csv" in cmd
     assert "/results/result.csv" in cmd
     assert value_after(cmd, "--served-model-name") == "qwen2_5_1_5b"
     assert value_after(cmd, "--output-xlsx") == "/results/result.xlsx"
+
+
+def test_build_bench_command_passes_builtin_dataset(tmp_path):
+    data = minimal_config(tmp_path)
+    data["bench_profiles"][0]["dataset"] = {
+        "name": "builtin_mtp_chat",
+        "length_policy": "bucket",
+        "input_len_tolerance": 0.2,
+        "on_bucket_shortage": "error",
+        "sampling": "shuffle",
+    }
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = Path("relative-results") / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
+
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+
+    assert value_after(cmd, "--dataset") == "builtin_mtp_chat"
+    assert value_after(cmd, "--dataset-length-policy") == "bucket"
+    assert value_after(cmd, "--dataset-input-len-tolerance") == "0.2"
+    assert value_after(cmd, "--dataset-on-bucket-shortage") == "error"
+    assert value_after(cmd, "--dataset-sampling") == "shuffle"
+
+
+def test_build_bench_command_omits_dataset_for_legacy_config(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = Path("relative-results") / "run123" / "qwen2_5_1_5b" / "bf16_default" / "smoke"
+
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+
+    assert "--dataset" not in cmd
+
+
+def test_serve_profile_rejects_speculative_config_without_dashes(tmp_path):
+    data = minimal_config(tmp_path)
+    data["serve_profiles"][0]["args"] = [
+        "speculative-config.num_speculative_tokens",
+        "1",
+    ]
+
+    with pytest.raises(ab.ConfigError, match="--speculative-config"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_asr_profile_defaults_to_builtin_dataset_path(tmp_path):
+    config = ab.load_config(write_config(tmp_path, asr_config(tmp_path)))
+    bench = config.bench_profiles[0]
+    assert bench.backend == "openai-audio"
+    assert bench.input_lens == (0,)
+    assert bench.prefix_ratio == 0.0
+    assert bench.dataset_name == "custom_audio"
+    assert bench.dataset_path == ab.BUILTIN_ASR_DATASET_PATH
+    assert bench.language == "en"
+
+
+def test_build_bench_command_passes_asr_dataset_args(tmp_path):
+    config = ab.load_config(write_config(tmp_path, asr_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    bench_dir = (
+        tmp_path
+        / "results"
+        / "run123"
+        / "qwen3_asr_1_7b"
+        / "bf16_default"
+        / "asr_smoke"
+    )
+    cmd = ab.build_bench_run_command(config, case, bench_dir)
+    assert value_after(cmd, "--backend") == "openai-audio"
+    assert value_after(cmd, "--dataset-name") == "custom_audio"
+    assert value_after(cmd, "--dataset-path") == ab.BUILTIN_ASR_DATASET_PATH
+    assert value_after(cmd, "--language") == "en"
+    assert "--input-lens" not in cmd
+    assert "--prefix-ratio" not in cmd
+    assert "--tokenizer" not in cmd
+    assert value_after(cmd, "--output-lens") == "128"
+
+
+def test_external_asr_dataset_requires_datasets_mount(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/custom.jsonl"
+    with pytest.raises(ab.ConfigError, match="mounts.datasets"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_external_asr_dataset_must_be_under_datasets_mount(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = "/tmp/asr.jsonl"
+
+    with pytest.raises(ab.ConfigError, match="/datasets|dataset_path"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_external_asr_dataset_mount_is_added(tmp_path):
+    data = asr_config(tmp_path)
+    host_datasets = tmp_path / "datasets"
+    host_dataset_file = host_datasets / "asr" / "custom.jsonl"
+    host_dataset_file.parent.mkdir(parents=True)
+    host_dataset_file.write_text("{}", encoding="utf-8")
+    data["mounts"]["datasets"] = str(host_datasets)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/custom.jsonl"
+    config = ab.load_config(write_config(tmp_path, data))
+    ab.validate_local_paths(config)
+    case = ab.expand_cases(config, run_id="run123")[0]
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+    mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
+    assert f"{host_datasets.resolve()}:/datasets:ro" in mounts
+
+
+def test_validate_local_paths_rejects_missing_external_asr_dataset_file(tmp_path):
+    data = asr_config(tmp_path)
+    host_datasets = tmp_path / "datasets"
+    host_datasets.mkdir()
+    data["mounts"]["datasets"] = str(host_datasets)
+    data["bench_profiles"][0]["dataset_path"] = "/datasets/asr/missing.jsonl"
+    config = ab.load_config(write_config(tmp_path, data))
+
+    with pytest.raises(ab.ConfigError, match="dataset"):
+        ab.validate_local_paths(config)
+
+
+@pytest.mark.parametrize(
+    "dataset_path",
+    [
+        "datasets/asr/custom.jsonl",
+        "/datasets/../custom.jsonl",
+        "//datasets/asr/custom.jsonl",
+    ],
+)
+def test_asr_dataset_path_must_be_absolute_and_not_escape(tmp_path, dataset_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["dataset_path"] = dataset_path
+
+    with pytest.raises(ab.ConfigError, match="dataset_path"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("dataset_name", 123, "dataset_name"),
+        ("language", "", "language"),
+        ("dataset_path", 123, "dataset_path"),
+        ("dataset_path", "", "dataset_path"),
+    ],
+)
+def test_asr_dataset_fields_must_be_non_empty_strings(tmp_path, field, value, match):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0][field] = value
+
+    with pytest.raises(ab.ConfigError, match=match):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_asr_output_lens_can_have_multiple_values_without_cross_product(tmp_path):
+    data = asr_config(tmp_path)
+    data["bench_profiles"][0]["output_lens"] = [64, 128]
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+
+    output_index = cmd.index("--output-lens")
+    assert cmd[output_index + 1:output_index + 3] == ["64", "128"]
+    assert "--cross-product" not in cmd
 
 
 def test_build_bench_command_includes_name_and_ownership_labels(tmp_path):
@@ -1496,6 +1684,33 @@ def test_follow_file_tails_from_end(tmp_path, monkeypatch, capsys):
     assert exit_code == 0
     assert "old" not in captured.out
     assert "new" in captured.out
+
+
+def test_readme_documents_vllm_cache_persistence():
+    readme = (Path(ab.__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+    readme_lower = readme.lower()
+
+    assert "vllm_cache" in readme
+    assert "VLLM_CACHE_ROOT" in readme
+    assert "DG_JIT_CACHE_DIR" in readme
+    assert "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR" in readme
+    assert "可省略" in readme
+    assert ".cache/vllm_auto_bench" in readme
+    assert "model_path" in readme
+    assert "gpus" in readme
+    assert "serve args" in readme
+    assert "image id" in readme_lower
+    assert "digest" in readme_lower
+    assert "cache_key" in readme
+    assert "更换" in readme or "清理" in readme
+
+
+def test_gitignore_ignores_local_cache_dir():
+    gitignore = (Path(ab.__file__).resolve().parents[1] / ".gitignore").read_text(
+        encoding="utf-8"
+    )
+
+    assert ".cache/" in gitignore.splitlines()
 
 
 def test_follow_file_handles_open_error(tmp_path, monkeypatch, capsys):
@@ -2891,3 +3106,613 @@ def test_bench_runner_dockerfile_contains_offline_dependencies():
         sources = parts[1:-1]
         for source in sources:
             assert (root / source).exists(), f"COPY source does not exist: {source}"
+
+
+def test_serve_profile_engine_defaults_to_vllm(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    assert config.serve_profiles[0].engine == "vllm"
+
+
+def test_invalid_engine_rejected(tmp_path):
+    data = minimal_config(tmp_path)
+    data["serve_profiles"][0]["engine"] = "trtllm"
+    with pytest.raises(ab.ConfigError, match="engine"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_images_falls_back_to_vllm_image(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    assert config.run.images == {"vllm": "009e4cb46541"}
+
+
+def test_images_missing_engine_rejected(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": data["run"]["vllm_image"]}
+    data["serve_profiles"][0]["engine"] = "sglang"
+    with pytest.raises(ab.ConfigError, match="missing image"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_images_without_vllm_image_supported(tmp_path):
+    data = minimal_config(tmp_path)
+    del data["run"]["vllm_image"]
+    data["run"]["images"] = {"sglang": "sglang:latest"}
+    data["serve_profiles"][0]["engine"] = "sglang"
+    config = ab.load_config(write_config(tmp_path, data))
+    assert config.run.images == {"sglang": "sglang:latest"}
+    assert config.run.vllm_image is None
+
+
+def test_explicit_images_vllm_not_overridden_by_vllm_image(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": "explicit-vllm:tag"}
+    config = ab.load_config(write_config(tmp_path, data))
+    assert config.run.images["vllm"] == "explicit-vllm:tag"
+
+
+def sglang_config(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
+    profile = {
+        "name": "sglang_bf16",
+        "engine": "sglang",
+        "gpus": "all",
+        "args": ["--dtype", "bfloat16", "--mem-fraction-static", "0.70"],
+    }
+    data["serve_profiles"] = [profile]
+    return data
+
+
+def test_build_sglang_command_uses_launch_server(tmp_path):
+    config = ab.load_config(write_config(tmp_path, sglang_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_serve_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert value_after(cmd, "--entrypoint") == "python3"
+    assert "sglang:latest" in cmd
+    assert value_after(cmd, "-m") == "sglang.launch_server"
+    assert value_after(cmd, "--model-path") == "/models/Qwen2.5-1.5B-Instruct"
+    assert value_after(cmd, "--host") == "0.0.0.0"
+    assert value_after(cmd, "--port") == "8000"
+    assert value_after(cmd, "--served-model-name") == "qwen2_5_1_5b"
+    assert value_after(cmd, "--api-key") == "local-bench-key"
+    assert value_after(cmd, "--mem-fraction-static") == "0.70"
+    assert value_after(cmd, "--gpus") == "all"
+
+
+def test_build_serve_command_dispatches_vllm(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_serve_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert value_after(cmd, "--entrypoint") == "vllm"
+    assert "serve" in cmd
+
+
+def test_controller_invokes_aggregate_after_groups(tmp_path, monkeypatch):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
+    sglang_profile = {
+        "name": "sglang_bf16",
+        "engine": "sglang",
+        "gpus": "all",
+        "args": ["--dtype", "bfloat16"],
+    }
+    data["serve_profiles"].append(sglang_profile)
+    config = ab.load_config(write_config(tmp_path, data))
+    calls = []
+    monkeypatch.setattr(ab, "aggregate_compare", lambda c, rd: calls.append(Path(rd)) or None)
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *a, **k: True)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+
+    assert result == 0
+    assert len(calls) == 1
+    assert calls[0].name == "run123"
+
+
+def test_controller_dry_run_skips_aggregate(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    calls = []
+    monkeypatch.setattr(ab, "aggregate_compare", lambda c, rd: calls.append(rd))
+
+    ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+    assert calls == []
+
+
+def test_shipped_sglang_compare_config_parses():
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "configs"
+        / "auto_bench.qwen2_5_1_5b.sglang_compare.json"
+    )
+    config = ab.load_config(path)
+    engines = {profile.engine for profile in config.serve_profiles}
+    assert engines == {"vllm", "sglang"}
+    assert "vllm" in config.run.images
+    assert "sglang" in config.run.images
+
+
+def test_controller_dry_run_prints_sglang_command(tmp_path, capsys):
+    data = minimal_config(tmp_path)
+    data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
+    data["serve_profiles"][0]["engine"] = "sglang"
+    config = ab.load_config(write_config(tmp_path, data))
+
+    ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+    out = capsys.readouterr().out
+    assert "sglang.launch_server" in out
+    assert "sglang:latest" in out
+    assert "--model-path" in out
+
+
+def test_load_config_parses_warmup_opts(tmp_path):
+    data = minimal_config(tmp_path)
+    data["bench_profiles"][0]["warmup_concurrency"] = 4
+    data["bench_profiles"][0]["warmup_output_len"] = 128
+    config = ab.load_config(write_config(tmp_path, data))
+    bp = config.bench_profiles[0]
+    assert bp.warmup_concurrency == 4
+    assert bp.warmup_output_len == 128
+
+
+def test_load_config_warmup_opts_default_none(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    bp = config.bench_profiles[0]
+    assert bp.warmup_concurrency is None
+    assert bp.warmup_output_len is None
+
+
+def enable_vllm_cache(data, root):
+    data["run"]["vllm_cache"] = {
+        "enabled": True,
+        "root": str(root),
+        "container_path": "/vllm-cache",
+        "set_default_env": True,
+    }
+    return data
+
+
+def expected_vllm_cache_key_inputs(config, case):
+    return {
+        "vllm_image_ref": config.run.images["vllm"],
+        "model": {
+            "name": case.model.name,
+            "model_path": case.model.model_path,
+            "tokenizer_path": case.model.tokenizer_path,
+            "served_model_name": case.model.served_model_name,
+        },
+        "serve_profile": {
+            "name": case.serve_profile.name,
+            "gpus": case.serve_profile.gpus,
+            "args": list(case.serve_profile.args),
+        },
+    }
+
+
+def expected_vllm_cache_fingerprint(inputs):
+    canonical = json.dumps(
+        inputs,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+def test_load_config_vllm_cache_defaults_disabled(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+
+    assert config.run.vllm_cache.enabled is False
+    assert config.run.vllm_cache.root is None
+    assert config.run.vllm_cache.container_path == "/vllm-cache"
+    assert config.run.vllm_cache.set_default_env is True
+    assert config.serve_profiles[0].cache_key is None
+
+
+def test_load_config_parses_enabled_vllm_cache(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert config.run.vllm_cache.enabled is True
+    assert config.run.vllm_cache.root == (tmp_path / "cache").resolve()
+    assert config.run.vllm_cache.container_path == "/vllm-cache"
+    assert config.run.vllm_cache.set_default_env is True
+    assert config.serve_profiles[0].cache_key == "glm52-fp8-tp8-h20-o2"
+
+
+def test_load_config_defaults_enabled_vllm_cache_root_from_config_dir(tmp_path):
+    config_dir = tmp_path / "configs"
+    data = minimal_config(tmp_path)
+    data["run"]["vllm_cache"] = {"enabled": True}
+
+    config = ab.load_config(write_config_at(config_dir / "config.json", data))
+
+    assert config.run.vllm_cache.enabled is True
+    assert config.run.vllm_cache.root == (
+        config_dir / ".cache" / "vllm_auto_bench"
+    ).resolve()
+    assert config.run.vllm_cache.container_path == "/vllm-cache"
+    assert config.run.vllm_cache.set_default_env is True
+
+
+def test_load_config_resolves_relative_vllm_cache_root_from_config_dir(tmp_path):
+    config_dir = tmp_path / "configs"
+    data = enable_vllm_cache(minimal_config(tmp_path), "relative-cache")
+
+    config = ab.load_config(write_config_at(config_dir / "config.json", data))
+
+    assert config.run.vllm_cache.root == (config_dir / "relative-cache").resolve()
+
+
+def test_vllm_cache_null_is_rejected(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["vllm_cache"] = None
+
+    with pytest.raises(ab.ConfigError, match="vllm_cache.*object"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_vllm_cache_explicit_null_root_is_rejected(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["run"]["vllm_cache"]["root"] = None
+
+    with pytest.raises(ab.ConfigError, match="vllm_cache.root"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("container_path", [
+    "relative/cache",
+    "/cache/../bad",
+    "/",
+    "/models",
+    "/models/cache",
+])
+def test_vllm_cache_container_path_must_be_absolute_and_safe(tmp_path, container_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["run"]["vllm_cache"]["container_path"] = container_path
+
+    with pytest.raises(ab.ConfigError, match="container_path|absolute|contain"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+@pytest.mark.parametrize("cache_key", ["bad/name", ".", ".."])
+def test_serve_profile_cache_key_must_be_safe(tmp_path, cache_key):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = cache_key
+
+    with pytest.raises(ab.ConfigError, match="cache_key|safe filename"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_resolve_vllm_cache_dir_uses_explicit_cache_key(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    assert ab.resolve_vllm_cache_dir(config, case) == (
+        tmp_path / "cache" / "glm52-fp8-tp8-h20-o2"
+    ).resolve()
+
+
+def test_resolve_vllm_cache_dir_uses_stable_default_key(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cache_dir = ab.resolve_vllm_cache_dir(config, case)
+    key_inputs = expected_vllm_cache_key_inputs(config, case)
+    expected_fingerprint = expected_vllm_cache_fingerprint(key_inputs)
+    expected_name = (
+        f"{case.model.name}__{case.serve_profile.name}__"
+        f"{expected_fingerprint}"
+    )
+
+    assert cache_dir is not None
+    assert cache_dir.parent == (tmp_path / "cache").resolve()
+    assert cache_dir.name == expected_name
+    assert ab.resolve_vllm_cache_dir(config, case) == cache_dir
+
+
+def test_default_vllm_cache_dir_changes_when_image_changes(tmp_path):
+    first_data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    first_config = ab.load_config(write_config(tmp_path, first_data))
+    first_case = ab.expand_cases(first_config, run_id="run123")[0]
+
+    second_data = json.loads(json.dumps(first_data))
+    second_data["run"]["vllm_image"] = "vllm-openai:changed"
+    second_config = ab.load_config(write_config(tmp_path, second_data))
+    second_case = ab.expand_cases(second_config, run_id="run123")[0]
+
+    assert (
+        ab.resolve_vllm_cache_dir(first_config, first_case).name
+        != ab.resolve_vllm_cache_dir(second_config, second_case).name
+    )
+
+
+def test_default_vllm_cache_dir_changes_when_serve_args_change(tmp_path):
+    first_data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    first_config = ab.load_config(write_config(tmp_path, first_data))
+    first_case = ab.expand_cases(first_config, run_id="run123")[0]
+
+    second_data = json.loads(json.dumps(first_data))
+    second_data["serve_profiles"][0]["args"] = ["--dtype", "float16"]
+    second_config = ab.load_config(write_config(tmp_path, second_data))
+    second_case = ab.expand_cases(second_config, run_id="run123")[0]
+
+    assert (
+        ab.resolve_vllm_cache_dir(first_config, first_case).name
+        != ab.resolve_vllm_cache_dir(second_config, second_case).name
+    )
+
+
+def test_default_vllm_cache_dir_changes_when_serve_gpus_change(tmp_path):
+    first_data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    first_config = ab.load_config(write_config(tmp_path, first_data))
+    first_case = ab.expand_cases(first_config, run_id="run123")[0]
+
+    second_data = json.loads(json.dumps(first_data))
+    second_data["serve_profiles"][0]["gpus"] = "device=0,1"
+    second_config = ab.load_config(write_config(tmp_path, second_data))
+    second_case = ab.expand_cases(second_config, run_id="run123")[0]
+
+    assert (
+        ab.resolve_vllm_cache_dir(first_config, first_case).name
+        != ab.resolve_vllm_cache_dir(second_config, second_case).name
+    )
+
+
+def test_default_vllm_cache_dir_changes_when_model_path_changes(tmp_path):
+    first_data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    first_config = ab.load_config(write_config(tmp_path, first_data))
+    first_case = ab.expand_cases(first_config, run_id="run123")[0]
+
+    second_data = json.loads(json.dumps(first_data))
+    second_data["models"][0]["model_path"] = "/models/Qwen2.5-1.5B-Instruct-Alt"
+    second_config = ab.load_config(write_config(tmp_path, second_data))
+    second_case = ab.expand_cases(second_config, run_id="run123")[0]
+
+    assert (
+        ab.resolve_vllm_cache_dir(first_config, first_case).name
+        != ab.resolve_vllm_cache_dir(second_config, second_case).name
+    )
+
+
+def test_validate_local_paths_creates_vllm_cache_dirs(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    cache_dir = ab.resolve_vllm_cache_dir(config, case)
+
+    assert cache_dir is not None
+    assert not cache_dir.exists()
+
+    ab.validate_local_paths(config)
+
+    assert cache_dir.is_dir()
+
+
+def test_build_vllm_cache_env_defaults(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert ab.build_vllm_cache_env(config) == {
+        "VLLM_CACHE_ROOT": "/vllm-cache",
+        "DG_JIT_CACHE_DIR": "/vllm-cache/deep_gemm",
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/vllm-cache/flashinfer_autotune",
+    }
+
+
+def test_vllm_cache_container_path_rejects_container_root(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["run"]["vllm_cache"]["container_path"] = "/"
+
+    with pytest.raises(ab.ConfigError, match="container_path|root|/models"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_build_vllm_cache_env_can_be_disabled(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["run"]["vllm_cache"]["set_default_env"] = False
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert ab.build_vllm_cache_env(config) == {}
+
+
+def test_build_vllm_command_omits_cache_when_disabled(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_vllm_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert "/vllm-cache" not in " ".join(cmd)
+    assert "VLLM_CACHE_ROOT=/vllm-cache" not in cmd
+
+
+def test_build_vllm_command_includes_cache_mount_and_env(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_vllm_run_command(config, case, tmp_path / "results" / "run123")
+
+    mounts = values_after(cmd, "-v")
+    envs = values_after(cmd, "-e")
+    assert f"{(tmp_path / 'cache' / 'glm52-fp8-tp8-h20-o2').resolve()}:/vllm-cache:rw" in mounts
+    assert "VLLM_CACHE_ROOT=/vllm-cache" in envs
+    assert "DG_JIT_CACHE_DIR=/vllm-cache/deep_gemm" in envs
+    assert "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/vllm-cache/flashinfer_autotune" in envs
+
+
+def test_vllm_cache_metadata_payload(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    payload = ab.vllm_cache_metadata(config, case)
+
+    assert payload == {
+        "enabled": True,
+        "cache_key": "glm52-fp8-tp8-h20-o2",
+        "cache_key_source": "explicit",
+        "cache_key_inputs": expected_vllm_cache_key_inputs(config, case),
+        "host_dir": str((tmp_path / "cache" / "glm52-fp8-tp8-h20-o2").resolve()),
+        "container_path": "/vllm-cache",
+        "env": {
+            "VLLM_CACHE_ROOT": "/vllm-cache",
+            "DG_JIT_CACHE_DIR": "/vllm-cache/deep_gemm",
+            "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": "/vllm-cache/flashinfer_autotune",
+        },
+    }
+
+
+def test_vllm_cache_metadata_payload_for_default_key_includes_audit_inputs(tmp_path):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    payload = ab.vllm_cache_metadata(config, case)
+
+    assert payload is not None
+    assert payload["cache_key_source"] == "default"
+    assert payload["cache_key_inputs"] == expected_vllm_cache_key_inputs(config, case)
+
+
+def test_run_controller_writes_vllm_cache_metadata(tmp_path, monkeypatch):
+    data = enable_vllm_cache(minimal_config(tmp_path), tmp_path / "cache")
+    data["serve_profiles"][0]["cache_key"] = "glm52-fp8-tp8-h20-o2"
+    config = ab.load_config(write_config(tmp_path, data))
+    monkeypatch.setattr(ab, "wait_for_ready", lambda *a, **k: True)
+    runner = FakeRunner()
+
+    result = ab.run_controller(config, run_id="run123", runner=runner)
+
+    metadata_path = (
+        tmp_path / "results" / "run123" / "qwen2_5_1_5b" / "bf16_default" / "vllm_cache.json"
+    )
+    assert result == 0
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["cache_key"] == (
+        "glm52-fp8-tp8-h20-o2"
+    )
+
+
+def test_build_sglang_command_omits_vllm_cache_mount_and_env(tmp_path):
+    data = enable_vllm_cache(sglang_config(tmp_path), tmp_path / "cache")
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_serve_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert "/vllm-cache" not in " ".join(cmd)
+    assert "VLLM_CACHE_ROOT=/vllm-cache" not in cmd
+
+
+def test_build_bench_command_includes_warmup_opts(tmp_path):
+    data = minimal_config(tmp_path)
+    data["bench_profiles"][0]["warmup_concurrency"] = 4
+    data["bench_profiles"][0]["warmup_output_len"] = 128
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config)[0]
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+    assert value_after(cmd, "--warmup-concurrency") == "4"
+    assert value_after(cmd, "--warmup-output-len") == "128"
+
+
+def test_build_bench_command_omits_warmup_opts_when_none(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config)[0]
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+    assert "--warmup-concurrency" not in cmd
+    assert "--warmup-output-len" not in cmd
+
+
+def test_sglang_compare_config_enables_fixed_warmup():
+    cfg = json.loads((CONFIG_DIR / "auto_bench.qwen2_5_1_5b.sglang_compare.json").read_text())
+    bp = cfg["bench_profiles"][0]
+    assert bp["warmup_concurrency"] == 4
+    assert bp["warmup_output_len"] == 128
+
+
+def test_smoke_config_enables_fixed_warmup():
+    cfg = json.loads((CONFIG_DIR / "auto_bench.qwen2_5_1_5b.smoke.json").read_text())
+    bp = cfg["bench_profiles"][0]
+    assert bp["warmup_concurrency"] == 4
+    assert bp["warmup_output_len"] == 128
+
+
+def test_qwen3_asr_sample_config_loads():
+    path = CONFIG_DIR / "auto_bench.qwen3_asr_1_7b.smoke.json"
+
+    config = ab.load_config(path)
+
+    assert config.bench_profiles[0].backend == "openai-audio"
+    assert config.bench_profiles[0].dataset_path == ab.BUILTIN_ASR_DATASET_PATH
+    assert config.bench_profiles[0].parallel_nums == (1, 4, 8)
+
+
+def test_builtin_asr_dataset_manifest_is_valid():
+    root = Path(__file__).resolve().parents[1] / "assets" / "librispeech_test_clean_256"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    jsonl = root / "asr_smoke.jsonl"
+    audio_dir = root / "audio"
+
+    import soundfile
+
+    rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()]
+    audio_refs = [row["audio"] for row in rows]
+    audio_paths = [root / audio_ref for audio_ref in audio_refs]
+    root_resolved = root.resolve()
+    referenced_files = {path.resolve() for path in audio_paths}
+    actual_flacs = {path.resolve() for path in audio_dir.glob("*.flac")}
+    missing_flacs = sorted(
+        path.relative_to(root_resolved).as_posix() for path in referenced_files - actual_flacs
+    )
+    extra_flacs = sorted(
+        path.relative_to(root_resolved).as_posix() for path in actual_flacs - referenced_files
+    )
+
+    def duration_bucket(duration_s):
+        if 5.0 <= duration_s < 10.0:
+            return "medium"
+        if 10.0 <= duration_s < 20.0:
+            return "long"
+        if 20.0 <= duration_s <= 30.0:
+            return "xlong"
+        return None
+
+    assert len(rows) == 256
+    assert manifest["sample_count"] == 256
+    assert manifest["requested_sample_count"] == 256
+    assert 5.0 <= manifest["min_duration_s"] <= manifest["max_duration_s"] <= 30.0
+    assert manifest["total_audio_bytes"] <= 104857600
+    assert len(audio_refs) == len(set(audio_refs))
+    assert all(audio_ref.startswith("audio/") for audio_ref in audio_refs)
+    assert all(Path(audio_ref).name == audio_ref.removeprefix("audio/") for audio_ref in audio_refs)
+    assert all(Path(audio_ref).suffix == ".flac" for audio_ref in audio_refs)
+    assert missing_flacs == []
+    assert extra_flacs == []
+
+    durations = [soundfile.info(path).duration for path in audio_paths]
+    duration_buckets = {"medium": 0, "long": 0, "xlong": 0}
+    for duration in durations:
+        bucket = duration_bucket(duration)
+        assert bucket is not None
+        duration_buckets[bucket] += 1
+
+    assert duration_buckets == manifest["duration_buckets"]
+    assert min(durations) == pytest.approx(manifest["min_duration_s"])
+    assert max(durations) == pytest.approx(manifest["max_duration_s"])
+    assert round(sum(durations), 3) == manifest["total_duration_s"]
+    assert sum(path.stat().st_size for path in audio_paths) == manifest["total_audio_bytes"]
+    assert (root / "ATTRIBUTION.md").is_file()
+    assert (root / "LICENSE.LibriSpeech.txt").is_file()

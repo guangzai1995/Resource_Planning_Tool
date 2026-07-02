@@ -204,3 +204,35 @@ def test_random_prefix_range_ratio_keeps_suffix_for_short_inputs(monkeypatch):
 
     assert [req.prompt_len for req in requests] == [2, 2]
     assert requests[0].prompt != requests[1].prompt
+
+
+def test_get_samples_supports_builtin_mtp_chat(monkeypatch):
+    calls = []
+
+    def fake_build_requests(args, tokenizer, sample_request_cls):
+        calls.append((args.dataset_name, tokenizer, sample_request_cls))
+        return [
+            rbs.SampleRequest(
+                prompt="user: explain mtp\nassistant:",
+                prompt_len=4,
+                expected_output_len=8,
+            )
+        ]
+
+    monkeypatch.setattr(
+        rbs.builtin_mtp_chat,
+        "build_requests",
+        fake_build_requests,
+    )
+    args = argparse.Namespace(
+        dataset_name="builtin_mtp_chat",
+        input_len=32,
+        output_len=8,
+        num_prompts=1,
+    )
+
+    requests = rbs.get_samples(args, object())
+
+    assert len(requests) == 1
+    assert calls[0][0] == "builtin_mtp_chat"
+    assert calls[0][2] is rbs.SampleRequest

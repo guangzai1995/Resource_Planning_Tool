@@ -1,0 +1,57 @@
+{
+  "run": {
+    "name": "qwen2_5_1_5b_sglang_compare",
+    "results_dir": "vllm_standalone_bench/results",
+    "images": { "vllm": "009e4cb46541", "sglang": "lmsysorg/sglang:latest" },
+    "bench_image": "vllm-bench-runner:offline",
+    "network": "vllm-bench-net",
+    "create_network": true,
+    "cleanup_network": true,
+    "container_port": 8888,
+    "publish_host_port": false,
+    "host_port": 18000,
+    "api_key": "local-bench-key",
+    "ready_timeout_sec": 1800,
+    "cooldown_sec": 5
+  },
+  "mounts": {
+    "models": "/Resource_Planning_Tool/model"
+  },
+  "models": [
+    {
+      "name": "qwen2_5_1_5b",
+      "model_path": "/models/Qwen2.5-1.5B-Instruct",
+      "tokenizer_path": "/models/Qwen2.5-1.5B-Instruct",
+      "served_model_name": "qwen2_5_1_5b"
+    }
+  ],
+  "serve_profiles": [
+    {
+      "name": "vllm_bf16",
+      "engine": "vllm",
+      "gpus": "all",
+      "args": ["--dtype", "bfloat16", "--gpu-memory-utilization", "0.70"]
+    },
+    {
+      "name": "sglang_bf16",
+      "engine": "sglang",
+      "gpus": "all",
+      "args": ["--dtype", "bfloat16", "--mem-fraction-static", "0.70"]
+    }
+  ],
+  "bench_profiles": [
+    {
+      "name": "smoke",
+      "backend": "openai-chat",
+      "input_lens": [1024, 2048, 4096],
+      "output_lens": [256, 256, 256],
+      "parallel_nums": [1, 4, 8, 16],
+      "epochs": 3,
+      "prefix_ratio": 0.0,
+      "warmup_requests": 1,
+      "warmup_concurrency": 4,
+      "warmup_output_len": 128,
+      "cross_product": false
+    }
+  ]
+}

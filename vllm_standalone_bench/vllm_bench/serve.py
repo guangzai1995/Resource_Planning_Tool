@@ -102,68 +102,212 @@ class SpecDecodeMetrics:
     accepted_per_pos: dict[int, int]
 
 
+@dataclass
+class RuntimeMetrics:
+    """Runtime metrics parsed from the server's Prometheus endpoint."""
+
+    spec_decode: SpecDecodeMetrics | None = None
+    gpu_kv_cache_usage: float | None = None
+
+
+@dataclass
+class RuntimeMetricsSummary:
+    """Aggregated runtime metrics for a single benchmark run."""
+
+    avg_gpu_kv_cache_usage: float = 0.0
+    peak_gpu_kv_cache_usage: float = 0.0
+
+    @classmethod
+    def from_samples(cls, samples: Iterable[float]) -> "RuntimeMetricsSummary":
+        values = [float(sample) for sample in samples]
+        if not values:
+            return cls()
+        return cls(
+            avg_gpu_kv_cache_usage=round(sum(values) / len(values), 4),
+            peak_gpu_kv_cache_usage=round(max(values), 4),
+        )
+
+
+def _metrics_url_from_base(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3]
+    return f"{normalized}/metrics"
+
+
+GPU_KV_CACHE_USAGE_METRICS = {
+    "vllm:gpu_cache_usage_perc",
+    "vllm:kv_cache_usage_perc",
+    "ray_vllm_kv_cache_usage_perc",
+}
+
+
+def _metric_name_from_prometheus_line(line: str) -> str:
+    return line.split(None, 1)[0].split("{", 1)[0]
+
+
+def _metric_value_from_prometheus_line(line: str) -> float | None:
+    parts = line.split()
+    if not parts:
+        return None
+    with contextlib.suppress(ValueError, OverflowError):
+        value = float(parts[-1])
+        if np.isfinite(value):
+            return value
+    return None
+
+
+def _normalize_gpu_kv_cache_usage(value: float) -> float:
+    if 0.0 <= value <= 1.0:
+        return value * 100.0
+    return value
+
+
+def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
+    num_drafts = 0
+    num_draft_tokens = 0
+    num_accepted_tokens = 0
+    accepted_per_pos: dict[int, int] = {}
+    found_spec_decode = False
+    gpu_kv_cache_usage_samples: list[float] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        metric_name = _metric_name_from_prometheus_line(line)
+        value = _metric_value_from_prometheus_line(line)
+        if value is None:
+            continue
+
+        if metric_name in GPU_KV_CACHE_USAGE_METRICS:
+            gpu_kv_cache_usage_samples.append(_normalize_gpu_kv_cache_usage(value))
+            continue
+
+        if not metric_name.startswith("vllm:spec_decode"):
+            continue
+        if not metric_name.endswith("_total"):
+            continue
+
+        found_spec_decode = True
+        if "num_drafts" in metric_name:
+            num_drafts += int(value)
+        elif "num_draft_tokens" in metric_name:
+            num_draft_tokens += int(value)
+        elif "num_accepted_tokens_per_pos" in metric_name:
+            pos_label = 'position="'
+            if pos_label in line:
+                with contextlib.suppress(ValueError):
+                    start = line.index(pos_label) + len(pos_label)
+                    end = line.index('"', start)
+                    pos = int(line[start:end])
+                    accepted_per_pos[pos] = accepted_per_pos.get(pos, 0) + int(value)
+        elif "num_accepted_tokens" in metric_name:
+            num_accepted_tokens += int(value)
+
+    spec_decode = None
+    if found_spec_decode:
+        spec_decode = SpecDecodeMetrics(
+            num_drafts=num_drafts,
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            accepted_per_pos=accepted_per_pos,
+        )
+
+    gpu_kv_cache_usage = (
+        max(gpu_kv_cache_usage_samples) if gpu_kv_cache_usage_samples else None
+    )
+    return RuntimeMetrics(
+        spec_decode=spec_decode,
+        gpu_kv_cache_usage=gpu_kv_cache_usage,
+    )
+
+
+async def fetch_runtime_metrics(
+    base_url: str,
+    session: aiohttp.ClientSession,
+    extra_headers: dict[str, str] | None = None,
+) -> RuntimeMetrics | None:
+    """Fetch runtime metrics from the server's Prometheus endpoint."""
+    metrics_url = _metrics_url_from_base(base_url)
+    try:
+        async with session.get(metrics_url, headers=extra_headers) as response:
+            if response.status != 200:
+                return None
+            return parse_runtime_metrics_text(await response.text())
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+
+
 async def fetch_spec_decode_metrics(
-    base_url: str, session: aiohttp.ClientSession
+    base_url: str,
+    session: aiohttp.ClientSession,
+    extra_headers: dict[str, str] | None = None,
 ) -> SpecDecodeMetrics | None:
     """Fetch speculative decoding metrics from the server's Prometheus endpoint.
 
     Returns None if speculative decoding is not enabled or metrics are not available.
     """
-    metrics_url = f"{base_url}/metrics"
-    try:
-        async with session.get(metrics_url) as response:
-            if response.status != 200:
-                return None
-            text = await response.text()
-
-            num_drafts = 0
-            num_draft_tokens = 0
-            num_accepted_tokens = 0
-            accepted_per_pos: dict[int, int] = {}
-            found_spec_decode = False
-
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                if line.startswith("vllm:spec_decode"):
-                    # Extract metric name (before labels) to avoid matching
-                    # substrings inside label values.
-                    parts = line.split(None, 1)
-                    metric_name = parts[0].split("{")[0]
-                    if not metric_name.endswith("_total"):
-                        continue
-                    found_spec_decode = True
-                    with contextlib.suppress(ValueError):
-                        if "num_drafts" in metric_name:
-                            num_drafts += int(float(parts[-1]))
-                        elif "num_draft_tokens" in metric_name:
-                            num_draft_tokens += int(float(parts[-1]))
-                        elif "num_accepted_tokens_per_pos" in metric_name:
-                            pos_label = 'position="'
-                            if pos_label in line:
-                                start = line.index(pos_label) + len(pos_label)
-                                end = line.index('"', start)
-                                pos = int(line[start:end])
-                                val = int(float(parts[-1]))
-                                accepted_per_pos[pos] = (
-                                    accepted_per_pos.get(pos, 0) + val
-                                )
-                        elif "num_accepted_tokens" in metric_name:
-                            num_accepted_tokens += int(float(parts[-1]))
-
-            if not found_spec_decode:
-                return None
-
-            return SpecDecodeMetrics(
-                num_drafts=num_drafts,
-                num_draft_tokens=num_draft_tokens,
-                num_accepted_tokens=num_accepted_tokens,
-                accepted_per_pos=accepted_per_pos,
-            )
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    metrics = await fetch_runtime_metrics(base_url, session, extra_headers)
+    if metrics is None:
         return None
+    return metrics.spec_decode
+
+
+class RuntimeMetricsSampler:
+    """Background sampler for runtime Prometheus metrics during a benchmark."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        session: aiohttp.ClientSession,
+        extra_headers: dict[str, str] | None = None,
+        interval_s: float = 1.0,
+    ) -> None:
+        self.base_url = base_url
+        self.session = session
+        self.extra_headers = extra_headers
+        self.interval_s = interval_s
+        self._samples: list[float] = []
+        self._task: asyncio.Task | None = None
+        self._stopped = asyncio.Event()
+
+    async def start(self) -> None:
+        await self._scrape_once()
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> RuntimeMetricsSummary:
+        self._stopped.set()
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+        await self._scrape_once()
+        return RuntimeMetricsSummary.from_samples(self._samples)
+
+    async def _run(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=self.interval_s)
+            except asyncio.TimeoutError:
+                await self._scrape_once()
+
+    async def _scrape_once(self) -> None:
+        metrics = await fetch_runtime_metrics(
+            self.base_url, self.session, self.extra_headers
+        )
+        if metrics is not None and metrics.gpu_kv_cache_usage is not None:
+            self._samples.append(metrics.gpu_kv_cache_usage)
+
+
+def add_runtime_metrics_to_result(
+    result: dict[str, Any],
+    summary: RuntimeMetricsSummary,
+) -> None:
+    result["avg_gpu_kv_cache_usage"] = summary.avg_gpu_kv_cache_usage
+    result["peak_gpu_kv_cache_usage"] = summary.peak_gpu_kv_cache_usage
 
 
 class TaskType(Enum):
@@ -208,6 +352,8 @@ class BenchmarkMetrics:
     finish_reason_length: int = 0      # finish_reason == "length" 的成功请求数
     usage_reported_count: int = 0      # 服务端流式上报了 output_tokens 的成功请求数
     tokenizer_fallback_count: int = 0  # 未上报 usage 时用 tokenizer 回退统计的成功请求数
+    total_cached_tokens: int = 0       # 命中 prefix cache 的 prompt token 总数（usage.cached_tokens 累计）
+    cached_reported_count: int = 0     # 服务端上报了 cached_tokens 字段的成功请求数
 
 
 @dataclass
@@ -408,6 +554,45 @@ def calculate_metrics_for_embeddings(
     return metrics
 
 
+def resolve_warmup_config(
+    *,
+    max_concurrency: int | None,
+    warmup_concurrency: int | None,
+    output_len: int,
+    warmup_output_len: int | None,
+) -> tuple[int | None, int]:
+    """Resolve warmup concurrency and output length.
+
+    Falls back to max_concurrency when warmup_concurrency is None (backward compatible);
+    falls back to the profile output_len when warmup_output_len is None.
+    """
+    cc = warmup_concurrency if warmup_concurrency is not None else max_concurrency
+    ol = warmup_output_len if warmup_output_len is not None else output_len
+    return cc, ol
+
+
+def resolve_connection_limit(
+    *,
+    max_concurrency: int | None,
+    warmup_concurrency: int | None,
+) -> int:
+    return max(max_concurrency or 0, warmup_concurrency or 0)
+
+
+def warmup_batch_sizes(
+    *,
+    num_warmups: int,
+    warmup_concurrency: int | None,
+) -> list[int]:
+    if num_warmups <= 0:
+        return []
+    batch_size = warmup_concurrency or num_warmups
+    return [
+        min(batch_size, num_warmups - start)
+        for start in range(0, num_warmups, batch_size)
+    ]
+
+
 def calculate_metrics(
     input_requests: list[SampleRequest],
     outputs: list[RequestFuncOutput],
@@ -435,6 +620,8 @@ def calculate_metrics(
     finish_reason_length = 0
     usage_reported_count = 0
     tokenizer_fallback_count = 0
+    total_cached = 0
+    cached_reported_count = 0
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
@@ -467,6 +654,9 @@ def calculate_metrics(
                     tokenizer_fallback_count += 1
             actual_output_lens.append(output_len)
             total_input += outputs[i].prompt_len
+            total_cached += outputs[i].cached_tokens
+            if outputs[i].cached_reported:
+                cached_reported_count += 1
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
@@ -626,6 +816,8 @@ def calculate_metrics(
         finish_reason_length=finish_reason_length,
         usage_reported_count=usage_reported_count,
         tokenizer_fallback_count=tokenizer_fallback_count,
+        total_cached_tokens=total_cached,
+        cached_reported_count=cached_reported_count,
     )
 
     return metrics, actual_output_lens
@@ -655,12 +847,15 @@ async def benchmark(
     extra_headers: dict | None,
     extra_body: dict | None,
     lora_assignment: Literal["random", "round-robin"] = "random",
+    warmup_concurrency: int | None = None,
+    warmup_output_len: int | None = None,
     ramp_up_strategy: Literal["linear", "exponential"] | None = None,
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
     self_timed: bool = False,
+    language: str | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -670,9 +865,13 @@ async def benchmark(
     # Reuses connections across requests to reduce TLS handshake overhead.
     # Use ssl_context if provided, otherwise default to True for https URLs
     ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
+    connector_limit = resolve_connection_limit(
+        max_concurrency=max_concurrency,
+        warmup_concurrency=warmup_concurrency,
+    )
     connector = aiohttp.TCPConnector(
-        limit=max_concurrency or 0,
-        limit_per_host=max_concurrency or 0,
+        limit=connector_limit,
+        limit_per_host=connector_limit,
         ttl_dns_cache=300,
         use_dns_cache=True,
         keepalive_timeout=60,
@@ -703,16 +902,23 @@ async def benchmark(
             and all(isinstance(item, dict) for item in test_mm_content)
         )
     ), "multi_modal_data must be a dict or list[dict]"
+    warmup_cc, warmup_ol = resolve_warmup_config(
+        max_concurrency=max_concurrency,
+        warmup_concurrency=warmup_concurrency,
+        output_len=test_output_len,
+        warmup_output_len=warmup_output_len,
+    )
     test_input = RequestFuncInput(
         model=model_id,
         model_name=model_name,
         prompt=test_prompt,
         api_url=api_url,
         prompt_len=test_prompt_len,
-        output_len=test_output_len,
+        output_len=warmup_ol,
         logprobs=logprobs,
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
+        language=language,
         extra_headers=extra_headers,
         extra_body=extra_body,
     )
@@ -739,22 +945,25 @@ async def benchmark(
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
         warmup_semaphore = (
-            asyncio.Semaphore(max_concurrency)
-            if max_concurrency
+            asyncio.Semaphore(warmup_cc)
+            if warmup_cc
             else contextlib.nullcontext()
         )
-        warmup_tasks = []
-
         async def warmup_limited_request_func():
             async with warmup_semaphore:
                 return await request_func(
                     request_func_input=test_input, session=session, pbar=warmup_pbar
                 )
 
-        for _ in range(num_warmups):
-            request_task = asyncio.create_task(warmup_limited_request_func())
-            warmup_tasks.append(request_task)
-        _ = await asyncio.gather(*warmup_tasks)
+        for batch_size in warmup_batch_sizes(
+            num_warmups=num_warmups,
+            warmup_concurrency=warmup_cc,
+        ):
+            warmup_tasks = [
+                asyncio.create_task(warmup_limited_request_func())
+                for _ in range(batch_size)
+            ]
+            _ = await asyncio.gather(*warmup_tasks)
 
         if warmup_pbar is not None:
             warmup_pbar.close()
@@ -790,6 +999,7 @@ async def benchmark(
             logprobs=logprobs,
             multi_modal_content=test_mm_content,
             ignore_eos=ignore_eos,
+            language=language,
             extra_headers=extra_headers,
             extra_body=extra_body,
         )
@@ -815,7 +1025,15 @@ async def benchmark(
     else:
         print("Self timing is set, using the timestamps from the trace file.")
 
-    spec_decode_metrics_before = await fetch_spec_decode_metrics(base_url, session)
+    spec_decode_metrics_before = await fetch_spec_decode_metrics(
+        base_url, session, extra_headers
+    )
+    runtime_sampler = RuntimeMetricsSampler(
+        base_url=base_url,
+        session=session,
+        extra_headers=extra_headers,
+    )
+    await runtime_sampler.start()
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -883,6 +1101,7 @@ async def benchmark(
             logprobs=logprobs,
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
+            language=language,
             extra_headers=extra_headers,
             extra_body=extra_body,
             request_id=request_id,
@@ -894,14 +1113,19 @@ async def benchmark(
                 )
             )
         )
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    try:
+        outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    finally:
+        runtime_metrics_summary = await runtime_sampler.stop()
 
     if pbar is not None:
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    spec_decode_metrics_after = await fetch_spec_decode_metrics(base_url, session)
+    spec_decode_metrics_after = await fetch_spec_decode_metrics(
+        base_url, session, extra_headers
+    )
     spec_decode_stats: dict[str, Any] | None = None
     if spec_decode_metrics_before is not None and spec_decode_metrics_after is not None:
         delta_drafts = (
@@ -1037,6 +1261,8 @@ async def benchmark(
             "finish_reason_length": metrics.finish_reason_length,
             "usage_reported_count": metrics.usage_reported_count,
             "tokenizer_fallback_count": metrics.tokenizer_fallback_count,
+            "total_cached_tokens": metrics.total_cached_tokens,
+            "cached_reported_count": metrics.cached_reported_count,
         }
     else:
         result = {
@@ -1051,6 +1277,8 @@ async def benchmark(
 
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
+
+    add_runtime_metrics_to_result(result, runtime_metrics_summary)
 
     if spec_decode_stats is not None:
         result["spec_decode_acceptance_rate"] = spec_decode_stats["acceptance_rate"]
@@ -1149,6 +1377,7 @@ async def benchmark(
             prompt_len=test_prompt_len,
             output_len=test_output_len,
             logprobs=logprobs,
+            language=language,
         )
         profile_output = await request_func(
             request_func_input=profile_input, session=session
@@ -1306,6 +1535,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         type=str,
         default="/v1/completions",
         help="API endpoint.",
+    )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Language hint for audio transcription backends.",
     )
     parser.add_argument(
         "--header",
@@ -1907,6 +2142,8 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ignore_eos=args.ignore_eos,
         goodput_config_dict=goodput_config_dict,
         max_concurrency=args.max_concurrency,
+        warmup_concurrency=getattr(args, "warmup_concurrency", None),
+        warmup_output_len=getattr(args, "warmup_output_len", None),
         lora_modules=args.lora_modules,
         lora_assignment=args.lora_assignment,
         extra_headers=headers,
@@ -1917,6 +2154,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
         self_timed=args.self_timed,
+        language=getattr(args, "language", None),
     )
 
     # Save config and results to json

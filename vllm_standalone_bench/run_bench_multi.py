@@ -40,11 +40,12 @@ import csv
 import hashlib
 import importlib.util
 import itertools
+import json
 import logging
 import os
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +82,9 @@ _rbs_spec.loader.exec_module(_rbs_mod)   # 执行所有 shim 注入 + 加载 vll
 # 获取已加载的 vllm_bench/serve.py 模块
 _serve = _rbs_mod._serve
 
+ASR_BACKEND = "openai-audio"
+DEFAULT_ASR_DATASET_NAME = "custom_audio"
+
 
 # ─── 构建 serve.py 所需的 argparse.Namespace ──────────────────────────────────
 
@@ -99,6 +103,7 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
     base.model = our_args.model
     base.served_model_name = our_args.served_model_name or our_args.model
     base.backend = our_args.backend
+    is_asr_backend = our_args.backend == ASR_BACKEND
 
     if our_args.base_url:
         # ── 完整 URL 模式（优先级高于 host:port）──────────────────────────────
@@ -111,6 +116,8 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
         # endpoint 不含版本前缀（base_url 已包含 /v1）
         if our_args.backend == 'openai-chat':
             base.endpoint = '/chat/completions'
+        elif is_asr_backend:
+            base.endpoint = '/audio/transcriptions'
         else:
             base.endpoint = '/completions'
         # HTTPS 时自动开启 SSL；如需跳过证书验证请使用 --insecure
@@ -122,6 +129,8 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
         base.port = our_args.port
         if our_args.backend == 'openai-chat':
             base.endpoint = '/v1/chat/completions'
+        elif is_asr_backend:
+            base.endpoint = '/v1/audio/transcriptions'
         else:
             base.endpoint = '/v1/completions'
 
@@ -130,14 +139,34 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
         base.header = [f'Authorization=Bearer {our_args.api_key}']
 
     # ── tokenizer ────────────────────────────────────────────────────────────
-    if our_args.tokenizer:
+    if is_asr_backend:
+        base.skip_tokenizer_init = True
+    elif our_args.tokenizer:
         base.tokenizer = our_args.tokenizer
     else:
         # 无 tokenizer 时跳过 tokenizer 初始化，使用近似字符串模式
         base.skip_tokenizer_init = True
 
-    # ── 数据集固定为 random ──────────────────────────────────────────────────
-    base.dataset_name = 'random'
+    # ── 数据集 ──────────────────────────────────────────────────────────────
+    if is_asr_backend:
+        base.dataset_name = (
+            getattr(our_args, "dataset_name", None) or DEFAULT_ASR_DATASET_NAME
+        )
+        base.dataset_path = getattr(our_args, "dataset_path", None)
+        base.language = getattr(our_args, "language", None) or "en"
+    else:
+        dataset = getattr(our_args, 'dataset', 'random')
+        if dataset == 'builtin_mtp_chat' and not our_args.tokenizer:
+            raise ValueError('builtin_mtp_chat requires --tokenizer')
+        base.dataset_name = dataset
+        base.dataset_length_policy = getattr(our_args, 'dataset_length_policy', 'exact')
+        base.dataset_input_len_tolerance = getattr(
+            our_args, 'dataset_input_len_tolerance', 0.2
+        )
+        base.dataset_on_bucket_shortage = getattr(
+            our_args, 'dataset_on_bucket_shortage', 'error'
+        )
+        base.dataset_sampling = getattr(our_args, 'dataset_sampling', 'shuffle')
 
     # ── 流量控制：不限速，仅用 max_concurrency 控制并发 ───────────────────────
     base.request_rate = float('inf')
@@ -159,6 +188,10 @@ def _build_base_args(our_args: argparse.Namespace) -> argparse.Namespace:
     # 初始值：不检查，不预热
     base.ready_check_timeout_sec = 0
     base.num_warmups = 0
+
+    # ── warmup 固定并发/输出参数 ────────────────────────────────────────────
+    base.warmup_concurrency = getattr(our_args, 'warmup_concurrency', None)
+    base.warmup_output_len = getattr(our_args, 'warmup_output_len', None)
 
     return base
 
@@ -261,6 +294,9 @@ def _extract_row(
     prefix_ratio: float = 0.0,
     has_tokenizer: bool = False,
     seed: int = 0,
+    *,
+    dataset_name: str = "random",
+    language: str = "",
 ) -> dict:
     """从 _serve.main_async() 返回的字典中提取并重命名需要的指标字段。
 
@@ -276,6 +312,16 @@ def _extract_row(
     def _i(key: str, default=0) -> int:
         return int(result.get(key, default) or default)
 
+    def _i_any(*keys: str, default=0) -> int:
+        for key in keys:
+            if result.get(key) is not None:
+                return int(result.get(key) or default)
+        return default
+
+    def _json_list(key: str) -> str:
+        value = result.get(key) or []
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
     def _rate(numerator: float, denominator_s: float) -> float:
         if denominator_s <= 0:
             return 0.0
@@ -284,12 +330,17 @@ def _extract_row(
     completed = _i('completed')
     total_in = _i('total_input_tokens')
     total_out = _i('total_output_tokens')
+    total_cached = _i('total_cached_tokens')
 
     # ── 真实平均 token 数（来自服务端上报的总量）─────────────────────────────
     # 注意：completed==0（全部失败）时回退 0.0，【不】回退 requested 值——
     # 否则会把零成功伪装成"按指定长度输出"，复发 Bug①。
     avg_in = round(total_in / completed, 1) if completed > 0 else 0.0
     avg_out = round(total_out / completed, 1) if completed > 0 else 0.0
+    avg_cached_tokens = round(total_cached / completed, 1) if completed > 0 else 0.0
+    cache_hit_rate = (
+        round(total_cached / total_in * 100, 1) if total_in > 0 else 0.0
+    )
 
     # ── token 计数来源 ────────────────────────────────────────────────────────
     token_source = decide_token_usage_source(
@@ -320,11 +371,18 @@ def _extract_row(
     input_throughput_tok_s = _rate(total_in, duration_s)
     prefill_effective_tok_s = _rate(raw_avg_in, mean_ttft_ms / 1000.0)
     decode_effective_tok_s = _rate(1.0, mean_tpot_ms / 1000.0)
+    rtfx = _f('rtfx')
+    audio_duration_s_total = round(rtfx * duration_s, 4) if rtfx > 0 else 0.0
+    audio_duration_s_avg = (
+        round(audio_duration_s_total / completed, 4) if completed > 0 else 0.0
+    )
 
     return {
         # ── 测试配置 ────────────────────────────────
         'model':           model,
         'backend':         backend,
+        'dataset_name':    dataset_name,
+        'language':        language,
         'input_len':       in_len,           # requested 总输入长度
         'output_len':      out_len,           # requested 输出长度
         'total_input_len': total_input_len,  # 新语义下等于 input_len
@@ -343,6 +401,25 @@ def _extract_row(
         'output_compliance':   output_compliance,
         'finish_reason_length_pct': finish_reason_length_pct,
         'token_source':        token_source,
+        'avg_cached_tokens':   avg_cached_tokens,   # 平均命中缓存的 prompt token 数
+        'cache_hit_rate':      cache_hit_rate,       # token 加权缓存命中率 (%) = total_cached/total_in*100
+        'avg_gpu_kv_cache_usage': _f('avg_gpu_kv_cache_usage'),
+        'peak_gpu_kv_cache_usage': _f('peak_gpu_kv_cache_usage'),
+        # ── MTP / Spec Decode ───────────────────────
+        'spec_decode_acceptance_rate': _f('spec_decode_acceptance_rate'),
+        'spec_decode_system_efficiency': _f('spec_decode_system_efficiency'),
+        'spec_decode_num_drafts': _i('spec_decode_num_drafts'),
+        'spec_decode_num_accepted_tokens': _i_any(
+            'spec_decode_num_accepted_tokens',
+            'spec_decode_accepted_tokens',
+        ),
+        'spec_decode_num_draft_tokens': _i_any(
+            'spec_decode_num_draft_tokens',
+            'spec_decode_draft_tokens',
+        ),
+        'spec_decode_per_position_acceptance_rates': _json_list(
+            'spec_decode_per_position_acceptance_rates'
+        ),
         # ── 吞吐量 ──────────────────────────────────
         'throughput_req_s':   _f('request_throughput'),
         'throughput_tok_s':   _f('output_throughput'),  # 输出 Token 系统吞吐，vLLM 官方口径
@@ -365,6 +442,9 @@ def _extract_row(
         'e2el_p90_ms':   _f('p90_e2el_ms'),
         'e2el_p99_ms':   _f('p99_e2el_ms'),
         # ── 其他 ────────────────────────────────────
+        'audio_duration_s_total': audio_duration_s_total,
+        'audio_duration_s_avg':   audio_duration_s_avg,
+        'rtfx':          rtfx,
         'duration_s':    _f('duration'),
     }
 
@@ -372,33 +452,45 @@ def _extract_row(
 # ─── 结果保存 ──────────────────────────────────────────────────────────────────
 
 CSV_HEADERS = [
-    'model', 'backend',
+    'model', 'backend', 'dataset_name', 'language',
     'input_len', 'output_len', 'total_input_len', 'prefix_ratio', 'prefix_tokens',
     'parallel_num', 'epochs', 'num_prompts', 'seed',
     'n_success', 'n_failed',
     'avg_input_tokens', 'avg_output_tokens',
     'input_compliance', 'output_compliance',
     'finish_reason_length_pct', 'token_source',
+    'avg_cached_tokens', 'cache_hit_rate',
+    'avg_gpu_kv_cache_usage', 'peak_gpu_kv_cache_usage',
+    'spec_decode_acceptance_rate', 'spec_decode_system_efficiency',
+    'spec_decode_num_drafts', 'spec_decode_num_accepted_tokens',
+    'spec_decode_num_draft_tokens', 'spec_decode_per_position_acceptance_rates',
     'throughput_req_s', 'throughput_tok_s', 'input_throughput_tok_s',
     'prefill_effective_tok_s', 'decode_effective_tok_s',
     'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
     'tpot_mean_ms', 'tpot_p50_ms', 'tpot_p90_ms', 'tpot_p99_ms',
     'e2el_mean_ms', 'e2el_p50_ms', 'e2el_p90_ms', 'e2el_p99_ms',
+    'audio_duration_s_total', 'audio_duration_s_avg', 'rtfx',
     'duration_s',
 ]
 
 CSV_HEADERS_ZH = [
-    '模型', '接口类型',
+    '模型', '接口类型', '数据集', '语言',
     '输入长度(token)', '输出长度(token)', '总输入长度(token)', '前缀比例', '前缀tokens数',
     '并发数', '测试轮数', '总请求数', '随机种子',
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
     '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
+    '平均缓存命中tokens', '缓存命中率(%)',
+    '平均GPU KV缓存占用率(%)', '峰值GPU KV缓存占用率(%)',
+    'SpecDecode接受率(%)', 'SpecDecode系统效率',
+    'SpecDecode草稿轮数', 'SpecDecode接受tokens数',
+    'SpecDecode草稿tokens数', 'SpecDecode分位置接受率(%)',
     '请求吞吐(req/s)', '输出Token系统吞吐(tok/s)', '输入Token系统吞吐(tok/s)',
     'Prefill有效速率(tok/s)', 'Decode有效速率(tok/s)',
     'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
     'TPOT均值(ms)', 'TPOT_P50(ms)', 'TPOT_P90(ms)', 'TPOT_P99(ms)',
     'E2EL均值(ms)', 'E2EL_P50(ms)', 'E2EL_P90(ms)', 'E2EL_P99(ms)',
+    '音频总时长(s)', '平均音频时长(s)', 'RTFx',
     '测试耗时(s)',
 ]
 
@@ -437,10 +529,14 @@ def save_xlsx(rows: List[dict], path: str) -> None:
 
     for col, h in enumerate(CSV_HEADERS, 1):
         c = ws.cell(row=1, column=col, value=h)
-        c.font = hdr_font; c.fill = hdr_fill; c.alignment = center
+        c.font = hdr_font
+        c.fill = hdr_fill
+        c.alignment = center
     for col, h in enumerate(CSV_HEADERS_ZH, 1):
         c = ws.cell(row=2, column=col, value=h)
-        c.font = sub_font; c.fill = sub_fill; c.alignment = center
+        c.font = sub_font
+        c.fill = sub_fill
+        c.alignment = center
 
     fill_a = PatternFill(fill_type='solid', fgColor='F2F7FF')
     fill_b = PatternFill(fill_type='solid', fgColor='FFFFFF')
@@ -479,6 +575,16 @@ def save_xlsx(rows: List[dict], path: str) -> None:
         ('input_throughput_tok_s', '输入 Token 系统吞吐量', 'total_input_tokens ÷ benchmark_duration'),
         ('prefill_effective_tok_s', 'Prefill 有效速率', 'avg_input_tokens ÷ mean_TTFT_s；TTFT 含排队、调度和首 token'),
         ('decode_effective_tok_s', 'Decode 有效速率', '1 ÷ mean_TPOT_s；基于 TPOT 的 next-token decode 近似速率'),
+        ('avg_cached_tokens', '平均缓存命中 tokens', 'total_cached_tokens ÷ completed（服务端 usage.cached_tokens 累计）'),
+        ('cache_hit_rate', '缓存命中率(%)', 'total_cached_tokens ÷ total_input_tokens × 100（token 加权；仅服务端开启 prefix caching 时非零）'),
+        ('avg_gpu_kv_cache_usage', '平均 GPU KV cache 占用率(%)', 'benchmark 运行期间定期采样 /metrics 中 GPU KV cache usage 后求平均值'),
+        ('peak_gpu_kv_cache_usage', '峰值 GPU KV cache 占用率(%)', 'benchmark 运行期间定期采样 /metrics 中 GPU KV cache usage 后取峰值'),
+        ('spec_decode_acceptance_rate', 'Spec Decode 接受率(%)', 'accepted_tokens ÷ draft_tokens × 100（来自 /metrics 差分）'),
+        ('spec_decode_system_efficiency', 'Spec Decode 系统效率', '接受 tokens 相对 draft tokens 的服务端效率指标'),
+        ('spec_decode_num_drafts', 'Spec Decode 草稿轮数', 'num_drafts_total 差分'),
+        ('spec_decode_num_accepted_tokens', 'Spec Decode 接受 tokens 数', 'num_accepted_tokens_total 差分'),
+        ('spec_decode_num_draft_tokens', 'Spec Decode 草稿 tokens 数', 'num_draft_tokens_total 差分'),
+        ('spec_decode_per_position_acceptance_rates', '分位置接受率(%)', '各 speculative position 的接受率列表'),
         ('P50/P90/P99', '百分位数', 'P90 表示 90% 请求低于该延迟值'),
         ('', '', ''),
         ('并发控制说明', '',
@@ -492,7 +598,8 @@ def save_xlsx(rows: List[dict], path: str) -> None:
         for ci, val in enumerate(rd, 1):
             c = ws2.cell(row=ri, column=ci, value=val)
             if ri == 1:
-                c.font = tf; c.fill = tfl
+                c.font = tf
+                c.fill = tfl
             c.alignment = Alignment(wrap_text=True, vertical='center')
     for ci, w in zip(range(1, 4), [22, 45, 55]):
         ws2.column_dimensions[get_column_letter(ci)].width = w
@@ -509,21 +616,35 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
     为每组构建 serve.py 所需 args，调用 _serve.main_async()，
     收集并返回所有指标行。
     """
+    backend = getattr(our_args, "backend", "openai")
+    is_asr_backend = backend == ASR_BACKEND
+    if is_asr_backend and not getattr(our_args, "dataset_path", None):
+        raise ValueError("--backend openai-audio requires --dataset-path")
+
     validate_seed(our_args.seed)
     vary_seed_by_config = not our_args.no_vary_seed_by_config
 
     # 构建基础 Namespace（含全部 serve.py 默认值）
     base = _build_base_args(our_args)
-    _derive_prefix_suffix_tokens(1, our_args.prefix_ratio)
+    if is_asr_backend:
+        if list(our_args.input_lens) != [0] or our_args.prefix_ratio != 0.0:
+            logger.warning(
+                "ASR backend openai-audio ignores --input-lens and "
+                "--prefix-ratio; using input_lens=[0], prefix_ratio=0.0"
+            )
+    else:
+        _derive_prefix_suffix_tokens(1, our_args.prefix_ratio)
     model = our_args.served_model_name or our_args.model
 
     # 构建 (in_len, out_len) 测试对
-    in_lens: List[int] = our_args.input_lens
+    in_lens: List[int] = [0] if is_asr_backend else our_args.input_lens
     out_lens: List[int] = our_args.output_lens
 
     if our_args.cross_product:
         io_pairs = list(itertools.product(in_lens, out_lens))
         logger.info("笛卡尔积模式: %d × %d = %d 组", len(in_lens), len(out_lens), len(io_pairs))
+    elif is_asr_backend:
+        io_pairs = [(0, out_len) for out_len in out_lens]
     else:
         if len(out_lens) == 1:
             out_lens = out_lens * len(in_lens)
@@ -573,35 +694,49 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                 )
                 continue
 
-            prefix_ratio = our_args.prefix_ratio
-            prefix_tokens, suffix_tokens = _derive_prefix_suffix_tokens(in_len, prefix_ratio)
+            prefix_ratio = 0.0 if is_asr_backend else our_args.prefix_ratio
+            cfg_input_len = 0 if is_asr_backend else in_len
+            if is_asr_backend:
+                prefix_tokens = 0
+                suffix_tokens = 0
+            else:
+                prefix_tokens, suffix_tokens = _derive_prefix_suffix_tokens(
+                    in_len, prefix_ratio
+                )
             effective_seed = effective_config_seed(
                 base_seed=our_args.seed,
-                input_len=in_len,
+                input_len=cfg_input_len,
                 output_len=out_len,
                 parallel_num=parallel_num,
                 prefix_ratio=prefix_ratio,
                 config_index=config_count,
                 vary_seed_by_config=vary_seed_by_config,
             )
+            prefix_detail = ""
+            if not is_asr_backend:
+                prefix_detail = (
+                    f"  total_input={in_len} prefix={prefix_tokens}tok"
+                    f"({prefix_ratio * 100:.0f}%) suffix={suffix_tokens}tok"
+                )
 
             logger.info(
                 "\n%s\n[%d/%d] 开始测试: input=%d, output=%d, parallel=%d, "
                 "num_prompts=%d (=%d×%d epochs), seed=%d%s\n%s",
                 "─" * 65,
                 config_count, total_configs,
-                in_len, out_len, parallel_num,
+                cfg_input_len, out_len, parallel_num,
                 parallel_num * our_args.epochs, parallel_num, our_args.epochs,
                 effective_seed,
-                (f"  total_input={in_len} prefix={prefix_tokens}tok({prefix_ratio * 100:.0f}%)"
-                 f" suffix={suffix_tokens}tok"),
+                prefix_detail,
                 "─" * 65,
             )
 
             # 复制 base args，按本次配置覆盖可变字段
             cfg = copy.copy(base)
-            cfg.input_len       = in_len       # serve.py 内部映射到 random_input_len（总输入长度）
-            cfg.output_len      = out_len       # serve.py 内部映射到 random_output_len
+            cfg.input_len       = cfg_input_len  # serve.py 内部映射到数据集输入长度
+            cfg.output_len      = out_len       # serve.py 内部映射到数据集输出长度
+            if is_asr_backend:
+                cfg.custom_output_len = out_len
             cfg.max_concurrency = parallel_num  # 最大并发数
             cfg.num_prompts     = parallel_num * our_args.epochs  # 总请求数
             cfg.seed            = effective_seed
@@ -613,7 +748,12 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
             # 第一次运行：做 ready check（超时 600s）；后续跳过（设为 0）
             if is_first_run:
                 cfg.ready_check_timeout_sec = 600
-                cfg.num_warmups = our_args.warmup_requests
+                # 固定并发预热：warmup_requests 表示轮数；
+                # warmup_concurrency 设了则每轮发满该并发。
+                warmup_cc = getattr(our_args, 'warmup_concurrency', None)
+                cfg.num_warmups = our_args.warmup_requests * (
+                    warmup_cc if warmup_cc is not None else 1
+                )
                 is_first_run = False
             else:
                 cfg.ready_check_timeout_sec = 0
@@ -634,12 +774,18 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
                 continue
 
             # 提取汇总指标
-            row = _extract_row(result, in_len, out_len, parallel_num,
+            row = _extract_row(result, cfg_input_len, out_len, parallel_num,
                                our_args.epochs, model, our_args.backend,
                                prefix_tokens=prefix_tokens,
                                prefix_ratio=prefix_ratio,
-                               has_tokenizer=bool(our_args.tokenizer),
-                               seed=effective_seed)
+                               has_tokenizer=(
+                                   False if is_asr_backend else bool(our_args.tokenizer)
+                               ),
+                               seed=effective_seed,
+                               dataset_name=getattr(cfg, "dataset_name", "random"),
+                               language=(
+                                   getattr(cfg, "language", "") if is_asr_backend else ""
+                               ))
             all_rows.append(row)
 
             # 打印摘要行
@@ -709,7 +855,7 @@ def _run_all(our_args: argparse.Namespace) -> List[dict]:
 
 # ─── CLI 参数解析 ──────────────────────────────────────────────────────────────
 
-def _parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             '多配置 vLLM OpenAI 接口批量基准测试\n'
@@ -754,16 +900,19 @@ def _parse_args() -> argparse.Namespace:
                       help='模型名称，需与服务端 --model 完全一致')
     conn.add_argument('--served-model-name', default=None,
                       help='服务端挂载的模型别名（若与 --model 不同时指定）')
-    conn.add_argument('--backend', choices=['openai', 'openai-chat'], default='openai',
+    conn.add_argument('--backend', choices=['openai', 'openai-chat', ASR_BACKEND],
+                      default='openai',
                       help='请求接口类型: openai=/v1/completions, '
-                           'openai-chat=/v1/chat/completions（默认: openai）')
+                           'openai-chat=/v1/chat/completions, '
+                           'openai-audio=/v1/audio/transcriptions（默认: openai）')
     conn.add_argument('--api-key', default=None,
                       help='API 认证密钥（若服务端开启鉴权时指定）')
 
     # ── 测试配置 ────────────────────────────────────────────────────────────
     bench = p.add_argument_group('测试配置')
     bench.add_argument('--input-lens', type=int, nargs='+', default=[512],
-                       help='输入 token 长度列表，支持多个值（空格分隔）')
+                       help='输入 token 长度列表，支持多个值（空格分隔）。'
+                            'ASR/openai-audio 会忽略该参数并使用 0')
     bench.add_argument('--output-lens', type=int, nargs='+', default=[128],
                        help='输出 token 长度列表；数量需与 --input-lens 一致，'
                             '或只给 1 个值（广播到所有输入长度）')
@@ -777,14 +926,40 @@ def _parse_args() -> argparse.Namespace:
     bench.add_argument('--sleep-between', type=float, default=2.0,
                        help='每组配置测试后的等待时间（秒，让服务 KV cache 释放，默认: 2.0）')
     bench.add_argument('--warmup-requests', type=int, default=1,
-                       help='首次测试前的预热请求数（仅第一组配置执行，默认: 1）')
+                       help='首次测试前的预热轮数；设 warmup-concurrency 后总预热请求数'
+                            '= warmup_requests × warmup_concurrency（默认: 1）')
+    bench.add_argument('--warmup-concurrency', type=int, default=None,
+                       help='warmup 每轮固定并发数（仅首次预热生效；默认 None=跟随该档并发）')
+    bench.add_argument('--warmup-output-len', type=int, default=None,
+                       help='warmup 请求输出长度（默认 None=跟随该档输出；设短值省 decode 时间）')
+    bench.add_argument('--dataset-name', default=None,
+                       help='ASR 使用的数据集类型；openai-audio 默认 custom_audio')
+    bench.add_argument('--dataset-path', default=None,
+                       help='ASR JSONL 数据集路径；custom_audio 需要')
+    bench.add_argument('--language', default='en',
+                       help='OpenAI Audio transcription language 参数，默认 en')
     bench.add_argument('--prefix-ratio', type=float, default=0.0,
                        help='前缀缓存比例 [0.0~1.0]（默认: 0.0 = 不使用共享前缀）。'
                             '取值 0.5 表示每个请求中有 50%% 的 input_len 作为共享前缀。'
                             '所有请求共享同一段前缀文本（固定生成一次），'
                             '后缀包含 request-index token 加随机 tail，用于保证非 full-prefix 请求差异。'
                             '实际 prompt_len ≈ input_len；共享前缀 token 数约为 input_len × prefix_ratio。'
-                            '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。')
+                            '用于对比 prefix caching 开启/关闭对延迟/吞吐的影响。'
+                            'ASR/openai-audio 会忽略该参数并使用 0.0。')
+    bench.add_argument('--dataset', default='random',
+                       choices=['random', 'builtin_mtp_chat'],
+                       help='请求数据集（默认 random；builtin_mtp_chat 使用内置真实风格 MTP chat prompt）')
+    bench.add_argument('--dataset-length-policy', default='exact',
+                       choices=['exact', 'bucket'],
+                       help='dataset 输入长度策略：exact 精确匹配，bucket 按容忍度筛选')
+    bench.add_argument('--dataset-input-len-tolerance', type=float, default=0.2,
+                       help='dataset-length-policy=bucket 时的 input_len 容忍度')
+    bench.add_argument('--dataset-on-bucket-shortage', default='error',
+                       choices=['error'],
+                       help='bucket 无候选样本时的处理策略')
+    bench.add_argument('--dataset-sampling', default='shuffle',
+                       choices=['shuffle', 'round_robin'],
+                       help='内置数据集采样顺序')
     bench.add_argument('--seed', type=int, default=0,
                        help='随机种子基值。默认每个配置会基于该值派生独立 seed（默认: 0）')
     bench.add_argument('--no-vary-seed-by-config', action='store_true', default=False,
@@ -821,6 +996,11 @@ def _parse_args() -> argparse.Namespace:
     out.add_argument('--result-dir', default=None,
                      help='统一指定输出目录，CSV/XLSX 文件名自动放入此目录')
 
+    return p
+
+
+def _parse_args() -> argparse.Namespace:
+    p = build_arg_parser()
     return p.parse_args()
 
 
@@ -855,6 +1035,7 @@ def main() -> None:
     print(
         f"{'输入':>6} {'输出':>6} {'并发':>5} "
         f"{'out_sys':>10} {'in_sys':>10} {'prefill':>10} {'decode':>10} {'req/s':>8} "
+        f"{'命中%':>8} "
         f"{'TTFT均值':>10} {'TTFT_P90':>10} "
         f"{'TPOT均值':>10} {'E2EL均值':>10} {'成功':>6}"
     )
@@ -867,6 +1048,7 @@ def main() -> None:
             f"{r['prefill_effective_tok_s']:>10.1f} "
             f"{r['decode_effective_tok_s']:>10.1f} "
             f"{r['throughput_req_s']:>8.3f} "
+            f"{r['cache_hit_rate']:>8.1f} "
             f"{r['ttft_mean_ms']:>10.1f} {r['ttft_p90_ms']:>10.1f} "
             f"{r['tpot_mean_ms']:>10.3f} {r['e2el_mean_ms']:>10.1f} {r['n_success']:>6}"
         )

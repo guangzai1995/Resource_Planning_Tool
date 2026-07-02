@@ -36,9 +36,10 @@ python3 vllm_standalone_bench/auto_bench.py run \
 | 端点就绪检查 | ✅ | ✅ |
 | Random 数据集 | ✅ | ✅ |
 | ShareGPT 数据集 | ✅ | ✅（基础） |
+| Built-in MTP Chat 数据集 | ❌ | ✅ |
 | Ramp-up 策略 | ✅ | ❌ |
 | Burstiness (Gamma) | ✅ | ❌ |
-| Speculative Decoding 指标 | ✅ | ❌ |
+| Speculative Decoding 指标 | ✅ | ✅（/metrics 差分） |
 | 多模态 | ✅ | ❌ |
 | Timeline Plot | ✅ | ❌ |
 
@@ -139,6 +140,187 @@ python3 vllm_standalone_bench/auto_bench.py run \
   --config vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json
 ```
 
+## Qwen3-ASR-1.7B 自动压测
+
+Qwen3-ASR 走 OpenAI Audio transcription endpoint。auto bench 配置里将
+`bench_profiles[].backend` 设为 `"openai-audio"` 后，bench-runner 会调用
+`/v1/audio/transcriptions`，并把 `language` 作为 transcription 请求参数传给服务端。
+
+仓库内置了 Qwen3-ASR smoke 配置：
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.qwen3_asr_1_7b.smoke.json
+```
+
+当 `backend` 为 `"openai-audio"` 且 `dataset_path` 未设置时，auto bench 会使用
+bench-runner 镜像内的内置 ASR 数据集：
+
+```text
+/opt/vllm_standalone_bench/assets/librispeech_test_clean_256/asr_smoke.jsonl
+```
+
+该数据集是确定性的 LibriSpeech `test-clean` 子集：采样 seed 为 `20260701`，只保留
+5-30 秒音频，并按 5-10s、10-20s、20-30s 三个时长桶做均衡采样。资产目录同时包含
+`manifest.json`、`ATTRIBUTION.md` 和 `LICENSE.LibriSpeech.txt`，用于审计采样信息、
+来源归属和 LibriSpeech 许可证说明。
+
+如需使用外部 ASR 数据集，把宿主机数据目录挂到容器内 `/datasets`，并在 bench profile
+里显式设置 `dataset_name: "custom_audio"` 与 `dataset_path`：
+
+```json
+{
+  "mounts": {
+    "models": "/Resource_Planning_Tool/model",
+    "datasets": "/Resource_Planning_Tool/datasets"
+  },
+  "bench_profiles": [
+    {
+      "name": "asr_external_128",
+      "backend": "openai-audio",
+      "dataset_name": "custom_audio",
+      "dataset_path": "/datasets/custom/asr.jsonl",
+      "output_lens": [128],
+      "parallel_nums": [1, 4, 8],
+      "epochs": 16,
+      "language": "en"
+    }
+  ]
+}
+```
+
+ASR benchmark 的并发语义和离线静态 batch 不同：`parallel_nums` 中的每个
+`parallel_num` 控制同一配置下最多同时在途的 HTTP transcription 请求数，
+`parallel_num * epochs` 是该配置的总请求数。vLLM server 会在服务端内部做
+continuous batching；选择 128 个样本只是让请求从数据集中循环取样，不会把 128 段音频
+组成一个静态 batch 一次性提交。
+
+## vLLM / SGLang 同台对比
+
+通过 `serve_profiles` 的 `engine` 字段与 `run.images` 映射，可在同一次 run 内分别启动 vLLM 与 SGLang 做对比。样例：`configs/auto_bench.qwen2_5_1_5b.sglang_compare.json`。
+
+### SGLang 镜像离线搬运
+
+```bash
+# 联网机
+docker pull lmsysorg/sglang:latest
+docker save lmsysorg/sglang:latest -o sglang.offline.tar
+# 离线机
+docker load -i sglang.offline.tar
+```
+
+### 常用启动参数等价（仅文档参考，配置里 `args` 原样透传，不自动翻译）
+
+| 用途 | vLLM | SGLang |
+|---|---|---|
+| 显存占用比例 | `--gpu-memory-utilization` | `--mem-fraction-static` |
+| 张量并行 | `--tensor-parallel-size` | `--tp-size` |
+| 最大上下文 | `--max-model-len` | `--context-length` |
+
+run 结束后在 `results/<run_id>/` 产出 `compare.csv`、`compare.xlsx` 与 `plots/*.png`，各引擎原始 `result.csv` 保留在 `<model>/<serve_profile>/<bench_profile>/` 子目录。
+
+### 固定并发预热（消除小并发档 TTFT 首批尖峰）
+
+`bench_profile` 可选字段：
+- `warmup_requests`：warmup 轮数（默认 `1`）
+- `warmup_concurrency`：warmup 每轮固定并发数（默认 `null`=跟随该档并发）
+- `warmup_output_len`：warmup 请求输出长度（默认 `null`=跟随该档输出）
+
+整个测试仅在首个配置前预热一次：用首个配置输入长度和指定输出长度，按
+`warmup_requests × warmup_concurrency` 发起预热请求。例如
+`warmup_requests=8`、`warmup_concurrency=8` 表示 8 轮、每轮并发 8 个请求。
+`smoke` / `sglang_compare` 配置默认 `warmup_concurrency=4`、
+`warmup_output_len=128`。CLI 直跑可用
+`--warmup-requests 8 --warmup-concurrency 8 --warmup-output-len 128`。
+
+### MTP 真实风格内置数据集
+
+`bench_profiles[].dataset.name = "builtin_mtp_chat"` 会启用离线内置的 chat-style
+MTP prompt 数据集。该数据集用真实任务风格的中文/英文技术场景构造 prompt，适合替代随机
+token prompt 来观察 MTP/Spec Decode 接受率。
+
+```json
+"dataset": {
+  "name": "builtin_mtp_chat",
+  "length_policy": "bucket",
+  "input_len_tolerance": 0.2,
+  "on_bucket_shortage": "error",
+  "sampling": "shuffle"
+}
+```
+
+启用该数据集后，`input_lens` 不会失效，而是作为 prompt token bucket 目标。例如
+`input_lens: [4096]` 且 `input_len_tolerance: 0.2` 表示选择约 3276 到 4915 token
+的真实风格 prompt。`output_lens`、`parallel_nums`、`epochs`、`cross_product` 保持
+现有矩阵语义。
+
+注意事项：
+- `builtin_mtp_chat` 需要模型 tokenizer，配置中必须提供 `models[].tokenizer_path`。
+- 数据集只负责 prompt；MTP 本身仍通过 `serve_profiles[].args` 配置，例如
+  `--speculative-config.method mtp` 和 `--speculative-config.num_speculative_tokens 1`。
+- 自动化配置会拒绝漏写前导 `--` 的 `speculative-config.*` 参数。
+- 结果表会导出 `spec_decode_acceptance_rate`、`spec_decode_system_efficiency`、
+  `spec_decode_num_drafts`、`spec_decode_num_accepted_tokens`、
+  `spec_decode_num_draft_tokens` 和 `spec_decode_per_position_acceptance_rates`。
+
+示例配置见
+`vllm_standalone_bench/configs/auto_bench.mtp_builtin_dataset.example.json`。
+
+### vLLM 编译/JIT cache 持久化
+
+GLM5.2 这类 DSA/MoE 模型首次启动会触发 torch.compile、AOT、Triton/Inductor、
+DeepGEMM JIT 和 FlashInfer autotune。默认情况下这些缓存位于 vLLM 容器内，
+auto_bench 停止并删除容器后会丢失。需要反复运行同一套 benchmark 时，可以启用
+`run.vllm_cache`：
+
+```json
+"run": {
+  "vllm_cache": {
+    "enabled": true,
+    "container_path": "/vllm-cache",
+    "set_default_env": true
+  }
+}
+```
+
+`root` 可省略；启用 cache 且省略 `root` 时，默认使用配置文件所在目录下的
+`.cache/vllm_auto_bench`。也可以显式配置绝对路径或相对路径，相对路径按配置文件所在
+目录解析。
+
+启用后，vLLM serving 容器会挂载 `<root>/<cache_key>:/vllm-cache:rw`，并自动设置：
+
+- `VLLM_CACHE_ROOT=/vllm-cache`
+- `DG_JIT_CACHE_DIR=/vllm-cache/deep_gemm`
+- `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/vllm-cache/flashinfer_autotune`
+
+建议为 GLM5.2 正式 profile 显式配置稳定 `cache_key`：
+
+```json
+"serve_profiles": [{
+  "name": "glm52_fp8_tp8_o2",
+  "engine": "vllm",
+  "cache_key": "glm52-fp8-tp8-h20-o2",
+  "gpus": "all",
+  "args": ["--tensor-parallel-size", "8", "--kv-cache-dtype", "fp8"]
+}]
+```
+
+第一次运行仍会完整编译和 JIT；后续相同镜像、模型、GPU 架构、TP、dtype 和 serve args
+应复用 cache。不要让不同硬件或不同 serve 参数共享同一个 `cache_key`。cache 目录不会随
+run 清理，可手动删除 `.cache/vllm_auto_bench/<cache_key>` 释放磁盘空间。
+
+默认 cache key 会随 `run.images.vllm` 镜像引用字符串、`model.name`、`model_path`、
+`tokenizer_path`、`served_model_name`、serve profile 名称、`gpus` 和 `serve args`
+变化。正式 GLM5.2 benchmark 仍建议显式配置稳定 `cache_key`，把模型、GPU 架构、TP、
+dtype、优化级别和关键环境口径写进名字，便于人工审计和跨机器协作。
+
+注意可变镜像 tag 的风险：默认 cache key 只看配置里的镜像引用字符串，不会自动知道 tag
+背后的 image id 或 digest；`latest`、`offline` 等 tag 可能在底层镜像变更后仍保持相同
+引用。显式 `cache_key` 也会绕过默认 fingerprint。使用可变 tag 时，建议把
+`run.images.vllm` 改成稳定的 image id 或 digest，或把 image id、digest、构建号纳入
+`cache_key`。升级 vLLM 镜像、GPU 架构、TP、dtype 或关键 serve args 后，应更换
+`cache_key` 或清理对应 cache 目录，避免复用不兼容的编译/JIT cache。
+
 ## 使用方法
 
 ### 基本用法（Random 数据集）
@@ -209,6 +391,12 @@ python3 vllm_standalone_bench/run_bench_serve.py \
 | **input_throughput_tok_s** | 输入 Token 系统吞吐 | `total_input_tokens / benchmark_duration` |
 | **prefill_effective_tok_s** | Prefill 有效速率 | `avg_input_tokens / mean_TTFT_s`，TTFT 包含排队、调度和首 token |
 | **decode_effective_tok_s** | Decode 有效速率 | `1 / mean_TPOT_s`，基于 TPOT 的 next-token decode 近似速率 |
+| **cache_hit_rate** | 缓存命中率 | `avg_cached_tokens / avg_input_tokens`，统计输入 tokens 中从缓存命中的比例 |
+| **avg_cached_tokens** | 平均缓存 Token 数 | 每个请求平均从 prefix cache 命中的 token 数 |
+
+> **缓存命中率（`cache_hit_rate`）**：统计结果中的 `cache_hit_rate` / `avg_cached_tokens`
+> 取自响应 `usage.cached_tokens`。该值非零需要服务端开启前缀缓存
+> （vLLM `--enable-prefix-caching`；SGLang 对应缓存开关）；未开启时命中率为 0。
 
 ## 与 benchmark_tools 的关键差异
 

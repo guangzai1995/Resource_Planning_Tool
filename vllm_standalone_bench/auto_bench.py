@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -12,14 +14,23 @@ import signal
 import subprocess
 import sys
 import time
+import types
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol, Sequence
+
+from bench_compare import aggregate_compare
+
+logger = logging.getLogger("auto_bench")
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 MODEL_CONTAINER_ROOT = PurePosixPath("/models")
-SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat"})
+DATASET_CONTAINER_ROOT = PurePosixPath("/datasets")
+BUILTIN_ASR_DATASET_PATH = (
+    "/opt/vllm_standalone_bench/assets/librispeech_test_clean_256/asr_smoke.jsonl"
+)
+SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat", "openai-audio"})
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
 NETWORK_MANAGED_LABEL = "vllm_auto_bench.managed"
 NETWORK_RUN_ID_LABEL = "vllm_auto_bench.run_id"
@@ -33,15 +44,25 @@ class ConfigError(ValueError):
     """Raised when the auto bench configuration is invalid."""
 
 
+SUPPORTED_ENGINES = ("vllm", "sglang")
+
+
 class StopRequested(Exception):
     """Raised when the detached controller is asked to stop gracefully."""
+
+
+@dataclass(frozen=True)
+class VllmCacheConfig:
+    enabled: bool = False
+    root: Path | None = None
+    container_path: str = "/vllm-cache"
+    set_default_env: bool = True
 
 
 @dataclass(frozen=True)
 class RunConfig:
     name: str
     results_dir: Path
-    vllm_image: str
     bench_image: str
     network: str = "vllm-bench-net"
     create_network: bool = True
@@ -52,11 +73,17 @@ class RunConfig:
     api_key: str | None = None
     ready_timeout_sec: int = 1800
     cooldown_sec: float = 20.0
+    vllm_image: str | None = None
+    images: Mapping[str, str] = field(
+        default_factory=lambda: types.MappingProxyType({})
+    )
+    vllm_cache: VllmCacheConfig = field(default_factory=VllmCacheConfig)
 
 
 @dataclass(frozen=True)
 class MountConfig:
     models: Path
+    datasets: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -70,10 +97,21 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class DatasetConfig:
+    name: str
+    length_policy: str = "exact"
+    input_len_tolerance: float = 0.2
+    on_bucket_shortage: str = "error"
+    sampling: str = "shuffle"
+
+
+@dataclass(frozen=True)
 class ServeProfile:
     name: str
+    engine: str = "vllm"
     gpus: str = "all"
     args: tuple[str, ...] = field(default_factory=tuple)
+    cache_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,10 +124,16 @@ class BenchProfile:
     epochs: int = 3
     prefix_ratio: float = 0.0
     warmup_requests: int = 1
+    warmup_concurrency: int | None = None
+    warmup_output_len: int | None = None
     cross_product: bool = False
     max_ttft_ms: float | None = None
     min_throughput_tok_s: float | None = None
     min_output_compliance: float | None = None
+    dataset: DatasetConfig | None = None
+    dataset_name: str = "random"
+    dataset_path: str | None = None
+    language: str = "en"
 
 
 @dataclass(frozen=True)
@@ -203,6 +247,14 @@ def _non_negative_int(value: Any, field_name: str) -> int:
     return value
 
 
+def _optional_positive_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise ConfigError(f"{field_name} must be a positive integer or None, got {value!r}")
+    return value
+
+
 def _finite_float(value: Any, field_name: str) -> float:
     if type(value) not in (int, float):
         raise ConfigError(f"{field_name} must be a finite number")
@@ -279,14 +331,80 @@ def _container_path_to_host(path_value: Any, model_root: Path, field_name: str) 
     return model_root / relative
 
 
-def _parse_run(data: dict[str, Any]) -> RunConfig:
+def _container_abs_path(value: Any, field_name: str) -> str:
+    path_text = _string(value, field_name)
+    container_path = PurePosixPath(path_text)
+    if not container_path.is_absolute():
+        raise ConfigError(f"{field_name} must be absolute inside the container: {path_text}")
+    if ".." in container_path.parts:
+        raise ConfigError(f"{field_name} must not contain '..': {path_text}")
+    if container_path == PurePosixPath("/"):
+        raise ConfigError(f"{field_name} must not be the container root: {path_text}")
+    try:
+        container_path.relative_to(MODEL_CONTAINER_ROOT)
+    except ValueError:
+        pass
+    else:
+        raise ConfigError(f"{field_name} must not overlap the /models mount: {path_text}")
+    return str(container_path)
+
+
+def _dataset_container_path(value: Any, field_name: str) -> str:
+    path_text = _string(value, field_name)
+    if path_text.startswith("//"):
+        raise ConfigError(f"{field_name} must not start with '//': {path_text}")
+    container_path = PurePosixPath(path_text)
+    if not container_path.is_absolute():
+        raise ConfigError(f"{field_name} must be absolute inside the container: {path_text}")
+    if ".." in container_path.parts:
+        raise ConfigError(f"{field_name} must not contain '..': {path_text}")
+    return str(container_path)
+
+
+def _parse_vllm_cache(run: dict[str, Any], config_dir: Path) -> VllmCacheConfig:
+    if "vllm_cache" not in run:
+        return VllmCacheConfig()
+    raw = run["vllm_cache"]
+    cache = _require_mapping(raw, "run.vllm_cache")
+    enabled = _bool(cache.get("enabled", False), "run.vllm_cache.enabled")
+    container_path = _container_abs_path(
+        cache.get("container_path", "/vllm-cache"),
+        "run.vllm_cache.container_path",
+    )
+    set_default_env = _bool(
+        cache.get("set_default_env", True),
+        "run.vllm_cache.set_default_env",
+    )
+    if not enabled:
+        return VllmCacheConfig(
+            enabled=False,
+            root=None,
+            container_path=container_path,
+            set_default_env=set_default_env,
+        )
+    if "root" in cache:
+        root = Path(_string(cache["root"], "run.vllm_cache.root"))
+    else:
+        root = config_dir / ".cache" / "vllm_auto_bench"
+    if not root.is_absolute():
+        root = config_dir / root
+    return VllmCacheConfig(
+        enabled=True,
+        root=root.resolve(),
+        container_path=container_path,
+        set_default_env=set_default_env,
+    )
+
+
+def _parse_run(data: dict[str, Any], config_dir: Path) -> RunConfig:
     run = _require_mapping(data.get("run"), "run")
     host_port = run.get("host_port")
+    vllm_image = _optional_string(run.get("vllm_image"), "run.vllm_image")
+    images = _parse_engine_images(run, vllm_image)
     return RunConfig(
         name=_safe_name(_required(run, "name", "run.name"), "run.name"),
         results_dir=Path(_string(run.get("results_dir", "vllm_standalone_bench/results"),
                                  "run.results_dir")),
-        vllm_image=_string(_required(run, "vllm_image", "run.vllm_image"), "run.vllm_image"),
         bench_image=_string(_required(run, "bench_image", "run.bench_image"), "run.bench_image"),
         network=_network_name(run.get("network", "vllm-bench-net"), "run.network"),
         create_network=_bool(run.get("create_network", True), "run.create_network"),
@@ -301,7 +419,28 @@ def _parse_run(data: dict[str, Any]) -> RunConfig:
         ready_timeout_sec=_positive_int(run.get("ready_timeout_sec", 1800),
                                         "run.ready_timeout_sec"),
         cooldown_sec=_non_negative_float(run.get("cooldown_sec", 20.0), "run.cooldown_sec"),
+        vllm_image=vllm_image,
+        images=images,
+        vllm_cache=_parse_vllm_cache(run, config_dir),
     )
+
+
+def _parse_engine_images(
+    run: dict[str, Any], vllm_image: str | None
+) -> Mapping[str, str]:
+    raw = run.get("images")
+    images: dict[str, str] = {}
+    if raw is not None:
+        if not isinstance(raw, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+        ):
+            raise ConfigError("run.images must be an object mapping engine -> image string")
+        images = dict(raw)
+    if vllm_image is not None:
+        images.setdefault("vllm", vllm_image)
+    if not images:
+        raise ConfigError("run.images (or run.vllm_image) must define at least one engine image")
+    return types.MappingProxyType(images)
 
 
 def _parse_mounts(data: dict[str, Any], config_dir: Path) -> MountConfig:
@@ -309,8 +448,15 @@ def _parse_mounts(data: dict[str, Any], config_dir: Path) -> MountConfig:
     models = Path(_string(_required(mounts, "models", "mounts.models"), "mounts.models"))
     if not models.is_absolute():
         models = config_dir / models
+    raw_datasets = mounts.get("datasets")
+    datasets = None
+    if raw_datasets is not None:
+        datasets = Path(_string(raw_datasets, "mounts.datasets"))
+        if not datasets.is_absolute():
+            datasets = config_dir / datasets
     return MountConfig(
-        models=models.resolve()
+        models=models.resolve(),
+        datasets=datasets.resolve() if datasets is not None else None,
     )
 
 
@@ -355,13 +501,69 @@ def _parse_serve_profiles(data: dict[str, Any]) -> tuple[ServeProfile, ...]:
         args = profile.get("args", [])
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise ConfigError("serve_profile.args must be a string array")
+        _validate_serve_args(args, "serve_profile")
+        engine = _string(profile.get("engine", "vllm"), "serve_profile.engine")
+        if engine not in SUPPORTED_ENGINES:
+            raise ConfigError(
+                f"serve_profile.engine must be one of {SUPPORTED_ENGINES}, got {engine!r}"
+            )
+        cache_key = profile.get("cache_key")
         parsed.append(ServeProfile(
             name=_safe_name(_required(profile, "name", "serve_profile.name"),
                             "serve_profile.name"),
+            engine=engine,
             gpus=_string(profile.get("gpus", "all"), "serve_profile.gpus"),
             args=tuple(args),
+            cache_key=(
+                _safe_name(cache_key, "serve_profile.cache_key")
+                if cache_key is not None else None
+            ),
         ))
     return tuple(parsed)
+
+
+def _validate_serve_args(args: Sequence[str], path: str) -> None:
+    for value in args:
+        if value.startswith("speculative-config."):
+            raise ConfigError(
+                f"{path}.args contains {value!r}; use '--{value}' for vLLM dotted flags"
+            )
+
+
+def _parse_dataset_config(raw: object, path: str) -> DatasetConfig | None:
+    if raw is None:
+        return None
+    dataset = _require_mapping(raw, path)
+    name = _string(_required(dataset, "name", f"{path}.name"), f"{path}.name")
+    if name not in {"random", "builtin_mtp_chat"}:
+        raise ConfigError(f"{path}.name unsupported dataset: {name}")
+
+    length_policy = _string(dataset.get("length_policy", "exact"),
+                            f"{path}.length_policy")
+    if length_policy not in {"exact", "bucket"}:
+        raise ConfigError(f"{path}.length_policy must be exact or bucket")
+
+    tolerance = _finite_float(dataset.get("input_len_tolerance", 0.2),
+                              f"{path}.input_len_tolerance")
+    if tolerance < 0 or tolerance >= 1:
+        raise ConfigError(f"{path}.input_len_tolerance must be >= 0 and < 1")
+
+    shortage = _string(dataset.get("on_bucket_shortage", "error"),
+                       f"{path}.on_bucket_shortage")
+    if shortage != "error":
+        raise ConfigError(f"{path}.on_bucket_shortage only supports error")
+
+    sampling = _string(dataset.get("sampling", "shuffle"), f"{path}.sampling")
+    if sampling not in {"shuffle", "round_robin"}:
+        raise ConfigError(f"{path}.sampling must be shuffle or round_robin")
+
+    return DatasetConfig(
+        name=name,
+        length_policy=length_policy,
+        input_len_tolerance=tolerance,
+        on_bucket_shortage=shortage,
+        sampling=sampling,
+    )
 
 
 def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
@@ -372,27 +574,70 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
     parsed: list[BenchProfile] = []
     for item in raw_profiles:
         profile = _require_mapping(item, "bench_profiles[]")
-        input_lens = _positive_int_list(profile.get("input_lens", [512]), "input_lens")
+        backend = _backend(profile.get("backend", "openai-chat"), "bench_profile.backend")
         output_lens = _positive_int_list(profile.get("output_lens", [128]), "output_lens")
         parallel_nums = _positive_int_list(profile.get("parallel_nums", [1, 4, 8]),
                                            "parallel_nums")
         cross_product = _bool(profile.get("cross_product", False), "cross_product")
-        if not cross_product and len(output_lens) not in (1, len(input_lens)):
+        if backend == "openai-audio":
+            input_lens = (0,)
+            prefix_ratio = 0.0
+            dataset = None
+            dataset_name = (
+                _string(profile["dataset_name"], "bench_profile.dataset_name")
+                if "dataset_name" in profile else "custom_audio"
+            )
+            if "dataset_path" in profile:
+                dataset_path = _dataset_container_path(
+                    profile["dataset_path"],
+                    "bench_profile.dataset_path",
+                )
+                if not _is_under_container_path(dataset_path, DATASET_CONTAINER_ROOT):
+                    raise ConfigError(
+                        "bench_profile.dataset_path for openai-audio must be under "
+                        "/datasets so mounts.datasets can expose it to the bench "
+                        "container"
+                    )
+            else:
+                dataset_path = BUILTIN_ASR_DATASET_PATH
+            language = (
+                _string(profile["language"], "bench_profile.language")
+                if "language" in profile else "en"
+            )
+        else:
+            input_lens = _positive_int_list(profile.get("input_lens", [512]), "input_lens")
+            prefix_ratio = _ratio(profile.get("prefix_ratio", 0.0),
+                                  "bench_profile.prefix_ratio")
+            dataset_name = "random"
+            dataset_path = None
+            language = ""
+            dataset = _parse_dataset_config(
+                profile.get("dataset"),
+                "bench_profile.dataset",
+            )
+        if (
+            backend != "openai-audio"
+            and not cross_product
+            and len(output_lens) not in (1, len(input_lens))
+        ):
             raise ConfigError(
                 "output_lens length must be 1 or match input_lens unless cross_product=true"
             )
         parsed.append(BenchProfile(
             name=_safe_name(_required(profile, "name", "bench_profile.name"),
                             "bench_profile.name"),
-            backend=_backend(profile.get("backend", "openai-chat"), "bench_profile.backend"),
+            backend=backend,
             input_lens=input_lens,
             output_lens=output_lens,
             parallel_nums=parallel_nums,
             epochs=_positive_int(profile.get("epochs", 3), "bench_profile.epochs"),
-            prefix_ratio=_ratio(profile.get("prefix_ratio", 0.0),
-                                "bench_profile.prefix_ratio"),
+            prefix_ratio=prefix_ratio,
             warmup_requests=_non_negative_int(profile.get("warmup_requests", 1),
                                               "bench_profile.warmup_requests"),
+            warmup_concurrency=_optional_positive_int(
+                profile.get("warmup_concurrency"), "bench_profile.warmup_concurrency"),
+            warmup_output_len=_optional_positive_int(
+                profile.get("warmup_output_len"), "bench_profile.warmup_output_len"),
             cross_product=cross_product,
             max_ttft_ms=_optional_non_negative_float(profile.get("max_ttft_ms"),
                                                      "bench_profile.max_ttft_ms"),
@@ -404,6 +649,10 @@ def _parse_bench_profiles(data: dict[str, Any]) -> tuple[BenchProfile, ...]:
                 profile.get("min_output_compliance"),
                 "bench_profile.min_output_compliance",
             ),
+            dataset=dataset,
+            dataset_name=dataset_name,
+            dataset_path=dataset_path,
+            language=language,
         ))
     return tuple(parsed)
 
@@ -417,12 +666,45 @@ def load_config(path: str | Path) -> AutoBenchConfig:
         raise ConfigError(f"invalid JSON config: {exc}") from exc
 
     config_data = _require_mapping(raw, "config")
-    run = _parse_run(config_data)
+    run = _parse_run(config_data, config_path.parent)
     mounts = _parse_mounts(config_data, config_path.parent)
     models = _parse_models(config_data, mounts)
     serve_profiles = _parse_serve_profiles(config_data)
     bench_profiles = _parse_bench_profiles(config_data)
-    return AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    config = AutoBenchConfig(run, mounts, models, serve_profiles, bench_profiles)
+    _validate_asr_dataset_mounts(config)
+    _validate_images_cover_engines(config)
+    return config
+
+
+def _is_under_container_path(path: str, root: PurePosixPath) -> bool:
+    try:
+        PurePosixPath(path).relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_asr_dataset_mounts(config: AutoBenchConfig) -> None:
+    for bench in config.bench_profiles:
+        if (
+            bench.backend == "openai-audio"
+            and bench.dataset_path is not None
+            and _is_under_container_path(bench.dataset_path, DATASET_CONTAINER_ROOT)
+            and config.mounts.datasets is None
+        ):
+            raise ConfigError(
+                "bench_profile.dataset_path under /datasets requires mounts.datasets"
+            )
+
+
+def _validate_images_cover_engines(config: AutoBenchConfig) -> None:
+    engines = {profile.engine for profile in config.serve_profiles}
+    missing = sorted(engine for engine in engines if engine not in config.run.images)
+    if missing:
+        raise ConfigError(
+            f"run.images missing image for engine(s): {', '.join(missing)}"
+        )
 
 
 def make_run_id(run_name: str, now: float | None = None) -> str:
@@ -442,6 +724,109 @@ def make_bench_container_name(case: BenchmarkCase) -> str:
         f"bench-runner-{case.model.name}-{case.serve_profile.name}-"
         f"{case.bench_profile.name}-{_safe_name(case.run_id, 'run_id')}"
     )
+
+
+def _short_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def vllm_cache_key_inputs(config: AutoBenchConfig,
+                          case: BenchmarkCase) -> dict[str, Any]:
+    return {
+        "vllm_image_ref": config.run.images["vllm"],
+        "model": {
+            "name": case.model.name,
+            "model_path": case.model.model_path,
+            "tokenizer_path": case.model.tokenizer_path,
+            "served_model_name": case.model.served_model_name,
+        },
+        "serve_profile": {
+            "name": case.serve_profile.name,
+            "gpus": case.serve_profile.gpus,
+            "args": list(case.serve_profile.args),
+        },
+    }
+
+
+def _short_json_fingerprint(data: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return _short_hash(canonical)
+
+
+def default_vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str:
+    fingerprint = _short_json_fingerprint(vllm_cache_key_inputs(config, case))
+    return f"{case.model.name}__{case.serve_profile.name}__{fingerprint}"
+
+
+def vllm_cache_key(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
+    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+        return None
+    return case.serve_profile.cache_key or default_vllm_cache_key(config, case)
+
+
+def vllm_cache_key_source(config: AutoBenchConfig, case: BenchmarkCase) -> str | None:
+    if case.serve_profile.engine != "vllm" or not config.run.vllm_cache.enabled:
+        return None
+    return "explicit" if case.serve_profile.cache_key else "default"
+
+
+def resolve_vllm_cache_dir(config: AutoBenchConfig, case: BenchmarkCase) -> Path | None:
+    cache_key = vllm_cache_key(config, case)
+    if cache_key is None:
+        return None
+    if config.run.vllm_cache.root is None:
+        raise ConfigError("run.vllm_cache.root is required when enabled=true")
+    return config.run.vllm_cache.root / cache_key
+
+
+def build_vllm_cache_env(config: AutoBenchConfig) -> dict[str, str]:
+    cache = config.run.vllm_cache
+    if not cache.enabled or not cache.set_default_env:
+        return {}
+    root = cache.container_path
+    root_path = PurePosixPath(root)
+    return {
+        "VLLM_CACHE_ROOT": root,
+        "DG_JIT_CACHE_DIR": str(root_path / "deep_gemm"),
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": str(root_path / "flashinfer_autotune"),
+    }
+
+
+def vllm_cache_metadata(config: AutoBenchConfig,
+                        case: BenchmarkCase) -> dict[str, Any] | None:
+    cache_dir = resolve_vllm_cache_dir(config, case)
+    key = vllm_cache_key(config, case)
+    if cache_dir is None or key is None:
+        return None
+    return {
+        "enabled": True,
+        "cache_key": key,
+        "cache_key_source": vllm_cache_key_source(config, case),
+        "cache_key_inputs": vllm_cache_key_inputs(config, case),
+        "host_dir": str(cache_dir),
+        "container_path": config.run.vllm_cache.container_path,
+        "env": build_vllm_cache_env(config),
+    }
+
+
+def ensure_vllm_cache_dirs(config: AutoBenchConfig) -> None:
+    if not config.run.vllm_cache.enabled:
+        return
+    seen: set[Path] = set()
+    for case in expand_cases(config, run_id="cache-validation"):
+        cache_dir = resolve_vllm_cache_dir(config, case)
+        if cache_dir is None or cache_dir in seen:
+            continue
+        seen.add(cache_dir)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ConfigError(f"cannot create vllm cache dir: {cache_dir}") from exc
 
 
 def expand_cases(config: AutoBenchConfig, run_id: str | None = None) -> tuple[BenchmarkCase, ...]:
@@ -477,8 +862,15 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--gpus", case.serve_profile.gpus,
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
-        "--entrypoint", "vllm",
     ]
+    cache_dir = resolve_vllm_cache_dir(config, case)
+    if cache_dir is not None:
+        cmd.extend(["-v", f"{cache_dir}:{config.run.vllm_cache.container_path}:rw"])
+        for name, value in build_vllm_cache_env(config).items():
+            cmd.extend(["-e", f"{name}={value}"])
+    cmd.extend([
+        "--entrypoint", "vllm",
+    ])
     if config.run.publish_host_port:
         if config.run.host_port is None:
             raise ConfigError("host_port is required when publish_host_port=true")
@@ -487,11 +879,53 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
             f"127.0.0.1:{config.run.host_port}:{config.run.container_port}",
         ])
     cmd.extend([
-        config.run.vllm_image,
+        config.run.images["vllm"],
         "serve", case.model.model_path,
         "--served-model-name", case.api_model_name,
         "--host", "0.0.0.0",
         "--port", str(config.run.container_port),
+    ])
+    if config.run.api_key:
+        cmd.extend(["--api-key", config.run.api_key])
+    cmd.extend(case.serve_profile.args)
+    return cmd
+
+
+def build_serve_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                            run_dir: Path) -> list[str]:
+    """按 serve_profile.engine 分派服务启动命令。args 原样透传，不做参数翻译。"""
+    if case.serve_profile.engine == "sglang":
+        return _build_sglang_run_command(config, case, run_dir)
+    return build_vllm_run_command(config, case, run_dir)
+
+
+def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
+                              run_dir: Path) -> list[str]:
+    resolved_run_dir = Path(run_dir).resolve()
+    cmd = [
+        "docker", "run", "-d",
+        "--name", case.container_name,
+        "--label", f"{NETWORK_MANAGED_LABEL}=true",
+        "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
+        "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
+        "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
+        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={case.serve_profile.name}",
+        "--gpus", case.serve_profile.gpus,
+        "--network", config.run.network,
+        "-v", f"{config.mounts.models}:/models:ro",
+        "--entrypoint", "python3",
+    ]
+    if config.run.publish_host_port:
+        if config.run.host_port is None:
+            raise ConfigError("host_port is required when publish_host_port=true")
+        cmd.extend(["-p", f"127.0.0.1:{config.run.host_port}:{config.run.container_port}"])
+    cmd.extend([
+        config.run.images["sglang"],
+        "-m", "sglang.launch_server",
+        "--model-path", case.model.model_path,
+        "--host", "0.0.0.0",
+        "--port", str(config.run.container_port),
+        "--served-model-name", case.api_model_name,
     ])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
@@ -520,6 +954,10 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{CONTAINER_BENCH_PROFILE_LABEL}={case.bench_profile.name}",
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
+    ]
+    if config.mounts.datasets is not None:
+        cmd.extend(["-v", f"{config.mounts.datasets}:/datasets:ro"])
+    cmd.extend([
         "-v", f"{resolved_bench_dir}:/results",
         config.run.bench_image,
         "python", "/opt/vllm_standalone_bench/run_bench_multi.py",
@@ -531,17 +969,36 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--warmup-requests", str(bench.warmup_requests),
         "--output-csv", "/results/result.csv",
         "--output-xlsx", "/results/result.xlsx",
-    ]
+    ])
+    if bench.warmup_concurrency is not None:
+        cmd.extend(["--warmup-concurrency", str(bench.warmup_concurrency)])
+    if bench.warmup_output_len is not None:
+        cmd.extend(["--warmup-output-len", str(bench.warmup_output_len)])
     if config.run.api_key:
         cmd.extend(["--api-key", config.run.api_key])
-    if case.model.tokenizer_path:
-        cmd.extend(["--tokenizer", case.model.tokenizer_path])
-    _append_many(cmd, "--input-lens", bench.input_lens)
+    if bench.backend == "openai-audio":
+        cmd.extend([
+            "--dataset-name", bench.dataset_name,
+            "--dataset-path", bench.dataset_path or BUILTIN_ASR_DATASET_PATH,
+            "--language", bench.language,
+        ])
+    else:
+        if case.model.tokenizer_path:
+            cmd.extend(["--tokenizer", case.model.tokenizer_path])
+        if bench.dataset is not None:
+            cmd.extend(["--dataset", bench.dataset.name])
+            cmd.extend(["--dataset-length-policy", bench.dataset.length_policy])
+            cmd.extend(["--dataset-input-len-tolerance",
+                        str(bench.dataset.input_len_tolerance)])
+            cmd.extend(["--dataset-on-bucket-shortage",
+                        bench.dataset.on_bucket_shortage])
+            cmd.extend(["--dataset-sampling", bench.dataset.sampling])
+        _append_many(cmd, "--input-lens", bench.input_lens)
     _append_many(cmd, "--output-lens", bench.output_lens)
     _append_many(cmd, "--parallel-nums", bench.parallel_nums)
-    if bench.cross_product:
+    if bench.cross_product and bench.backend != "openai-audio":
         cmd.append("--cross-product")
-    if bench.prefix_ratio:
+    if bench.backend != "openai-audio" and bench.prefix_ratio:
         cmd.extend(["--prefix-ratio", str(bench.prefix_ratio)])
     if bench.max_ttft_ms is not None:
         cmd.extend(["--max-ttft-ms", str(bench.max_ttft_ms)])
@@ -560,11 +1017,30 @@ def should_cleanup_network(*, owned: bool, cleanup_enabled: bool,
 def validate_local_paths(config: AutoBenchConfig) -> None:
     if not config.mounts.models.is_dir():
         raise ConfigError(f"model root does not exist: {config.mounts.models}")
+    if config.mounts.datasets is not None and not config.mounts.datasets.is_dir():
+        raise ConfigError(f"datasets root does not exist: {config.mounts.datasets}")
+    for bench in config.bench_profiles:
+        if (
+            bench.backend == "openai-audio"
+            and bench.dataset_path is not None
+            and _is_under_container_path(bench.dataset_path, DATASET_CONTAINER_ROOT)
+        ):
+            if config.mounts.datasets is None:
+                raise ConfigError(
+                    "bench_profile.dataset_path under /datasets requires mounts.datasets"
+                )
+            relative_dataset = PurePosixPath(bench.dataset_path).relative_to(
+                DATASET_CONTAINER_ROOT
+            )
+            host_dataset = config.mounts.datasets.joinpath(*relative_dataset.parts)
+            if not host_dataset.is_file():
+                raise ConfigError(f"dataset file does not exist: {host_dataset}")
     for model in config.models:
         if not model.host_model_path.is_dir():
             raise ConfigError(f"model path does not exist: {model.host_model_path}")
         if model.host_tokenizer_path is not None and not model.host_tokenizer_path.exists():
             raise ConfigError(f"tokenizer path does not exist: {model.host_tokenizer_path}")
+    ensure_vllm_cache_dirs(config)
 
 
 def build_layout(config: AutoBenchConfig, run_id: str, case: BenchmarkCase) -> CaseLayout:
@@ -593,6 +1069,14 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def write_vllm_cache_metadata(config: AutoBenchConfig, case: BenchmarkCase,
+                              layout: CaseLayout) -> None:
+    payload = vllm_cache_metadata(config, case)
+    if payload is None:
+        return
+    write_json_atomic(layout.serve_dir / "vllm_cache.json", payload)
 
 
 def write_state(run_dir: Path, state: dict[str, Any]) -> None:
@@ -1033,7 +1517,7 @@ def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
     inspect = runner.run(["docker", "inspect", case.container_name], check=False)
     (layout.serve_dir / "docker.inspect.json").write_text(inspect.stdout, encoding="utf-8")
     (layout.serve_dir / "serve_command.txt").write_text(
-        " ".join(build_vllm_run_command(config, case, layout.run_dir)),
+        " ".join(build_serve_run_command(config, case, layout.run_dir)),
         encoding="utf-8",
     )
 
@@ -1354,6 +1838,8 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(item) for item in value]
     if isinstance(value, list):
         return [_jsonable(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if hasattr(value, "__dataclass_fields__"):
@@ -1507,7 +1993,7 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
         for group_cases in _group_cases_by_serve(cases).values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
-            print_cmd(build_vllm_run_command(config, serve_case, serve_layout.run_dir))
+            print_cmd(build_serve_run_command(config, serve_case, serve_layout.run_dir))
             for case in group_cases:
                 layout = build_layout(config, run_id, case)
                 print_cmd(build_bench_run_command(config, case, layout.bench_dir))
@@ -1568,12 +2054,14 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         for group_cases in grouped.values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
-            vllm_cmd = build_vllm_run_command(config, serve_case, serve_layout.run_dir)
+            if not dry_run:
+                write_vllm_cache_metadata(config, serve_case, serve_layout)
+            serve_cmd = build_serve_run_command(config, serve_case, serve_layout.run_dir)
             started = False
             cleanup_container = False
             try:
                 if dry_run:
-                    print_cmd(vllm_cmd)
+                    print_cmd(serve_cmd)
                     ready = True
                 else:
                     cleanup_container = True
@@ -1582,7 +2070,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         serve_case,
                         serve_layout.run_dir,
                     )
-                    start_result = active_runner.run(vllm_cmd, check=False)
+                    start_result = active_runner.run(serve_cmd, check=False)
                     started = start_result.returncode == 0
                     if not started:
                         ready = False
@@ -1733,6 +2221,12 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         raise stop_requested
             if interrupted:
                 break
+
+        if not dry_run and not interrupted:
+            try:
+                aggregate_compare(config, run_dir)
+            except Exception as exc:
+                logger.warning("结果对比聚合失败：%s", exc)
 
         write_state(run_dir, finished_state(run_id, manifest))
     except StopRequested as exc:
