@@ -1106,6 +1106,82 @@ def test_controller_stop_requested_writes_interrupted_and_cleans(tmp_path, monke
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
 
 
+def test_run_controller_with_initial_manifest_skips_passed_case(tmp_path, monkeypatch):
+    data = two_bench_config(tmp_path)
+    config = ab.load_config(write_config(tmp_path, data))
+    all_cases = ab.expand_cases(config, run_id="run123")
+    first_layout = ab.build_layout(config, "run123", all_cases[0])
+    initial = ab.Manifest(run_id="run123", total=2)
+    initial.record(all_cases[0], first_layout, "passed")
+    runner = FakeRunner()
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True, raising=False)
+
+    result = ab.run_controller(
+        config,
+        run_id="run123",
+        runner=runner,
+        initial_manifest=initial,
+        cases_to_run=(all_cases[1],),
+    )
+
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    bench_commands = bench_run_commands(runner.commands)
+    assert result == 0
+    assert [row["bench_profile"] for row in manifest["cases"]] == ["smoke", "smoke2"]
+    assert [row["status"] for row in manifest["cases"]] == ["passed", "passed"]
+    assert len(bench_commands) == 1
+    assert "smoke2" in " ".join(bench_commands[0])
+    assert "smoke-run123" not in " ".join(bench_commands[0])
+
+
+def test_run_controller_pending_empty_writes_finished_state_without_docker(tmp_path):
+    config = ab.load_config(write_config(tmp_path, two_bench_config(tmp_path)))
+    all_cases = ab.expand_cases(config, run_id="run123")
+    initial = ab.Manifest(run_id="run123", total=2)
+    for case in all_cases:
+        initial.record(case, ab.build_layout(config, "run123", case), "passed")
+    runner = FakeRunner()
+
+    result = ab.run_controller(
+        config,
+        run_id="run123",
+        runner=runner,
+        initial_manifest=initial,
+        cases_to_run=(),
+    )
+
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert result == 0
+    assert state["status"] == "completed"
+    assert state["counts"]["passed"] == 2
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_run_controller_resume_stop_preserves_old_passed_row(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, two_bench_config(tmp_path)))
+    all_cases = ab.expand_cases(config, run_id="run123")
+    initial = ab.Manifest(run_id="run123", total=2)
+    initial.record(all_cases[0], ab.build_layout(config, "run123", all_cases[0]), "passed")
+
+    def stop_ready(*args, **kwargs):
+        raise ab.StopRequested("resume stopped")
+
+    monkeypatch.setattr(ab, "wait_for_container_ready", stop_ready, raising=False)
+    result = ab.run_controller(
+        config,
+        run_id="run123",
+        runner=FakeRunner(),
+        initial_manifest=initial,
+        cases_to_run=(all_cases[1],),
+    )
+
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    assert result == 130
+    assert manifest["status"] == "interrupted"
+    assert [row["bench_profile"] for row in manifest["cases"]] == ["smoke", "smoke2"]
+    assert [row["status"] for row in manifest["cases"]] == ["passed", "interrupted"]
+
+
 def test_install_signal_handlers_raises_stop_requested(monkeypatch):
     handlers = {}
 

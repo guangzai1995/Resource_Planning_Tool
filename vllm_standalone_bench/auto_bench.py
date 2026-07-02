@@ -2130,12 +2130,15 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
 def run_controller(config: AutoBenchConfig, run_id: str,
                    runner: Runner | None = None,
                    dry_run: bool = False,
-                   lock_token: str | None = None) -> int:
+                   lock_token: str | None = None,
+                   initial_manifest: Manifest | None = None,
+                   cases_to_run: tuple[BenchmarkCase, ...] | None = None) -> int:
     active_runner: Runner = runner or DockerRunner()
     if dry_run:
         return _run_controller_dry_run(config, run_id)
 
-    cases = expand_cases(config, run_id=run_id)
+    all_cases = expand_cases(config, run_id=run_id)
+    cases = all_cases if cases_to_run is None else cases_to_run
     run_dir = config.run.results_dir / run_id
     if reject_active_run(run_dir, allow_pid=os.getpid(), lock_token=lock_token):
         return 1
@@ -2148,15 +2151,20 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     if reject_active_run(run_dir, allow_pid=os.getpid(), lock_token=run_lock.token):
         release_run_lock(run_lock)
         return 1
-    manifest = Manifest(run_id=run_id, total=len(cases))
+    manifest = initial_manifest or Manifest(run_id=run_id, total=len(all_cases))
 
     network_owned = False
     exit_code = 0
-    completed = 0
+    completed = len(manifest.cases)
     interrupted = False
     try:
         write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
         validate_local_paths(config)
+
+        if not cases:
+            write_manifest(run_dir, manifest)
+            write_state(run_dir, finished_state(run_id, manifest))
+            return 0
 
         if docker_network_exists(active_runner, config.run.network):
             validate_bridge_network_driver(active_runner, config.run.network)
@@ -2227,7 +2235,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         run_dir,
                         current_state(
                             run_id,
-                            cases,
+                            all_cases,
                             completed,
                             case,
                             "running",
