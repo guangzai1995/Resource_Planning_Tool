@@ -78,5 +78,10 @@ def test_summarize_samples_computes_avg_p95_and_max():
     assert summary["sample_count"] == 3
     assert summary["aggregate"]["cpu_util_avg_pct"] == pytest.approx(20.0)
     assert summary["aggregate"]["cpu_util_p95_pct"] == pytest.approx(30.0)
+    assert summary["aggregate"]["cpu_util_max_pct"] == pytest.approx(30.0)
+    assert summary["aggregate"]["mem_used_avg_mb"] == pytest.approx(200.0)
+    assert summary["aggregate"]["mem_used_p95_mb"] == pytest.approx(300.0)
     assert summary["aggregate"]["mem_used_max_mb"] == pytest.approx(300.0)
+    assert summary["aggregate"]["gpu_util_avg_pct"] == pytest.approx(40.0)
+    assert summary["aggregate"]["gpu_util_p95_pct"] == pytest.approx(60.0)
     assert summary["aggregate"]["gpu_util_max_pct"] == pytest.approx(60.0)
