@@ -4511,3 +4511,14 @@ def test_builtin_asr_dataset_manifest_is_valid():
     assert sum(path.stat().st_size for path in audio_paths) == manifest["total_audio_bytes"]
     assert (root / "ATTRIBUTION.md").is_file()
     assert (root / "LICENSE.LibriSpeech.txt").is_file()
+
+
+def test_example_config_includes_resource_monitor():
+    path = CONFIG_DIR / "auto_bench.example.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    assert data["run"]["resource_monitor"] == {
+        "enabled": True,
+        "backend": "nvidia-smi",
+        "interval_sec": 1.0,
+    }

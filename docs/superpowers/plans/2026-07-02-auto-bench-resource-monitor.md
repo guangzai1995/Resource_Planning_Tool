@@ -1011,7 +1011,7 @@ git commit -m "feat(bench): monitor resources during auto bench cases"
 - 修改：`vllm_standalone_bench/README.md`
 - 修改：`docs/superpowers/plans/2026-07-02-auto-bench-resource-monitor.md`
 
-- [ ] **步骤 1：编写失败的文档/配置检查测试**
+- [x] **步骤 1：编写失败的文档/配置检查测试**
 
 在 `vllm_standalone_bench/tests/test_auto_bench.py` 追加：
 
@@ -1027,7 +1027,7 @@ def test_example_config_includes_resource_monitor():
     }
 ```
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -1037,7 +1037,7 @@ python3 -m pytest vllm_standalone_bench/tests/test_auto_bench.py::test_example_c
 
 预期：FAIL，示例配置还没有 `run.resource_monitor`。
 
-- [ ] **步骤 3：更新示例配置**
+- [x] **步骤 3：更新示例配置**
 
 在 `vllm_standalone_bench/configs/auto_bench.example.json` 的 `run` 对象中加入：
 
@@ -1051,7 +1051,7 @@ python3 -m pytest vllm_standalone_bench/tests/test_auto_bench.py::test_example_c
 
 注意 JSON 逗号位置，保持文件可被 `json.loads()` 解析。
 
-- [ ] **步骤 4：更新 README**
+- [x] **步骤 4：更新 README**
 
 在 `vllm_standalone_bench/README.md` 的离线自动化压测章节后加入：
 
@@ -1089,7 +1089,7 @@ resource_summary.json
 ```
 ```
 
-- [ ] **步骤 5：运行文档/配置测试验证通过**
+- [x] **步骤 5：运行文档/配置测试验证通过**
 
 运行：
 
@@ -1099,7 +1099,7 @@ python3 -m pytest vllm_standalone_bench/tests/test_auto_bench.py::test_example_c
 
 预期：PASS。
 
-- [ ] **步骤 6：运行全量验证**
+- [x] **步骤 6：运行全量验证**
 
 运行：
 
@@ -1117,7 +1117,7 @@ git diff --check
 - 仓库全量 `pytest -q` PASS，允许既有 warnings。
 - `git diff --check` 无输出，退出码 0。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```bash
 git add \
