@@ -294,13 +294,13 @@ def send_request(request_id: str, request: dict[str, Any], timeout_seconds: floa
             "output_tokens": output_tokens,
             "response_summary": _extract_response_summary(payload, text),
             "error_type": classify_error(exc.code, exc),
-            "message": str(exc),
+            "error_message": str(exc),
         })
         return result
     except Exception as exc:
         result = _base_result(request_id, start)
         result.update({
             "error_type": classify_error(None, exc),
-            "message": str(exc),
+            "error_message": str(exc),
         })
         return result
