@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -298,6 +299,84 @@ def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, c
     )
 
 
+def secret_topology_config(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    data = pd_topology_config(tmp_path)
+    data["run"]["api_key"] = "run-secret"
+    data["run"]["resource_monitor"] = {"enabled": False}
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "ssh-secret",
+    }
+    topology["env"] = {
+        "OPENAI_API_KEY": "env-secret",
+        "VISIBLE_ENV": "visible",
+    }
+    topology["frontend"]["args"] = ["--api-key", "router-secret"]
+    topology["prefill"][0]["env"] = {"SERVICE_TOKEN": "node-token-secret"}
+    topology["prefill"][0]["args"] = ["--db-password", "node-password-secret"]
+    return data
+
+
+def test_real_run_writes_redacted_resolved_config_and_private_resume_config(
+    tmp_path,
+    monkeypatch,
+):
+    data = secret_topology_config(tmp_path)
+    config = ab.load_config(write_config(tmp_path, data))
+    remote = FakeRemoteDockerRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    run_dir = tmp_path / "results" / "run123"
+    public_path = run_dir / "config.resolved.json"
+    resume_path = run_dir / ab.RESUME_CONFIG_FILE
+    public_text = public_path.read_text(encoding="utf-8")
+    for secret_value in (
+        "run-secret",
+        "ssh-secret",
+        "env-secret",
+        "router-secret",
+        "node-token-secret",
+        "node-password-secret",
+    ):
+        assert secret_value not in public_text
+    public_config = json.loads(public_text)
+    topology = public_config["topology_profiles"][0]
+    assert public_config["run"]["api_key"] == "***"
+    assert topology["hosts"]["p1"]["auth"]["password"] == "***"
+    assert topology["env"]["OPENAI_API_KEY"] == "***"
+    assert topology["env"]["VISIBLE_ENV"] == "visible"
+    assert topology["frontend"]["args"] == ["--api-key", "***"]
+    assert topology["prefill"][0]["env"]["SERVICE_TOKEN"] == "***"
+    assert topology["prefill"][0]["args"] == ["--db-password", "***"]
+
+    assert resume_path.exists()
+    assert stat.S_IMODE(resume_path.stat().st_mode) == 0o600
+    resume_text = resume_path.read_text(encoding="utf-8")
+    for secret_value in (
+        "run-secret",
+        "ssh-secret",
+        "env-secret",
+        "router-secret",
+        "node-token-secret",
+        "node-password-secret",
+    ):
+        assert secret_value in resume_text
+    context = ab.load_resume_context(tmp_path / "results", "run123")
+    assert context.config.run.api_key == "run-secret"
+    assert (
+        context.config.topology_profiles[0].hosts["p1"].auth.password
+        == "ssh-secret"
+    )
+
+
 def test_resource_monitor_defaults_enabled(tmp_path):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
 
@@ -470,6 +549,22 @@ def test_build_vllm_command_uses_bridge_network_without_host_port(tmp_path):
     assert value_after(cmd, "--port") == "8000"
     assert value_after(cmd, "--api-key") == "local-bench-key"
     assert value_after(cmd, "--dtype") == "bfloat16"
+
+
+def test_save_vllm_artifacts_masks_api_key_in_serve_command(tmp_path):
+    data = minimal_config(tmp_path)
+    data["run"]["api_key"] = "legacy-secret"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+
+    ab.save_vllm_artifacts(config, FakeRunner(), case, layout)
+
+    serve_command = (layout.serve_dir / "serve_command.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "legacy-secret" not in serve_command
+    assert "***" in serve_command
 
 
 def test_build_vllm_command_includes_ownership_labels(tmp_path):
@@ -1108,6 +1203,30 @@ def write_resume_manifest(run_dir, cases, config, statuses):
     })
 
 
+def test_load_resume_context_rejects_redacted_inline_password_without_private_config(
+    tmp_path,
+):
+    from test_remote_topology import pd_topology_config
+
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "***",
+    }
+    config = ab.load_config(write_config(tmp_path, data))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_json_atomic(run_dir / "config.resolved.json", ab.config_to_dict(config))
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, [], config, [])
+
+    with pytest.raises(
+        ab.ConfigError,
+        match="private resume config|inline password.*redacted|password_env|rerun",
+    ):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
 def test_load_resume_context_uses_cli_results_dir_over_resolved_config(tmp_path):
     original_data = two_bench_config(tmp_path)
     config, original_run_dir = write_resolved_config_for_resume(tmp_path, original_data)
@@ -1561,6 +1680,28 @@ class InspectSecretRemoteRunner(FakeRemoteDockerRunner):
                 "Raw": "remote-env-secret router-secret arg-password arg-token",
             }]
             return ab.Completed(list(command), 0, json.dumps(payload), "")
+        return super().run(
+            host,
+            command,
+            check=check,
+            capture=capture,
+            text=text,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+
+class LogSecretRemoteRunner(FakeRemoteDockerRunner):
+    def run(self, host, command, *, check=False, capture=True, text=True,
+            stdout=None, stderr=None):
+        if command[:2] == ["docker", "logs"]:
+            self.commands.append((host.name, list(command)))
+            return ab.Completed(
+                list(command),
+                0,
+                f"{host.name} run-secret router-secret env-secret\n",
+                "ssh-secret node-token-secret node-password-secret\n",
+            )
         return super().run(
             host,
             command,
@@ -2264,6 +2405,33 @@ def test_topology_inspect_artifact_redacts_secrets(tmp_path, monkeypatch):
     assert "arg-password" not in inspect_text
     assert "arg-token" not in inspect_text
     assert "***" in inspect_text
+
+
+def test_topology_artifacts_role_logs_redact_known_secrets(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, secret_topology_config(tmp_path)))
+    remote = LogSecretRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 0
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    log_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((layout.bench_dir / "logs").glob("*.log"))
+    )
+    for secret_value in (
+        "run-secret",
+        "ssh-secret",
+        "env-secret",
+        "router-secret",
+        "node-token-secret",
+        "node-password-secret",
+    ):
+        assert secret_value not in log_text
+    assert "***" in log_text
 
 
 def test_topology_foreign_labels_skip_cleanup(tmp_path, monkeypatch):

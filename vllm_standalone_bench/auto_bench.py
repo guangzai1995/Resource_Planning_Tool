@@ -40,6 +40,13 @@ BUILTIN_ASR_DATASET_PATH = (
 )
 SUPPORTED_BACKENDS = frozenset({"openai", "openai-chat", "openai-audio"})
 DEFAULT_RESULTS_DIR = Path(__file__).resolve().parent / "results"
+RESUME_CONFIG_FILE = ".config.resume.json"
+REDACTED_SECRET_PLACEHOLDERS = frozenset({
+    "***",
+    "********",
+    "<redacted>",
+    "redacted",
+})
 NETWORK_MANAGED_LABEL = "vllm_auto_bench.managed"
 NETWORK_RUN_ID_LABEL = "vllm_auto_bench.run_id"
 CONTAINER_RUN_DIR_LABEL = "vllm_auto_bench.run_dir"
@@ -1222,6 +1229,34 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def write_private_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(
+        f"{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    fd: int | None = None
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+        tmp_path.replace(path)
+        os.chmod(path, 0o600)
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        raise
+
+
 def write_vllm_cache_metadata(config: AutoBenchConfig, case: BenchmarkCase,
                               layout: CaseLayout) -> None:
     payload = vllm_cache_metadata(config, case)
@@ -1791,7 +1826,11 @@ def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
     inspect = runner.run(["docker", "inspect", container_name], check=False)
     (layout.serve_dir / "docker.inspect.json").write_text(inspect.stdout, encoding="utf-8")
     (layout.serve_dir / "serve_command.txt").write_text(
-        " ".join(build_serve_run_command(config, case, layout.run_dir)),
+        shlex.join(
+            mask_command_for_display(
+                build_serve_run_command(config, case, layout.run_dir)
+            )
+        ) + "\n",
         encoding="utf-8",
     )
 
@@ -2014,7 +2053,7 @@ def save_topology_artifacts(config: AutoBenchConfig,
             check=False,
         )
         (log_dir / f"{role_command.role_name}.log").write_text(
-            logs.stdout + logs.stderr,
+            _redact_known_secrets(logs.stdout + logs.stderr, secrets_to_redact),
             encoding="utf-8",
         )
         inspect = remote_runner.run(
@@ -2441,6 +2480,75 @@ def _config_with_results_dir(config: AutoBenchConfig, results_dir: Path) -> Auto
     return replace(config, run=replace(config.run, results_dir=results_dir))
 
 
+def _is_redacted_secret_placeholder(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.strip().lower() in REDACTED_SECRET_PLACEHOLDERS
+    )
+
+
+def _is_sensitive_resume_key(key: object) -> bool:
+    normalized = str(key).strip().lstrip("-").replace("-", "_").lower()
+    return _is_sensitive_dry_run_key(normalized)
+
+
+def _redacted_sensitive_placeholder_path(value: Any,
+                                         path: str = "config") -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            item_path = f"{path}.{key}"
+            if (
+                _is_sensitive_resume_key(key)
+                and _is_redacted_secret_placeholder(item)
+            ):
+                return item_path
+            found = _redacted_sensitive_placeholder_path(item, item_path)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            for index, item in enumerate(value):
+                item_path = f"{path}[{index}]"
+                if "=" in item:
+                    key, _separator, item_value = item.partition("=")
+                    if (
+                        _is_sensitive_resume_key(key)
+                        and _is_redacted_secret_placeholder(item_value)
+                    ):
+                        return item_path
+                if not _is_redacted_secret_placeholder(item):
+                    continue
+                previous = value[index - 1] if index > 0 else ""
+                if _is_sensitive_resume_key(previous):
+                    return item_path
+            return None
+        for index, item in enumerate(value):
+            found = _redacted_sensitive_placeholder_path(item, f"{path}[{index}]")
+            if found is not None:
+                return found
+    return None
+
+
+def _load_resume_config(run_dir: Path) -> AutoBenchConfig:
+    private_config = run_dir / RESUME_CONFIG_FILE
+    if private_config.exists():
+        return load_config(private_config)
+
+    public_config = run_dir / "config.resolved.json"
+    payload = _read_json_object(public_config, "resolved config")
+    redacted_path = _redacted_sensitive_placeholder_path(payload)
+    if redacted_path is not None:
+        raise ConfigError(
+            f"run is missing private resume config {RESUME_CONFIG_FILE}; "
+            f"public config.resolved.json contains a redacted sensitive value "
+            f"at {redacted_path}. A secret such as an inline password or API "
+            "key has been redacted and cannot be recovered for resume; use "
+            "password_env/auth.env or rerun the benchmark."
+        )
+    return load_config(public_config)
+
+
 def _resume_context_from_state(results_dir: Path, run_id: str,
                                state: dict[str, Any]) -> ResumeContext:
     resolved_results_dir = Path(results_dir)
@@ -2451,7 +2559,7 @@ def _resume_context_from_state(results_dir: Path, run_id: str,
     if status in ("starting", "running"):
         raise ConfigError(f"run is active and cannot be resumed: {status}")
 
-    config = load_config(run_dir / "config.resolved.json")
+    config = _load_resume_config(run_dir)
     config = _config_with_results_dir(config, resolved_results_dir)
     cases = expand_cases(config, run_id=run_id)
     manifest_data = _read_json_object(run_dir / "manifest.json", "manifest")
@@ -2500,35 +2608,63 @@ def load_resume_child_startup_context(results_dir: Path, run_id: str,
     return load_resume_context(results_dir, run_id)
 
 
-def _jsonable(value: Any) -> Any:
+def _jsonable(value: Any, *, redact_remote_auth_password: bool = True) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, RemoteAuth):
         payload = {
-            field_name: _jsonable(getattr(value, field_name))
+            field_name: _jsonable(
+                getattr(value, field_name),
+                redact_remote_auth_password=redact_remote_auth_password,
+            )
             for field_name in value.__dataclass_fields__
         }
-        if value.password is not None:
+        if redact_remote_auth_password and value.password is not None:
             payload["password"] = "***"
         return payload
     if isinstance(value, tuple):
-        return [_jsonable(item) for item in value]
+        return [
+            _jsonable(item, redact_remote_auth_password=redact_remote_auth_password)
+            for item in value
+        ]
     if isinstance(value, list):
-        return [_jsonable(item) for item in value]
+        return [
+            _jsonable(item, redact_remote_auth_password=redact_remote_auth_password)
+            for item in value
+        ]
     if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        return {
+            str(key): _jsonable(
+                item,
+                redact_remote_auth_password=redact_remote_auth_password,
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        return {
+            str(key): _jsonable(
+                item,
+                redact_remote_auth_password=redact_remote_auth_password,
+            )
+            for key, item in value.items()
+        }
     if hasattr(value, "__dataclass_fields__"):
         return {
-            field_name: _jsonable(getattr(value, field_name))
+            field_name: _jsonable(
+                getattr(value, field_name),
+                redact_remote_auth_password=redact_remote_auth_password,
+            )
             for field_name in value.__dataclass_fields__
         }
     return value
 
 
-def config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
-    payload = _jsonable(config)
+def config_to_dict(config: AutoBenchConfig, *,
+                   redact_remote_auth_password: bool = True) -> dict[str, Any]:
+    payload = _jsonable(
+        config,
+        redact_remote_auth_password=redact_remote_auth_password,
+    )
     if not config.serve_profiles:
         payload.pop("serve_profiles", None)
     if not config.topology_profiles:
@@ -2567,6 +2703,10 @@ def dry_run_config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ConfigError("dry-run resolved config must be an object")
     return payload
+
+
+def resume_config_to_dict(config: AutoBenchConfig) -> dict[str, Any]:
+    return config_to_dict(config, redact_remote_auth_password=False)
 
 
 def _case_ref(case: BenchmarkCase) -> dict[str, str | None]:
@@ -3135,7 +3275,11 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     completed = len(manifest.cases)
     interrupted = False
     try:
-        write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
+        write_json_atomic(run_dir / "config.resolved.json", dry_run_config_to_dict(config))
+        write_private_json_atomic(
+            run_dir / RESUME_CONFIG_FILE,
+            resume_config_to_dict(config),
+        )
         validate_local_paths(config)
 
         if not cases:
