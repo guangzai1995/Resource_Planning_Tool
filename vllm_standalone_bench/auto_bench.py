@@ -39,6 +39,7 @@ NETWORK_RUN_ID_LABEL = "vllm_auto_bench.run_id"
 CONTAINER_RUN_DIR_LABEL = "vllm_auto_bench.run_dir"
 CONTAINER_MODEL_LABEL = "vllm_auto_bench.model"
 CONTAINER_SERVE_PROFILE_LABEL = "vllm_auto_bench.serve_profile"
+CONTAINER_TOPOLOGY_PROFILE_LABEL = "vllm_auto_bench.topology_profile"
 CONTAINER_BENCH_PROFILE_LABEL = "vllm_auto_bench.bench_profile"
 
 
@@ -1051,12 +1052,29 @@ def _append_many(cmd: list[str], flag: str, values: tuple[int, ...]) -> None:
     cmd.extend(str(value) for value in values)
 
 
+def case_endpoint_base_url(config: AutoBenchConfig, case: BenchmarkCase) -> str:
+    if case.topology_profile is not None:
+        topology = case.topology_profile
+        host = topology.hosts.get(topology.frontend.host)
+        if host is None:
+            raise ConfigError(
+                f"topology frontend host is missing: {topology.frontend.host}"
+            )
+        return f"http://{host.address}:{topology.frontend.port}/v1"
+    require_legacy_case(case)
+    return f"http://{case.container_name}:{config.run.container_port}/v1"
+
+
 def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                             bench_dir: Path) -> list[str]:
-    serve_profile = require_legacy_case(case)
     bench = case.bench_profile
     resolved_bench_dir = Path(bench_dir).resolve()
     resolved_run_dir = resolved_bench_dir.parents[2]
+    profile_label = (
+        f"{CONTAINER_TOPOLOGY_PROFILE_LABEL}={case.topology_profile.name}"
+        if case.topology_profile is not None
+        else f"{CONTAINER_SERVE_PROFILE_LABEL}={require_legacy_case(case).name}"
+    )
     cmd = [
         "docker", "run", "--rm",
         "--name", make_bench_container_name(case),
@@ -1064,7 +1082,7 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
-        "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
+        "--label", profile_label,
         "--label", f"{CONTAINER_BENCH_PROFILE_LABEL}={case.bench_profile.name}",
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
@@ -1075,7 +1093,7 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "-v", f"{resolved_bench_dir}:/results",
         config.run.bench_image,
         "python", "/opt/vllm_standalone_bench/run_bench_multi.py",
-        "--base-url", f"http://{case.container_name}:{config.run.container_port}/v1",
+        "--base-url", case_endpoint_base_url(config, case),
         "--model", case.api_model_name,
         "--served-model-name", case.api_model_name,
         "--backend", bench.backend,
@@ -1498,8 +1516,14 @@ def cleanup_network(config: AutoBenchConfig, runner: Runner,
     return stop_requested
 
 
-def print_cmd(cmd: list[str]) -> None:
-    print("+ " + " ".join(cmd))
+def mask_command_for_display(cmd: Sequence[str]) -> list[str]:
+    from remote_docker import mask_command
+
+    return mask_command(cmd)
+
+
+def print_cmd(cmd: Sequence[str]) -> None:
+    print("+ " + " ".join(mask_command_for_display(cmd)))
 
 
 def install_signal_handlers() -> None:
@@ -2268,18 +2292,29 @@ def _reject_topology_profiles_until_runner_supported(config: AutoBenchConfig) ->
 
 
 def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
-    _reject_topology_profiles_until_runner_supported(config)
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
-    network_owned = config.run.create_network
+    has_legacy_cases = any(case.serve_profile is not None for case in cases)
+    network_owned = config.run.create_network and has_legacy_cases
     write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
     try:
-        if config.run.create_network:
+        if network_owned:
             print_cmd(build_network_create_command(config, run_id))
         for group_cases in _group_cases_by_serve(cases).values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
-            print_cmd(build_serve_run_command(config, serve_case, serve_layout.run_dir))
+            if serve_case.topology_profile is not None:
+                commands = serve_case.topology_profile.build_commands(
+                    config,
+                    serve_case,
+                    serve_layout.run_dir,
+                )
+                for command in commands.values():
+                    print_cmd(command.masked_argv)
+            else:
+                print_cmd(
+                    build_serve_run_command(config, serve_case, serve_layout.run_dir)
+                )
             for case in group_cases:
                 layout = build_layout(config, run_id, case)
                 print_cmd(build_bench_run_command(config, case, layout.bench_dir))
@@ -2300,9 +2335,9 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                    initial_manifest: Manifest | None = None,
                    cases_to_run: tuple[BenchmarkCase, ...] | None = None) -> int:
     active_runner: Runner = runner or DockerRunner()
-    _reject_topology_profiles_until_runner_supported(config)
     if dry_run:
         return _run_controller_dry_run(config, run_id)
+    _reject_topology_profiles_until_runner_supported(config)
 
     all_cases = expand_cases(config, run_id=run_id)
     cases = all_cases if cases_to_run is None else cases_to_run

@@ -32,6 +32,15 @@ def values_after(cmd, flag):
     return [cmd[index + 1] for index, value in enumerate(cmd) if value == flag]
 
 
+def labels_from(cmd):
+    labels = {}
+    for value in values_after(cmd, "--label"):
+        key, separator, label_value = value.partition("=")
+        if separator:
+            labels[key] = label_value
+    return labels
+
+
 def minimal_config(tmp_path):
     model_root = tmp_path / "model"
     model_dir = model_root / "Qwen2.5-1.5B-Instruct"
@@ -126,13 +135,13 @@ def test_expand_cases_uses_topology_profiles(tmp_path):
     assert case.serving_name == "sglang_pd_2p2d"
 
 
-def test_topology_cases_are_not_runnable_before_topology_runner(tmp_path):
+def test_topology_non_dry_run_still_rejected_before_lifecycle(tmp_path):
     from test_remote_topology import pd_topology_config
 
     config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
 
     with pytest.raises(ab.ConfigError, match="topology_profiles.*not runnable"):
-        ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+        ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
 
 
 def test_start_detached_rejects_topology_profiles_before_lock(tmp_path):
@@ -157,8 +166,75 @@ def test_legacy_command_helpers_reject_topology_case(tmp_path):
 
     with pytest.raises(ab.ConfigError, match="legacy"):
         ab.build_serve_run_command(config, case, tmp_path / "run")
-    with pytest.raises(ab.ConfigError, match="legacy"):
-        ab.build_bench_run_command(config, case, tmp_path / "bench")
+
+
+def test_topology_layout_uses_topology_profile(tmp_path):
+    from test_remote_topology import (
+        pd_topology_config,
+        write_config as write_topology_config,
+    )
+
+    config = ab.load_config(write_topology_config(tmp_path, pd_topology_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    layout = ab.build_layout(config, "run123", case)
+
+    model = "qwen2_5_1_5b"
+    assert layout.serve_dir == tmp_path / "results" / "run123" / model / "sglang_pd_2p2d"
+    assert layout.bench_dir == layout.serve_dir / "smoke"
+
+
+def test_topology_bench_command_targets_frontend_endpoint(tmp_path):
+    from test_remote_topology import pd_topology_config
+
+    config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_bench_run_command(config, case, tmp_path / "bench")
+
+    labels = labels_from(cmd)
+    assert value_after(cmd, "--base-url") == "http://10.0.0.31:8000/v1"
+    assert labels["vllm_auto_bench.topology_profile"] == "sglang_pd_2p2d"
+    assert "vllm_auto_bench.serve_profile" not in labels
+
+
+def test_topology_dry_run_masks_passwords_and_prints_remote_commands(tmp_path, capsys):
+    from test_remote_topology import pd_topology_config
+
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "secret-p1-password",
+    }
+    topology["frontend"]["args"] = ["--api-key", "router-secret"]
+    config = ab.load_config(write_config(tmp_path, data))
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+
+    out = capsys.readouterr().out
+    resolved = json.loads(
+        (tmp_path / "results" / "run123" / "config.resolved.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    rendered_resolved = json.dumps(resolved)
+    assert result == 0
+    assert "sglang.launch_server" in out
+    assert "sglang_router.launch_router" in out
+    assert "run_bench_multi.py" in out
+    assert "--pd-disaggregation" in out
+    assert "docker network create" not in out
+    assert "docker network rm" not in out
+    assert "secret-p1-password" not in out
+    assert "router-secret" not in out
+    assert "local-bench-key" not in out
+    assert "secret-p1-password" not in rendered_resolved
+    assert (
+        resolved["topology_profiles"][0]["hosts"]["p1"]["auth"].get("password")
+        == "***"
+    )
 
 
 def test_resource_monitor_defaults_enabled(tmp_path):
