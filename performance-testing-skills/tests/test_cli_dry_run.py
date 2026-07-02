@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import subprocess
 
@@ -47,6 +48,38 @@ def test_manual_cli_rejects_non_finite_timeout_values(timeout_value):
     assert result.returncode != 0
     assert "error:" in result.stderr
     assert "argument --timeout-seconds" in result.stderr
+
+
+def test_manual_cli_saves_failed_non_dry_run_response_for_missing_asr_audio(tmp_path):
+    save_path = tmp_path / "responses.json"
+
+    result = run_manual_cli(
+        "--config",
+        "configs/openai_asr.json",
+        "--save-response",
+        str(save_path),
+        "--timeout-seconds",
+        "1",
+    )
+
+    assert result.returncode == 1
+    assert "success=False" in result.stdout
+    assert "file_not_found" in result.stdout
+    assert save_path.exists()
+    payload = json.loads(save_path.read_text(encoding="utf-8"))
+    assert isinstance(payload["requests"], list)
+    assert payload["requests"][0]["success"] is False
+    assert payload["requests"][0]["error_type"] == "file_not_found"
+
+
+def test_manual_cli_dry_run_save_response_creates_parent_directories(tmp_path):
+    save_path = tmp_path / "nested" / "out.json"
+
+    result = run_manual_cli("--dry-run", "--save-response", str(save_path))
+
+    assert result.returncode == 0, result.stderr
+    assert save_path.parent.is_dir()
+    assert json.loads(save_path.read_text(encoding="utf-8")) == {"requests": []}
 
 
 def test_run_manual_shell_wrapper_forwards_to_manual_cli():
