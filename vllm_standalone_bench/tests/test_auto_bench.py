@@ -550,6 +550,120 @@ def test_manifest_status_matrix(tmp_path):
     assert failed.status() == "completed_with_failures"
 
 
+def two_bench_config(tmp_path):
+    data = minimal_config(tmp_path)
+    second_profile = dict(data["bench_profiles"][0])
+    second_profile["name"] = "smoke2"
+    data["bench_profiles"].append(second_profile)
+    return data
+
+
+def write_resolved_config_for_resume(tmp_path, data=None):
+    data = data or two_bench_config(tmp_path)
+    config = ab.load_config(write_config(tmp_path, data))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_json_atomic(run_dir / "config.resolved.json", ab.config_to_dict(config))
+    return config, run_dir
+
+
+def test_plan_resume_cases_keeps_passed_and_selects_pending(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    first_layout = ab.build_layout(config, "run123", cases[0])
+    old_manifest = {
+        "run_id": "run123",
+        "status": "interrupted",
+        "cases": [
+            {
+                "model": cases[0].model.name,
+                "serve_profile": cases[0].serve_profile.name,
+                "bench_profile": cases[0].bench_profile.name,
+                "status": "passed",
+                "csv": str((first_layout.bench_dir / "result.csv").relative_to(first_layout.run_dir)),
+                "xlsx": str((first_layout.bench_dir / "result.xlsx").relative_to(first_layout.run_dir)),
+            },
+            {
+                "model": cases[1].model.name,
+                "serve_profile": cases[1].serve_profile.name,
+                "bench_profile": cases[1].bench_profile.name,
+                "status": "interrupted",
+                "csv": "old.csv",
+                "xlsx": "old.xlsx",
+            },
+        ],
+    }
+
+    initial_manifest, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=old_manifest,
+    )
+
+    assert unknown == []
+    assert [row["bench_profile"] for row in initial_manifest.cases] == ["smoke"]
+    assert initial_manifest.cases[0]["status"] == "passed"
+    assert [case.bench_profile.name for case in pending] == ["smoke2"]
+    assert initial_manifest.total == 2
+
+
+def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "status": "completed_with_failures",
+        "cases": [
+            {
+                "model": cases[0].model.name,
+                "serve_profile": cases[0].serve_profile.name,
+                "bench_profile": cases[0].bench_profile.name,
+                "status": "failed",
+                "csv": "old.csv",
+                "xlsx": "old.xlsx",
+            }
+        ],
+    }
+
+    initial_manifest, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert unknown == []
+    assert initial_manifest.cases == []
+    assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2"]
+
+
+def test_plan_resume_cases_reports_manifest_rows_not_in_config(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "status": "interrupted",
+        "cases": [
+            {
+                "model": "old_model",
+                "serve_profile": "old_serve",
+                "bench_profile": "old_bench",
+                "status": "passed",
+                "csv": "old.csv",
+                "xlsx": "old.xlsx",
+            }
+        ],
+    }
+
+    initial_manifest, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert initial_manifest.cases == []
+    assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2"]
+    assert unknown == [("old_model", "old_serve", "old_bench")]
+
+
 class FakeRunner:
     def __init__(self, failures=None):
         self.commands = []

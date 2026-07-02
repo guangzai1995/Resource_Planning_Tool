@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -1580,6 +1580,11 @@ TERMINAL_RUN_STATUSES = frozenset({
     "failed",
     "interrupted",
 })
+RESUMABLE_RUN_STATUSES = frozenset({
+    "interrupted",
+    "failed",
+    "completed_with_failures",
+})
 
 
 @dataclass(frozen=True)
@@ -1924,6 +1929,60 @@ def _manifest_case_keys(manifest: Manifest) -> set[tuple[str, str, str]]:
         (str(row["model"]), str(row["serve_profile"]), str(row["bench_profile"]))
         for row in manifest.cases
     }
+
+
+def _manifest_row_key(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    model = row.get("model")
+    serve_profile = row.get("serve_profile")
+    bench_profile = row.get("bench_profile")
+    if not all(isinstance(value, str) for value in (model, serve_profile, bench_profile)):
+        return None
+    return (model, serve_profile, bench_profile)
+
+
+def _copy_manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    copied: dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(key, str) and isinstance(value, (str, int, float, bool, type(None))):
+            copied[key] = value
+    return copied
+
+
+def plan_resume_cases(
+    *,
+    run_id: str,
+    cases: tuple[BenchmarkCase, ...],
+    manifest_data: Mapping[str, Any],
+) -> tuple[Manifest, tuple[BenchmarkCase, ...], list[tuple[str, str, str]]]:
+    rows = manifest_data.get("cases")
+    if not isinstance(rows, list):
+        raise ConfigError("manifest cases must be a list")
+    if manifest_data.get("run_id") not in (None, run_id):
+        raise ConfigError(
+            f"manifest run_id mismatch: expected {run_id}, got {manifest_data.get('run_id')}"
+        )
+
+    full_keys = {_case_key(case) for case in cases}
+    passed_rows: list[dict[str, Any]] = []
+    passed_keys: set[tuple[str, str, str]] = set()
+    unknown_keys: list[tuple[str, str, str]] = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ConfigError("manifest cases must contain objects")
+        key = _manifest_row_key(row)
+        if key is None:
+            raise ConfigError("manifest case row is missing model/serve_profile/bench_profile")
+        if key not in full_keys:
+            unknown_keys.append(key)
+            continue
+        if row.get("status") == "passed":
+            passed_keys.add(key)
+            passed_rows.append(_copy_manifest_row(row))
+
+    initial_manifest = Manifest(run_id=run_id, total=len(cases), cases=passed_rows)
+    pending = tuple(case for case in cases if _case_key(case) not in passed_keys)
+    return initial_manifest, pending, unknown_keys
 
 
 def _record_group_status(manifest: Manifest, run_dir: Path, run_id: str,
