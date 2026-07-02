@@ -56,6 +56,13 @@ DATASET_PATH="${DATASET_PATH:-${SCRIPT_DIR}/assets/librispeech_test_clean_256/as
 DATASET_NAME="${DATASET_NAME:-custom_audio}"
 LANGUAGE="${LANGUAGE:-en}"
 
+# 可选：运行时把内置短音频拼接成指定单条音频时长，单位秒。
+# 不设置 AUDIO_DURATION_S 时使用数据集原始音频；设置后每个请求生成独立音频文件，
+# 通过变换源片段顺序减少重复音频/前缀命中缓存对压测的影响。
+AUDIO_DURATION_S="${AUDIO_DURATION_S:-}"
+AUDIO_SILENCE_MS="${AUDIO_SILENCE_MS:-500}"
+GENERATED_AUDIO_DIR="${GENERATED_AUDIO_DIR:-}"
+
 # =============================================================================
 # ▌ 三、压测维度
 # =============================================================================
@@ -81,6 +88,9 @@ RESULT_DIR="${RESULT_DIR:-${SCRIPT_DIR}/results}"
 TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
 OUTPUT_CSV="${OUTPUT_CSV:-${RESULT_DIR}/asr_bench_${TIMESTAMP}.csv}"
 OUTPUT_XLSX="${OUTPUT_XLSX:-${RESULT_DIR}/asr_bench_${TIMESTAMP}.xlsx}"
+if [[ -n "${AUDIO_DURATION_S}" && -z "${GENERATED_AUDIO_DIR}" ]]; then
+    GENERATED_AUDIO_DIR="${RESULT_DIR}/asr_dynamic_audio_${TIMESTAMP}"
+fi
 
 # 设为 true 只打印命令，不实际发起压测
 DRY_RUN="${DRY_RUN:-false}"
@@ -146,6 +156,12 @@ if [[ -n "${MAX_TTFT_MS}" ]]; then
     CMD+=(--max-ttft-ms "${MAX_TTFT_MS}")
 fi
 
+if [[ -n "${AUDIO_DURATION_S}" ]]; then
+    CMD+=(--audio-duration-s "${AUDIO_DURATION_S}")
+    CMD+=(--audio-silence-ms "${AUDIO_SILENCE_MS}")
+    CMD+=(--generated-audio-dir "${GENERATED_AUDIO_DIR}")
+fi
+
 if [[ "${VARY_SEED_BY_CONFIG}" != "true" ]]; then
     CMD+=(--no-vary-seed-by-config)
 fi
@@ -157,6 +173,10 @@ printf "║  接口      : %-48s║\n" "${API_URL}"
 printf "║  Base URL  : %-48s║\n" "${BASE_URL}"
 printf "║  模型      : %-48s║\n" "${MODEL}"
 printf "║  数据集    : %-48s║\n" "${DATASET_PATH}"
+if [[ -n "${AUDIO_DURATION_S}" ]]; then
+    printf "║  单条时长  : %-48s║\n" "${AUDIO_DURATION_S}s"
+    printf "║  拼接目录  : %-48s║\n" "${GENERATED_AUDIO_DIR}"
+fi
 printf "║  并发      : %-48s║\n" "${PARALLEL_NUMS}"
 printf "║  轮数      : %-48s║\n" "${EPOCHS}"
 printf "║  CSV       : %-48s║\n" "${OUTPUT_CSV}"
