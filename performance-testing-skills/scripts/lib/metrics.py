@@ -71,10 +71,12 @@ def analyze_bottleneck(metrics):
             "stable_concurrency": None,
             "peak_throughput_concurrency": None,
             "overload_starts_at": None,
+            "all_failed_at": None,
         }
 
     peak = max(sorted_metrics, key=lambda item: item.get("request_throughput_req_s", 0.0))
     overload_starts_at = None
+    all_failed_at = None
     stable_concurrency = None
 
     for index, current in enumerate(sorted_metrics):
@@ -83,6 +85,11 @@ def analyze_bottleneck(metrics):
 
         current_concurrency = current.get("concurrency")
         current_success_rate = current.get("success_rate", 0.0)
+        if current_success_rate == 0.0:
+            if all_failed_at is None:
+                all_failed_at = current_concurrency
+            continue
+
         overloaded = current_success_rate < 1.0
 
         if index > 0:
@@ -115,4 +122,5 @@ def analyze_bottleneck(metrics):
         "stable_concurrency": stable_concurrency,
         "peak_throughput_concurrency": peak.get("concurrency"),
         "overload_starts_at": overload_starts_at,
+        "all_failed_at": all_failed_at,
     }

@@ -31,6 +31,7 @@ def _build_summary(metrics, analysis):
     stable = analysis.get("stable_concurrency")
     peak = analysis.get("peak_throughput_concurrency")
     overload = analysis.get("overload_starts_at")
+    all_failed = analysis.get("all_failed_at")
 
     lines = [
         "# Benchmark Summary",
@@ -40,10 +41,18 @@ def _build_summary(metrics, analysis):
         f"- Stable concurrency: {stable}",
         f"- Peak throughput concurrency: {peak}",
         f"- Overload starts at: {overload}",
-        "",
-        "## Metrics",
-        "",
     ]
+    if all_failed is not None:
+        lines.extend(
+            [
+                f"- All requests failed at: {all_failed}",
+                "",
+                "All requests failed at this concurrency, which is not a performance bottleneck. "
+                "Check API configuration, authentication, or request shape before interpreting performance.",
+            ]
+        )
+
+    lines.extend(["", "## Metrics", ""])
 
     if not metrics:
         lines.append("No metrics were recorded.")

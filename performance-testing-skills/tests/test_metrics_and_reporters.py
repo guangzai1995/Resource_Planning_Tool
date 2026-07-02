@@ -37,6 +37,19 @@ def test_analyze_bottleneck_finds_stable_and_overloaded_concurrency():
     assert analysis["overload_starts_at"] == 32
 
 
+def test_analyze_bottleneck_treats_all_failed_runs_as_invalid_not_overloaded():
+    metrics = [
+        {"concurrency": 16, "success_rate": 1.0, "request_throughput_req_s": 0.50, "latency_p90_ms": 30000.0},
+        {"concurrency": 32, "success_rate": 0.0, "request_throughput_req_s": 0.0, "latency_p90_ms": 0.0},
+    ]
+
+    analysis = analyze_bottleneck(metrics)
+
+    assert analysis["stable_concurrency"] == 16
+    assert analysis["overload_starts_at"] is None
+    assert analysis["all_failed_at"] == 32
+
+
 def test_write_reports_creates_summary_json_and_csv(tmp_path):
     metrics = [{"concurrency": 1, "n_success": 3, "n_failed": 0, "success_rate": 1.0, "request_throughput_req_s": 0.1}]
     requests = [{"request_id": "req-1", "success": True, "latency_ms": 100.0}]
@@ -48,3 +61,17 @@ def test_write_reports_creates_summary_json_and_csv(tmp_path):
     assert json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))[0]["concurrency"] == 1
     with (tmp_path / "metrics.csv").open("r", encoding="utf-8", newline="") as handle:
         assert list(csv.DictReader(handle))[0]["concurrency"] == "1"
+
+
+def test_write_reports_warns_that_all_failed_runs_are_not_bottlenecks(tmp_path):
+    metrics = [{"concurrency": 32, "n_success": 0, "n_failed": 3, "success_rate": 0.0, "request_throughput_req_s": 0.0}]
+    requests = [{"request_id": "req-1", "success": False}]
+    errors = [{"request_id": "req-1", "error": "401 Unauthorized"}]
+    analysis = {"stable_concurrency": None, "overload_starts_at": None, "all_failed_at": 32}
+
+    write_reports(tmp_path, metrics, requests, errors, analysis)
+
+    summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert "All requests failed at: 32" in summary
+    assert "not a performance bottleneck" in summary
+    assert "API configuration, authentication, or request shape" in summary
