@@ -6,8 +6,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
+from scripts import perf_auto, perf_manual
+
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CLI_TIMEOUT_SECONDS = 15
 
 
 class OpenAIChatHandler(BaseHTTPRequestHandler):
@@ -40,23 +43,31 @@ class OpenAIChatHandler(BaseHTTPRequestHandler):
         return
 
 
-def run_manual_cli(*args: str) -> subprocess.CompletedProcess[str]:
+def run_manual_cli(
+    *args: str,
+    timeout: float = DEFAULT_CLI_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["python3", "scripts/perf_manual.py", *args],
         cwd=ROOT,
         text=True,
         capture_output=True,
         check=False,
+        timeout=timeout,
     )
 
 
-def run_auto_cli(*args: str) -> subprocess.CompletedProcess[str]:
+def run_auto_cli(
+    *args: str,
+    timeout: float = DEFAULT_CLI_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["python3", "scripts/perf_auto.py", *args],
         cwd=ROOT,
         text=True,
         capture_output=True,
         check=False,
+        timeout=timeout,
     )
 
 
@@ -84,12 +95,14 @@ def test_manual_cli_mode_curl_only_outputs_curl():
 
 
 @pytest.mark.parametrize("timeout_value", ["nan", "inf"])
-def test_manual_cli_rejects_non_finite_timeout_values(timeout_value):
-    result = run_manual_cli("--dry-run", "--timeout-seconds", timeout_value)
+def test_manual_cli_rejects_non_finite_timeout_values(timeout_value, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        perf_manual.main(["--dry-run", "--timeout-seconds", timeout_value])
 
-    assert result.returncode != 0
-    assert "error:" in result.stderr
-    assert "argument --timeout-seconds" in result.stderr
+    captured = capsys.readouterr()
+    assert excinfo.value.code != 0
+    assert "error:" in captured.err
+    assert "argument --timeout-seconds" in captured.err
 
 
 def test_manual_cli_saves_failed_non_dry_run_response_for_missing_asr_audio(tmp_path):
@@ -131,6 +144,7 @@ def test_run_manual_shell_wrapper_forwards_to_manual_cli():
         text=True,
         capture_output=True,
         check=False,
+        timeout=DEFAULT_CLI_TIMEOUT_SECONDS,
     )
 
     assert result.returncode == 0, result.stderr
@@ -226,6 +240,8 @@ def test_perf_auto_writes_reports_with_local_server(tmp_path):
             "1,2",
             "--epochs",
             "2",
+            "--timeout-seconds",
+            "2",
             "--output-dir",
             str(output_dir),
         )
@@ -249,8 +265,22 @@ def test_perf_auto_writes_reports_with_local_server(tmp_path):
 
     metrics = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
     assert len(metrics) == 2
+    metrics_by_concurrency = {row["concurrency"]: row for row in metrics}
+    assert set(metrics_by_concurrency) == {1, 2}
+    assert metrics_by_concurrency[1]["n_requests"] == 2
+    assert metrics_by_concurrency[2]["n_requests"] == 4
+    for row in metrics:
+        assert row["n_success"] == row["n_requests"]
+        assert row["n_failed"] == 0
+        assert row["success_rate"] == 1.0
+
     request_lines = (output_dir / "requests.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(request_lines) == 6
+    request_rows = [json.loads(line) for line in request_lines]
+    assert all(row["status_code"] == 200 for row in request_rows)
+    assert all(row["input_tokens"] == 3 for row in request_rows)
+    assert all(row["output_tokens"] == 2 for row in request_rows)
+    assert all(row["response_summary"] == "ok" for row in request_rows)
     assert (output_dir / "errors.jsonl").read_text(encoding="utf-8") == ""
 
 
@@ -282,6 +312,7 @@ def test_run_auto_shell_wrapper_forwards_to_auto_cli():
         text=True,
         capture_output=True,
         check=False,
+        timeout=DEFAULT_CLI_TIMEOUT_SECONDS,
     )
 
     assert result.returncode == 0, result.stderr
@@ -305,8 +336,10 @@ def test_run_auto_shell_wrapper_forwards_to_auto_cli():
         ("--max-p90-latency-ms", "inf"),
     ],
 )
-def test_auto_cli_rejects_invalid_numeric_arguments(option, value):
-    result = run_auto_cli("--dry-run", option, value)
+def test_auto_cli_rejects_invalid_numeric_arguments(option, value, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        perf_auto.main(["--dry-run", option, value])
 
-    assert result.returncode != 0
-    assert "error:" in result.stderr
+    captured = capsys.readouterr()
+    assert excinfo.value.code != 0
+    assert "error:" in captured.err
