@@ -12,6 +12,23 @@ def write_config(tmp_path, data):
     return path
 
 
+def value_after(argv, flag):
+    return argv[argv.index(flag) + 1]
+
+
+def values_after(argv, flag):
+    return [argv[index + 1] for index, value in enumerate(argv) if value == flag]
+
+
+def labels_from(argv):
+    labels = {}
+    for value in values_after(argv, "--label"):
+        key, separator, label_value = value.partition("=")
+        if separator:
+            labels[key] = label_value
+    return labels
+
+
 def pd_topology_config(tmp_path):
     data = minimal_config(tmp_path)
     del data["serve_profiles"]
@@ -62,6 +79,112 @@ def pd_topology_config(tmp_path):
         },
     }]
     return data
+
+
+def test_sglang_pd_commands_render_worker_and_router_flags(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["router_image"] = "sglang-router:offline"
+    topology["network"] = "pd-net"
+    topology["transfer_backend"] = "nixl"
+    topology["prefill"][0]["bootstrap_port"] = 12335
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1 = commands["p1"].argv
+    router = commands["router"].argv
+    assert "sglang.launch_server" in p1
+    assert value_after(p1, "--disaggregation-mode") == "prefill"
+    assert value_after(p1, "--disaggregation-bootstrap-port") == "12335"
+    assert values_after(router, "--prefill") == [
+        "http://10.0.0.11:30000",
+        "http://10.0.0.12:30000",
+    ]
+    assert values_after(router, "--decode") == [
+        "http://10.0.0.21:31000",
+        "http://10.0.0.22:31000",
+    ]
+    assert "12335" not in values_after(router, "--prefill")
+    assert (
+        commands["p1"].container_name
+        == "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-p1"
+    )
+
+
+def test_sglang_pd_commands_include_expected_labels_and_masked_argv(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["frontend"]["args"] = ["--api-key", "router-secret"]
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    router = commands["router"]
+    assert "router-secret" in router.argv
+    assert "router-secret" not in router.masked_argv
+
+    labels = labels_from(commands["p1"].argv)
+    assert labels["vllm_auto_bench.managed"] == "true"
+    assert labels["vllm_auto_bench.run_id"] == "run123"
+    assert labels["vllm_auto_bench.model"] == "qwen2_5_1_5b"
+    assert labels["vllm_auto_bench.topology_profile"] == "sglang_pd_2p2d"
+    assert labels["vllm_auto_bench.role"] == "prefill"
+    assert labels["vllm_auto_bench.role_name"] == "p1"
+
+
+def test_vllm_pd_worker_command_renders_kv_template(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["kv_transfer_config_template"] = {
+        "kv_connector": "NixlConnector",
+        "kv_role": "{kv_role}",
+        "kv_rank": "{kv_rank}",
+        "kv_parallel_size": "{kv_parallel_size}",
+        "node_name": "{node_name}",
+        "node_address": "{node_address}",
+        "node_port": "{node_port}",
+        "run_id": "{run_id}",
+    }
+    topology["frontend"] = {
+        "kind": "external",
+        "host": "router",
+        "port": 8000,
+        "image": "pd-proxy:offline",
+        "command": ["python", "/opt/proxy.py", "--port", "{frontend_port}", "--run", "{run_id}"],
+    }
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1 = commands["p1"].argv
+    d1 = commands["d1"].argv
+    assert value_after(p1, "--entrypoint") == "vllm"
+
+    p1_kv_config = json.loads(value_after(p1, "--kv-transfer-config"))
+    assert p1_kv_config["kv_connector"] == "NixlConnector"
+    assert p1_kv_config["kv_role"] == "kv_producer"
+    assert str(p1_kv_config["kv_rank"]) == "0"
+    assert str(p1_kv_config["kv_parallel_size"]) == "4"
+    assert p1_kv_config["node_name"] == "p1"
+    assert p1_kv_config["node_address"] == "10.0.0.11"
+    assert str(p1_kv_config["node_port"]) == "30000"
+
+    d1_kv_config = json.loads(value_after(d1, "--kv-transfer-config"))
+    assert d1_kv_config["kv_role"] == "kv_consumer"
+    assert str(d1_kv_config["kv_rank"]) == "2"
+
+    external = commands["router"].argv
+    assert "pd-proxy:offline" in external
+    assert value_after(external, "--port") == "8000"
+    assert value_after(external, "--run") == "run123"
 
 
 def test_load_config_accepts_topology_profiles_without_serve_profiles(tmp_path):

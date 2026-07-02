@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
+import string
 import types
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Collection, Mapping
 
 
@@ -47,6 +50,15 @@ class TopologyFrontend:
 
 
 @dataclass(frozen=True)
+class RoleCommand:
+    role_name: str
+    host_name: str
+    container_name: str
+    argv: tuple[str, ...]
+    masked_argv: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class TopologyProfile:
     name: str
     engine: str
@@ -60,11 +72,417 @@ class TopologyProfile:
     router_image: str | None = None
     network: str = "host"
     transfer_backend: str | None = None
+    kv_transfer_config_template: Mapping[str, Any] = field(
+        default_factory=lambda: types.MappingProxyType({})
+    )
     disaggregation_ib_device: str | None = None
     env: Mapping[str, str] = field(
         default_factory=lambda: types.MappingProxyType({})
     )
     volumes: tuple[str, ...] = field(default_factory=tuple)
+
+    def build_commands(
+        self,
+        config: Any,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+    ) -> dict[str, RoleCommand]:
+        if self.mode != "pd":
+            raise _config_error(f"topology profile {self.name} only supports pd mode")
+        if self.provider != "ssh_docker":
+            raise _config_error(
+                f"topology profile {self.name} only supports ssh_docker provider"
+            )
+        if self.engine == "sglang":
+            return self._build_sglang_pd_commands(config, case, run_dir)
+        if self.engine == "vllm":
+            return self._build_vllm_pd_commands(config, case, run_dir)
+        raise _config_error(
+            f"topology profile {self.name} has unsupported engine: {self.engine}"
+        )
+
+    def _build_sglang_pd_commands(
+        self,
+        config: Any,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+    ) -> dict[str, RoleCommand]:
+        image = self._worker_image(config)
+        commands: dict[str, RoleCommand] = {}
+        for node in self.prefill:
+            commands[node.name] = self._build_sglang_worker_command(
+                config,
+                case,
+                run_dir,
+                node,
+                role="prefill",
+                image=image,
+            )
+        for node in self.decode:
+            commands[node.name] = self._build_sglang_worker_command(
+                config,
+                case,
+                run_dir,
+                node,
+                role="decode",
+                image=image,
+            )
+        commands[self.frontend.host] = self._build_sglang_router_command(
+            case,
+            run_dir,
+        )
+        return commands
+
+    def _build_sglang_worker_command(
+        self,
+        config: Any,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+        node: TopologyNode,
+        *,
+        role: str,
+        image: str,
+    ) -> RoleCommand:
+        argv = self._docker_run_base(case, run_dir, node.name, node.host, role)
+        argv.extend([
+            "--gpus",
+            _docker_gpus(node.gpus),
+            "--network",
+            self.network,
+            "-v",
+            f"{config.mounts.models}:/models:ro",
+        ])
+        self._append_env_and_volumes(argv, node)
+        argv.extend([
+            "--entrypoint",
+            "python3",
+            image,
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            case.model.model_path,
+            "--served-model-name",
+            case.api_model_name,
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(node.port),
+            "--disaggregation-mode",
+            role,
+        ])
+        if self.transfer_backend:
+            argv.extend(["--disaggregation-transfer-backend", self.transfer_backend])
+        if node.bootstrap_port is not None:
+            argv.extend([
+                "--disaggregation-bootstrap-port",
+                str(node.bootstrap_port),
+            ])
+        argv.extend(node.args)
+        return _role_command(
+            role_name=node.name,
+            host_name=node.host,
+            container_name=_container_name(case, self.name, node.name),
+            argv=argv,
+        )
+
+    def _build_sglang_router_command(
+        self,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+    ) -> RoleCommand:
+        if self.frontend.kind != "router":
+            raise _config_error(
+                f"topology profile {self.name} frontend.kind must be router "
+                "for sglang pd"
+            )
+        image = self.router_image or self._required_image()
+        argv = self._docker_run_base(
+            case,
+            run_dir,
+            self.frontend.host,
+            self.frontend.host,
+            "router",
+        )
+        argv.extend([
+            "--network",
+            self.network,
+        ])
+        self._append_env_and_volumes(argv, None)
+        argv.extend([
+            "--entrypoint",
+            "python3",
+            image,
+            "-m",
+            "sglang_router.launch_router",
+            "--pd-disaggregation",
+            "repeated",
+        ])
+        for node in self.prefill:
+            host = self.hosts[node.host]
+            argv.extend(["--prefill", f"http://{host.address}:{node.port}"])
+        for node in self.decode:
+            host = self.hosts[node.host]
+            argv.extend(["--decode", f"http://{host.address}:{node.port}"])
+        argv.extend([
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(self.frontend.port),
+        ])
+        argv.extend(self.frontend.args)
+        return _role_command(
+            role_name=self.frontend.host,
+            host_name=self.frontend.host,
+            container_name=_container_name(case, self.name, self.frontend.host),
+            argv=argv,
+        )
+
+    def _build_vllm_pd_commands(
+        self,
+        config: Any,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+    ) -> dict[str, RoleCommand]:
+        image = self._worker_image(config)
+        total_workers = len(self.prefill) + len(self.decode)
+        commands: dict[str, RoleCommand] = {}
+        rank = 0
+        for node in self.prefill:
+            commands[node.name] = self._build_vllm_worker_command(
+                config,
+                case,
+                run_dir,
+                node,
+                kv_role="kv_producer",
+                kv_rank=rank,
+                kv_parallel_size=total_workers,
+                image=image,
+            )
+            rank += 1
+        for node in self.decode:
+            commands[node.name] = self._build_vllm_worker_command(
+                config,
+                case,
+                run_dir,
+                node,
+                kv_role="kv_consumer",
+                kv_rank=rank,
+                kv_parallel_size=total_workers,
+                image=image,
+            )
+            rank += 1
+        commands[self.frontend.host] = self._build_external_frontend_command(
+            case,
+            run_dir,
+        )
+        return commands
+
+    def _build_vllm_worker_command(
+        self,
+        config: Any,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+        node: TopologyNode,
+        *,
+        kv_role: str,
+        kv_rank: int,
+        kv_parallel_size: int,
+        image: str,
+    ) -> RoleCommand:
+        argv = self._docker_run_base(
+            case,
+            run_dir,
+            node.name,
+            node.host,
+            "prefill" if kv_role == "kv_producer" else "decode",
+        )
+        argv.extend([
+            "--gpus",
+            _docker_gpus(node.gpus),
+            "--network",
+            self.network,
+            "-v",
+            f"{config.mounts.models}:/models:ro",
+        ])
+        self._append_env_and_volumes(argv, node)
+        argv.extend([
+            "--entrypoint",
+            "vllm",
+            image,
+            "serve",
+            case.model.model_path,
+            "--served-model-name",
+            case.api_model_name,
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(node.port),
+            "--kv-transfer-config",
+            self._render_kv_transfer_config(
+                case,
+                node,
+                kv_role=kv_role,
+                kv_rank=kv_rank,
+                kv_parallel_size=kv_parallel_size,
+            ),
+        ])
+        argv.extend(node.args)
+        return _role_command(
+            role_name=node.name,
+            host_name=node.host,
+            container_name=_container_name(case, self.name, node.name),
+            argv=argv,
+        )
+
+    def _build_external_frontend_command(
+        self,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+    ) -> RoleCommand:
+        if self.frontend.kind != "external":
+            raise _config_error(
+                f"topology profile {self.name} frontend.kind must be external "
+                "for vllm pd"
+            )
+        if not self.frontend.image:
+            raise _config_error(
+                f"topology profile {self.name} frontend.image is required "
+                "for external frontend"
+            )
+        if not self.frontend.command:
+            raise _config_error(
+                f"topology profile {self.name} frontend.command is required "
+                "for external frontend"
+            )
+        argv = self._docker_run_base(
+            case,
+            run_dir,
+            self.frontend.host,
+            self.frontend.host,
+            "frontend",
+        )
+        argv.extend([
+            "--network",
+            self.network,
+        ])
+        self._append_env_and_volumes(argv, None)
+        substitutions = {
+            "frontend_port": str(self.frontend.port),
+            "run_id": case.run_id,
+        }
+        argv.append(self.frontend.image)
+        argv.extend(
+            _render_template_string(value, substitutions)
+            for value in self.frontend.command
+        )
+        argv.extend(self.frontend.args)
+        return _role_command(
+            role_name=self.frontend.host,
+            host_name=self.frontend.host,
+            container_name=_container_name(case, self.name, self.frontend.host),
+            argv=argv,
+        )
+
+    def _render_kv_transfer_config(
+        self,
+        case: Any,
+        node: TopologyNode,
+        *,
+        kv_role: str,
+        kv_rank: int,
+        kv_parallel_size: int,
+    ) -> str:
+        if not self.kv_transfer_config_template:
+            raise _config_error(
+                f"topology profile {self.name} kv_transfer_config_template "
+                "is required for vllm pd"
+            )
+        host = self.hosts[node.host]
+        substitutions = {
+            "kv_role": kv_role,
+            "kv_rank": str(kv_rank),
+            "kv_parallel_size": str(kv_parallel_size),
+            "node_name": node.name,
+            "node_address": host.address,
+            "node_port": str(node.port),
+            "run_id": case.run_id,
+        }
+        rendered = _render_template_value(
+            self.kv_transfer_config_template,
+            substitutions,
+        )
+        return json.dumps(rendered, separators=(",", ":"), ensure_ascii=True)
+
+    def _worker_image(self, config: Any) -> str:
+        if self.image:
+            return self.image
+        image = getattr(config.run, "images", {}).get(self.engine)
+        if image:
+            return image
+        raise _config_error(
+            f"topology profile {self.name} image is required for {self.engine}"
+        )
+
+    def _required_image(self) -> str:
+        if not self.image:
+            raise _config_error(f"topology profile {self.name} image is required")
+        return self.image
+
+    def _docker_run_base(
+        self,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+        role_name: str,
+        host_name: str,
+        role: str,
+    ) -> list[str]:
+        container_name = _container_name(case, self.name, role_name)
+        return [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            container_name,
+            *self._label_args(case, run_dir, role, role_name),
+        ]
+
+    def _label_args(
+        self,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+        role: str,
+        role_name: str,
+    ) -> list[str]:
+        resolved_run_dir = Path(run_dir).resolve()
+        labels = {
+            "vllm_auto_bench.managed": "true",
+            "vllm_auto_bench.run_id": case.run_id,
+            "vllm_auto_bench.run_dir": str(resolved_run_dir),
+            "vllm_auto_bench.model": case.model.name,
+            "vllm_auto_bench.topology_profile": self.name,
+            "vllm_auto_bench.role": role,
+            "vllm_auto_bench.role_name": role_name,
+        }
+        args: list[str] = []
+        for key, value in labels.items():
+            args.extend(["--label", f"{key}={value}"])
+        return args
+
+    def _append_env_and_volumes(
+        self,
+        argv: list[str],
+        node: TopologyNode | None,
+    ) -> None:
+        env = dict(self.env)
+        if node is not None:
+            env.update(node.env)
+        for name, value in env.items():
+            argv.extend(["-e", f"{name}={value}"])
+        for volume in self.volumes:
+            argv.extend(["-v", volume])
+        if node is not None:
+            for volume in node.volumes:
+                argv.extend(["-v", volume])
 
 
 ErrorFactory = Callable[[str], Exception]
@@ -155,6 +573,11 @@ def parse_topology_profiles(
                 f"{path}.transfer_backend",
                 error,
             ),
+            kv_transfer_config_template=_json_template_mapping(
+                profile.get("kv_transfer_config_template"),
+                f"{path}.kv_transfer_config_template",
+                error,
+            ),
             disaggregation_ib_device=_optional_string(
                 profile.get("disaggregation_ib_device"),
                 f"{path}.disaggregation_ib_device",
@@ -222,6 +645,41 @@ def _string_mapping(value: Any, path: str, error: ErrorFactory) -> Mapping[str, 
     ):
         raise error(f"{path} must be an object mapping string to string")
     return types.MappingProxyType(dict(value))
+
+
+def _json_template_mapping(
+    value: Any,
+    path: str,
+    error: ErrorFactory,
+) -> Mapping[str, Any]:
+    if value is None:
+        return types.MappingProxyType({})
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) for key in value
+    ):
+        raise error(f"{path} must be an object")
+    _validate_json_template_value(value, path, error)
+    return types.MappingProxyType(dict(value))
+
+
+def _validate_json_template_value(
+    value: Any,
+    path: str,
+    error: ErrorFactory,
+) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise error(f"{path} keys must be strings")
+            _validate_json_template_value(item, f"{path}.{key}", error)
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_template_value(item, f"{path}[{index}]", error)
+        return
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return
+    raise error(f"{path} must contain JSON-compatible values")
 
 
 def _parse_auth(
@@ -350,3 +808,72 @@ def _parse_frontend(
         command=_string_tuple(frontend.get("command", []), f"{path}.command", error),
         args=_string_tuple(frontend.get("args", []), f"{path}.args", error),
     )
+
+
+def _container_name(case: Any, topology_name: str, role_name: str) -> str:
+    return (
+        f"bench-pd-{case.run_id}-{case.model.name}-{topology_name}-{role_name}"
+    )
+
+
+def _docker_gpus(value: str) -> str:
+    if value == "all":
+        return "all"
+    return f"device={value}"
+
+
+def _role_command(
+    *,
+    role_name: str,
+    host_name: str,
+    container_name: str,
+    argv: list[str],
+) -> RoleCommand:
+    from remote_docker import mask_command
+
+    return RoleCommand(
+        role_name=role_name,
+        host_name=host_name,
+        container_name=container_name,
+        argv=tuple(argv),
+        masked_argv=tuple(mask_command(argv)),
+    )
+
+
+def _render_template_value(value: Any, substitutions: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        return _render_template_string(value, substitutions)
+    if isinstance(value, dict):
+        return {
+            key: _render_template_value(item, substitutions)
+            for key, item in value.items()
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _render_template_value(item, substitutions)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _render_template_value(item, substitutions)
+            for item in value
+        ]
+    return value
+
+
+def _render_template_string(value: str, substitutions: Mapping[str, str]) -> str:
+    formatter = string.Formatter()
+    for _literal, field_name, _format_spec, _conversion in formatter.parse(value):
+        if field_name is None:
+            continue
+        if field_name not in substitutions:
+            raise _config_error(
+                f"unsupported template placeholder {{{field_name}}}"
+            )
+    return value.format(**substitutions)
+
+
+def _config_error(message: str) -> Exception:
+    from auto_bench import ConfigError
+
+    return ConfigError(message)
