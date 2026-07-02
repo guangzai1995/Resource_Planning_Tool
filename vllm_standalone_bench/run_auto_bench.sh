@@ -14,6 +14,8 @@
 #   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh logs
 #   RUN_ID=qwen_smoke_001 FOLLOW=true ./run_auto_bench.sh logs
 #   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh stop
+#   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh resume
+#   RUN_ID=qwen_smoke_001 DETACH=false ./run_auto_bench.sh resume
 #
 # 说明:
 #   该脚本只负责拼装并调用 auto_bench.py。vLLM 镜像、bench-runner 镜像、
@@ -63,7 +65,7 @@ FOLLOW="${FOLLOW:-false}"
 COMMAND="run"
 if [[ "$#" -gt 0 ]]; then
     case "$1" in
-        run|status|logs|stop)
+        run|status|logs|stop|resume)
             COMMAND="$1"
             shift
             ;;
@@ -122,6 +124,12 @@ case "${COMMAND}" in
     status|stop)
         CMD=("${PYTHON_BIN}" "${AUTO_BENCH}" "${COMMAND}" --results-dir "${RESULTS_DIR}" --run-id "${RUN_ID}")
         ;;
+    resume)
+        CMD=("${PYTHON_BIN}" "${AUTO_BENCH}" resume --results-dir "${RESULTS_DIR}" --run-id "${RUN_ID}")
+        if [[ "${DETACH}" == "true" ]]; then
+            CMD+=(--detach)
+        fi
+        ;;
     logs)
         CMD=("${PYTHON_BIN}" "${AUTO_BENCH}" logs --results-dir "${RESULTS_DIR}" --run-id "${RUN_ID}")
         if [[ "${FOLLOW}" == "true" ]]; then
@@ -154,6 +162,9 @@ if [[ "${COMMAND}" == "run" ]]; then
     printf "║  Dry-run   : %-48s║\n" "${DRY_RUN}"
 else
     printf "║  结果目录  : %-48s║\n" "${RESULTS_DIR}"
+    if [[ "${COMMAND}" == "resume" ]]; then
+        printf "║  后台运行  : %-48s║\n" "${DETACH}"
+    fi
 fi
 printf "║  Run ID    : %-48s║\n" "${RUN_ID:-自动生成}"
 echo "╚══════════════════════════════════════════════════════════════╝"

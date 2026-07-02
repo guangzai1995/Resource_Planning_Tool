@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -550,6 +551,497 @@ def test_manifest_status_matrix(tmp_path):
     assert failed.status() == "completed_with_failures"
 
 
+def two_bench_config(tmp_path):
+    data = minimal_config(tmp_path)
+    second_profile = dict(data["bench_profiles"][0])
+    second_profile["name"] = "smoke2"
+    data["bench_profiles"].append(second_profile)
+    return data
+
+
+def write_resolved_config_for_resume(tmp_path, data=None):
+    data = data or two_bench_config(tmp_path)
+    config = ab.load_config(write_config(tmp_path, data))
+    run_dir = tmp_path / "results" / "run123"
+    ab.write_json_atomic(run_dir / "config.resolved.json", ab.config_to_dict(config))
+    return config, run_dir
+
+
+def test_plan_resume_cases_keeps_passed_and_selects_pending(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    first_layout = ab.build_layout(config, "run123", cases[0])
+    old_manifest = {
+        "run_id": "run123",
+        "status": "interrupted",
+        "cases": [
+            {
+                "model": cases[0].model.name,
+                "serve_profile": cases[0].serve_profile.name,
+                "bench_profile": cases[0].bench_profile.name,
+                "status": "passed",
+                "csv": str((first_layout.bench_dir / "result.csv").relative_to(first_layout.run_dir)),
+                "xlsx": str((first_layout.bench_dir / "result.xlsx").relative_to(first_layout.run_dir)),
+                "extra": {"source": "old"},
+            },
+            {
+                "model": cases[1].model.name,
+                "serve_profile": cases[1].serve_profile.name,
+                "bench_profile": cases[1].bench_profile.name,
+                "status": "interrupted",
+                "csv": "old.csv",
+                "xlsx": "old.xlsx",
+            },
+        ],
+    }
+
+    initial_manifest, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=old_manifest,
+    )
+
+    assert unknown == []
+    assert [row["bench_profile"] for row in initial_manifest.cases] == ["smoke"]
+    assert initial_manifest.cases[0]["status"] == "passed"
+    assert initial_manifest.cases[0]["extra"] == {"source": "old"}
+    assert [case.bench_profile.name for case in pending] == ["smoke2"]
+    assert initial_manifest.total == 2
+
+
+def test_plan_resume_cases_reruns_failed_skipped_and_missing(tmp_path):
+    data = two_bench_config(tmp_path)
+    third_profile = dict(data["bench_profiles"][0])
+    third_profile["name"] = "smoke3"
+    data["bench_profiles"].append(third_profile)
+    config, run_dir = write_resolved_config_for_resume(tmp_path, data)
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "status": "completed_with_failures",
+        "cases": [
+            {
+                "model": cases[0].model.name,
+                "serve_profile": cases[0].serve_profile.name,
+                "bench_profile": cases[0].bench_profile.name,
+                "status": "failed",
+                "csv": "old.csv",
+                "xlsx": "old.xlsx",
+            },
+            {
+                "model": cases[1].model.name,
+                "serve_profile": cases[1].serve_profile.name,
+                "bench_profile": cases[1].bench_profile.name,
+                "status": "skipped",
+                "csv": "old.csv",
+                "xlsx": "old.xlsx",
+            }
+        ],
+    }
+
+    initial_manifest, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert unknown == []
+    assert initial_manifest.cases == []
+    assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2", "smoke3"]
+
+
+@pytest.mark.parametrize(("manifest_data", "match"), [
+    ({"run_id": "run123", "cases": "bad"}, "manifest cases must be a list"),
+    ({"run_id": "run123", "cases": ["bad"]}, "manifest cases must contain objects"),
+    (
+        {
+            "run_id": "run123",
+            "cases": [{
+                "model": "qwen2_5_1_5b",
+                "serve_profile": "bf16_default",
+                "bench_profile": None,
+                "status": "passed",
+            }],
+        },
+        "manifest case row is missing model/serve_profile/bench_profile",
+    ),
+    ({"run_id": "other", "cases": []}, "manifest run_id mismatch"),
+])
+def test_plan_resume_cases_rejects_invalid_manifest(tmp_path, manifest_data, match):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+
+    with pytest.raises(ab.ConfigError, match=match):
+        ab.plan_resume_cases(
+            run_id="run123",
+            cases=cases,
+            manifest_data=manifest_data,
+        )
+
+
+def test_plan_resume_cases_reports_manifest_rows_not_in_config(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    manifest_data = {
+        "run_id": "run123",
+        "status": "interrupted",
+        "cases": [
+            {
+                "model": "old_model",
+                "serve_profile": "old_serve",
+                "bench_profile": "old_bench",
+                "status": "passed",
+                "csv": "old.csv",
+                "xlsx": "old.xlsx",
+            }
+        ],
+    }
+
+    initial_manifest, pending, unknown = ab.plan_resume_cases(
+        run_id="run123",
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+
+    assert initial_manifest.cases == []
+    assert [case.bench_profile.name for case in pending] == ["smoke", "smoke2"]
+    assert unknown == [("old_model", "old_serve", "old_bench")]
+
+
+def write_resume_state(run_dir, status="interrupted"):
+    state = {
+        "run_id": run_dir.name,
+        "status": status,
+        "current": None,
+        "counts": {"passed": 1, "failed": 0, "skipped": 0, "running": 0, "total": 2},
+    }
+    if status is None:
+        del state["status"]
+    ab.write_state(run_dir, state)
+
+
+def write_resume_manifest(run_dir, cases, config, statuses):
+    rows = []
+    for case, status in zip(cases, statuses):
+        layout = ab.build_layout(config, run_dir.name, case)
+        rows.append({
+            "model": case.model.name,
+            "serve_profile": case.serve_profile.name,
+            "bench_profile": case.bench_profile.name,
+            "status": status,
+            "csv": str((layout.bench_dir / "result.csv").relative_to(layout.run_dir)),
+            "xlsx": str((layout.bench_dir / "result.xlsx").relative_to(layout.run_dir)),
+        })
+    ab.write_json_atomic(run_dir / "manifest.json", {
+        "run_id": run_dir.name,
+        "status": "interrupted",
+        "cases": rows,
+    })
+
+
+def test_load_resume_context_uses_cli_results_dir_over_resolved_config(tmp_path):
+    original_data = two_bench_config(tmp_path)
+    config, original_run_dir = write_resolved_config_for_resume(tmp_path, original_data)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(original_run_dir)
+    write_resume_manifest(original_run_dir, cases[:1], config, ["passed"])
+
+    other_results = tmp_path / "other-results"
+    moved_run_dir = other_results / "run123"
+    moved_run_dir.parent.mkdir()
+    original_run_dir.rename(moved_run_dir)
+
+    context = ab.load_resume_context(other_results, "run123")
+
+    assert context.config.run.results_dir == other_results
+    assert [case.bench_profile.name for case in context.pending_cases] == ["smoke2"]
+    assert [row["bench_profile"] for row in context.initial_manifest.cases] == ["smoke"]
+
+
+def test_load_resume_context_rejects_active_state(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status="running")
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+
+    with pytest.raises(ab.ConfigError, match="active|running"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+def test_load_resume_context_completed_with_no_pending_is_empty(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status="completed")
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+
+    context = ab.load_resume_context(tmp_path / "results", "run123")
+
+    assert context.pending_cases == ()
+    assert [row["status"] for row in context.initial_manifest.cases] == ["passed", "passed"]
+
+
+@pytest.mark.parametrize("status", [None, "complete", 123])
+def test_load_resume_context_rejects_unknown_state_even_without_pending(tmp_path, status):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status=status)
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+
+    with pytest.raises(ab.ConfigError, match="run status cannot be resumed"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+def test_load_resume_context_rejects_completed_with_pending(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status="completed")
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+
+    with pytest.raises(ab.ConfigError, match="run status cannot be resumed: completed"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+def test_load_resume_context_rejects_state_run_id_mismatch(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    state["run_id"] = "other"
+    ab.write_json_atomic(run_dir / "state.json", state)
+
+    with pytest.raises(ab.ConfigError, match="state run_id mismatch"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+@pytest.mark.parametrize(("filename", "label"), [
+    ("state.json", "state"),
+    ("manifest.json", "manifest"),
+])
+def test_load_resume_context_rejects_non_object_state_or_manifest(tmp_path, filename, label):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+    (run_dir / filename).write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ab.ConfigError, match=f"{label} must be a JSON object"):
+        ab.load_resume_context(tmp_path / "results", "run123")
+
+
+def test_load_resume_context_returns_unknown_manifest_cases(tmp_path):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cases"].append({
+        "model": "old_model",
+        "serve_profile": "old_serve",
+        "bench_profile": "old_bench",
+        "status": "passed",
+        "csv": "old.csv",
+        "xlsx": "old.xlsx",
+    })
+    ab.write_json_atomic(run_dir / "manifest.json", manifest)
+
+    context = ab.load_resume_context(tmp_path / "results", "run123")
+
+    assert context.unknown_manifest_cases == (("old_model", "old_serve", "old_bench"),)
+
+
+def test_controller_command_matches_resume_child(tmp_path):
+    cmd = [
+        sys.executable,
+        str(Path(ab.__file__).resolve()),
+        "resume",
+        "--run-id",
+        "run123",
+        "--child",
+        "--results-dir",
+        str(tmp_path / "results"),
+    ]
+
+    assert ab.controller_command_matches(cmd, "run123", tmp_path / "results") is True
+
+
+def test_main_resume_foreground_runs_pending_cases(tmp_path, monkeypatch):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    calls = []
+
+    def fake_run_controller(config_arg, run_id, runner=None, dry_run=False, lock_token=None,
+                            initial_manifest=None, cases_to_run=None):
+        calls.append((run_id, tuple(case.bench_profile.name for case in cases_to_run), len(initial_manifest.cases)))
+        return 0
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: calls.append("signals"), raising=False)
+    monkeypatch.setattr(ab, "run_controller", fake_run_controller)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(tmp_path / "results"),
+        "--run-id", "run123",
+    ])
+
+    assert exit_code == 0
+    assert calls == ["signals", ("run123", ("smoke2",), 1)]
+
+
+def test_main_resume_detach_starts_resume_child(tmp_path, monkeypatch):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    popen_calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(tmp_path / "results"),
+        "--run-id", "run123",
+        "--detach",
+    ])
+
+    controller = json.loads((run_dir / "controller.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert popen_calls[0][2] == "resume"
+    assert "--child" in popen_calls[0]
+    assert controller["command"][2] == "resume"
+
+
+def test_main_resume_detach_child_uses_saved_resume_state_after_parent_starting(
+    tmp_path,
+    monkeypatch,
+):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    child_exits = []
+    controller_calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_run_controller(config_arg, run_id, runner=None, dry_run=False, lock_token=None,
+                            initial_manifest=None, cases_to_run=None):
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        controller_calls.append((
+            run_id,
+            tuple(case.bench_profile.name for case in cases_to_run),
+            tuple(row["bench_profile"] for row in initial_manifest.cases),
+            state["status"],
+        ))
+        return 0
+
+    def fake_popen(command, **kwargs):
+        child_exits.append(ab.main(command[2:]))
+        return FakeProcess()
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: None, raising=False)
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(ab, "run_controller", fake_run_controller)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(tmp_path / "results"),
+        "--run-id", "run123",
+        "--detach",
+    ])
+
+    assert exit_code == 0
+    assert child_exits == [0]
+    assert controller_calls == [("run123", ("smoke2",), ("smoke",), "starting")]
+
+
+@pytest.mark.parametrize("lock_token", [None, "wrong"])
+def test_resume_child_startup_context_requires_matching_lock_token(tmp_path, lock_token):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    original_state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    ab.write_state(run_dir, {
+        "run_id": "run123",
+        "status": "starting",
+        "current": None,
+        "counts": {"passed": 0, "failed": 0, "skipped": 0, "running": 0, "total": 2},
+    })
+    ab.write_json_atomic(run_dir / ".resume-startup-state.json", original_state)
+    (run_dir / ".run.lock").write_text(
+        json.dumps({"pid": os.getpid(), "token": "tok", "created_at": 1.0}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ab.ConfigError, match="active.*starting"):
+        ab.load_resume_child_startup_context(tmp_path / "results", "run123", lock_token)
+
+
+def test_main_resume_empty_pending_does_not_start_controller(tmp_path, monkeypatch, capsys):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status="completed")
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+
+    def fail_run_controller(*args, **kwargs):
+        raise AssertionError("empty resume should not start controller")
+
+    monkeypatch.setattr(ab, "run_controller", fail_run_controller)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(tmp_path / "results"),
+        "--run-id", "run123",
+    ])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "no pending" in captured.out.lower() or "nothing to resume" in captured.out.lower()
+
+
+def test_main_resume_child_load_context_failure_releases_lock(tmp_path, monkeypatch, capsys):
+    results_dir = tmp_path / "results"
+    run_dir = results_dir / "run123"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".run.lock").write_text(
+        json.dumps({"pid": os.getpid(), "token": "tok", "created_at": 1.0}),
+        encoding="utf-8",
+    )
+
+    def fail_context(*args, **kwargs):
+        raise ab.ConfigError("bad resume context")
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: None, raising=False)
+    monkeypatch.setattr(ab, "load_resume_context", fail_context)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(results_dir),
+        "--run-id", "run123",
+        "--child",
+        "--lock-token", "tok",
+    ])
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "failed"
+    assert "bad resume context" in state["error"]
+    assert "bad resume context" in captured.err
+    assert not (run_dir / ".run.lock").exists()
+
+
 class FakeRunner:
     def __init__(self, failures=None):
         self.commands = []
@@ -805,6 +1297,82 @@ def test_controller_stop_requested_writes_interrupted_and_cleans(tmp_path, monke
     assert any("docker stop bench-vllm-qwen2_5_1_5b-bf16_default-run123" in cmd for cmd in joined)
     assert_removed_after_stop(runner.commands, "bench-vllm-qwen2_5_1_5b-bf16_default-run123")
     assert any("docker network rm vllm-bench-net" in cmd for cmd in joined)
+
+
+def test_run_controller_with_initial_manifest_skips_passed_case(tmp_path, monkeypatch):
+    data = two_bench_config(tmp_path)
+    config = ab.load_config(write_config(tmp_path, data))
+    all_cases = ab.expand_cases(config, run_id="run123")
+    first_layout = ab.build_layout(config, "run123", all_cases[0])
+    initial = ab.Manifest(run_id="run123", total=2)
+    initial.record(all_cases[0], first_layout, "passed")
+    runner = FakeRunner()
+    monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True, raising=False)
+
+    result = ab.run_controller(
+        config,
+        run_id="run123",
+        runner=runner,
+        initial_manifest=initial,
+        cases_to_run=(all_cases[1],),
+    )
+
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    bench_commands = bench_run_commands(runner.commands)
+    assert result == 0
+    assert [row["bench_profile"] for row in manifest["cases"]] == ["smoke", "smoke2"]
+    assert [row["status"] for row in manifest["cases"]] == ["passed", "passed"]
+    assert len(bench_commands) == 1
+    assert "smoke2" in " ".join(bench_commands[0])
+    assert "smoke-run123" not in " ".join(bench_commands[0])
+
+
+def test_run_controller_pending_empty_writes_finished_state_without_docker(tmp_path):
+    config = ab.load_config(write_config(tmp_path, two_bench_config(tmp_path)))
+    all_cases = ab.expand_cases(config, run_id="run123")
+    initial = ab.Manifest(run_id="run123", total=2)
+    for case in all_cases:
+        initial.record(case, ab.build_layout(config, "run123", case), "passed")
+    runner = FakeRunner()
+
+    result = ab.run_controller(
+        config,
+        run_id="run123",
+        runner=runner,
+        initial_manifest=initial,
+        cases_to_run=(),
+    )
+
+    state = json.loads((tmp_path / "results" / "run123" / "state.json").read_text(encoding="utf-8"))
+    assert result == 0
+    assert state["status"] == "completed"
+    assert state["counts"]["passed"] == 2
+    assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
+
+
+def test_run_controller_resume_stop_preserves_old_passed_row(tmp_path, monkeypatch):
+    config = ab.load_config(write_config(tmp_path, two_bench_config(tmp_path)))
+    all_cases = ab.expand_cases(config, run_id="run123")
+    initial = ab.Manifest(run_id="run123", total=2)
+    initial.record(all_cases[0], ab.build_layout(config, "run123", all_cases[0]), "passed")
+
+    def stop_ready(*args, **kwargs):
+        raise ab.StopRequested("resume stopped")
+
+    monkeypatch.setattr(ab, "wait_for_container_ready", stop_ready, raising=False)
+    result = ab.run_controller(
+        config,
+        run_id="run123",
+        runner=FakeRunner(),
+        initial_manifest=initial,
+        cases_to_run=(all_cases[1],),
+    )
+
+    manifest = json.loads((tmp_path / "results" / "run123" / "manifest.json").read_text(encoding="utf-8"))
+    assert result == 130
+    assert manifest["status"] == "interrupted"
+    assert [row["bench_profile"] for row in manifest["cases"]] == ["smoke", "smoke2"]
+    assert [row["status"] for row in manifest["cases"]] == ["passed", "interrupted"]
 
 
 def test_install_signal_handlers_raises_stop_requested(monkeypatch):

@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -1574,11 +1574,17 @@ def is_process_running(pid: int) -> bool:
 
 
 RUN_LOCK_FILE = ".run.lock"
+RESUME_STARTUP_STATE_FILE = ".resume-startup-state.json"
 TERMINAL_RUN_STATUSES = frozenset({
     "completed",
     "completed_with_failures",
     "failed",
     "interrupted",
+})
+RESUMABLE_RUN_STATUSES = frozenset({
+    "interrupted",
+    "failed",
+    "completed_with_failures",
 })
 
 
@@ -1586,6 +1592,16 @@ TERMINAL_RUN_STATUSES = frozenset({
 class RunLock:
     run_dir: Path
     token: str
+
+
+@dataclass(frozen=True)
+class ResumeContext:
+    config: AutoBenchConfig
+    run_id: str
+    run_dir: Path
+    initial_manifest: Manifest
+    pending_cases: tuple[BenchmarkCase, ...]
+    unknown_manifest_cases: tuple[tuple[str, str, str], ...]
 
 
 def run_lock_path(run_dir: Path) -> Path:
@@ -1614,6 +1630,16 @@ def _read_run_state(run_dir: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return state if isinstance(state, dict) else None
+
+
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"{label} invalid: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ConfigError(f"{label} must be a JSON object: {path}")
+    return payload
 
 
 def run_lock_token_matches(run_dir: Path, token: str | None) -> bool:
@@ -1831,6 +1857,69 @@ def reject_active_run(run_dir: Path, *, allow_pid: int | None = None,
     return True
 
 
+def _config_with_results_dir(config: AutoBenchConfig, results_dir: Path) -> AutoBenchConfig:
+    return replace(config, run=replace(config.run, results_dir=results_dir))
+
+
+def _resume_context_from_state(results_dir: Path, run_id: str,
+                               state: dict[str, Any]) -> ResumeContext:
+    resolved_results_dir = Path(results_dir)
+    run_dir = resolved_results_dir / run_id
+    status = state.get("status")
+    if state.get("run_id") not in (None, run_id):
+        raise ConfigError(f"state run_id mismatch: expected {run_id}, got {state.get('run_id')}")
+    if status in ("starting", "running"):
+        raise ConfigError(f"run is active and cannot be resumed: {status}")
+
+    config = load_config(run_dir / "config.resolved.json")
+    config = _config_with_results_dir(config, resolved_results_dir)
+    cases = expand_cases(config, run_id=run_id)
+    manifest_data = _read_json_object(run_dir / "manifest.json", "manifest")
+    initial_manifest, pending, unknown = plan_resume_cases(
+        run_id=run_id,
+        cases=cases,
+        manifest_data=manifest_data,
+    )
+    if status == "completed" and not pending:
+        pass
+    elif status in RESUMABLE_RUN_STATUSES:
+        pass
+    else:
+        raise ConfigError(f"run status cannot be resumed: {status}")
+    return ResumeContext(
+        config=config,
+        run_id=run_id,
+        run_dir=run_dir,
+        initial_manifest=initial_manifest,
+        pending_cases=pending,
+        unknown_manifest_cases=tuple(unknown),
+    )
+
+
+def load_resume_context(results_dir: Path, run_id: str) -> ResumeContext:
+    _safe_name(run_id, "run_id")
+    run_dir = Path(results_dir) / run_id
+    state = _read_json_object(run_dir / "state.json", "state")
+    return _resume_context_from_state(results_dir, run_id, state)
+
+
+def load_resume_child_startup_context(results_dir: Path, run_id: str,
+                                      lock_token: str | None) -> ResumeContext:
+    _safe_name(run_id, "run_id")
+    run_dir = Path(results_dir) / run_id
+    try:
+        state = _read_json_object(run_dir / "state.json", "state")
+    except ConfigError:
+        return load_resume_context(results_dir, run_id)
+    if state.get("status") == "starting" and run_lock_token_matches(run_dir, lock_token):
+        startup_state = _read_json_object(
+            run_dir / RESUME_STARTUP_STATE_FILE,
+            "resume startup state",
+        )
+        return _resume_context_from_state(results_dir, run_id, startup_state)
+    return load_resume_context(results_dir, run_id)
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -1926,6 +2015,61 @@ def _manifest_case_keys(manifest: Manifest) -> set[tuple[str, str, str]]:
     }
 
 
+def _manifest_row_key(row: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    model = row.get("model")
+    serve_profile = row.get("serve_profile")
+    bench_profile = row.get("bench_profile")
+    if not all(isinstance(value, str) for value in (model, serve_profile, bench_profile)):
+        return None
+    return (model, serve_profile, bench_profile)
+
+
+def _copy_manifest_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    copied: dict[str, Any] = {}
+    for key, value in row.items():
+        if not isinstance(key, str):
+            raise ConfigError("manifest case row keys must be strings")
+        copied[key] = value
+    return copied
+
+
+def plan_resume_cases(
+    *,
+    run_id: str,
+    cases: tuple[BenchmarkCase, ...],
+    manifest_data: Mapping[str, Any],
+) -> tuple[Manifest, tuple[BenchmarkCase, ...], list[tuple[str, str, str]]]:
+    rows = manifest_data.get("cases")
+    if not isinstance(rows, list):
+        raise ConfigError("manifest cases must be a list")
+    if manifest_data.get("run_id") not in (None, run_id):
+        raise ConfigError(
+            f"manifest run_id mismatch: expected {run_id}, got {manifest_data.get('run_id')}"
+        )
+
+    full_keys = {_case_key(case) for case in cases}
+    passed_rows: list[dict[str, Any]] = []
+    passed_keys: set[tuple[str, str, str]] = set()
+    unknown_keys: list[tuple[str, str, str]] = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ConfigError("manifest cases must contain objects")
+        key = _manifest_row_key(row)
+        if key is None:
+            raise ConfigError("manifest case row is missing model/serve_profile/bench_profile")
+        if key not in full_keys:
+            unknown_keys.append(key)
+            continue
+        if row.get("status") == "passed":
+            passed_keys.add(key)
+            passed_rows.append(_copy_manifest_row(row))
+
+    initial_manifest = Manifest(run_id=run_id, total=len(cases), cases=passed_rows)
+    pending = tuple(case for case in cases if _case_key(case) not in passed_keys)
+    return initial_manifest, pending, unknown_keys
+
+
 def _record_group_status(manifest: Manifest, run_dir: Path, run_id: str,
                          group_cases: list[BenchmarkCase], config: AutoBenchConfig,
                          status: str, error: str) -> int:
@@ -2010,12 +2154,15 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
 def run_controller(config: AutoBenchConfig, run_id: str,
                    runner: Runner | None = None,
                    dry_run: bool = False,
-                   lock_token: str | None = None) -> int:
+                   lock_token: str | None = None,
+                   initial_manifest: Manifest | None = None,
+                   cases_to_run: tuple[BenchmarkCase, ...] | None = None) -> int:
     active_runner: Runner = runner or DockerRunner()
     if dry_run:
         return _run_controller_dry_run(config, run_id)
 
-    cases = expand_cases(config, run_id=run_id)
+    all_cases = expand_cases(config, run_id=run_id)
+    cases = all_cases if cases_to_run is None else cases_to_run
     run_dir = config.run.results_dir / run_id
     if reject_active_run(run_dir, allow_pid=os.getpid(), lock_token=lock_token):
         return 1
@@ -2028,15 +2175,20 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     if reject_active_run(run_dir, allow_pid=os.getpid(), lock_token=run_lock.token):
         release_run_lock(run_lock)
         return 1
-    manifest = Manifest(run_id=run_id, total=len(cases))
+    manifest = initial_manifest or Manifest(run_id=run_id, total=len(all_cases))
 
     network_owned = False
     exit_code = 0
-    completed = 0
+    completed = len(manifest.cases)
     interrupted = False
     try:
         write_json_atomic(run_dir / "config.resolved.json", config_to_dict(config))
         validate_local_paths(config)
+
+        if not cases:
+            write_manifest(run_dir, manifest)
+            write_state(run_dir, finished_state(run_id, manifest))
+            return 0
 
         if docker_network_exists(active_runner, config.run.network):
             validate_bridge_network_driver(active_runner, config.run.network)
@@ -2107,7 +2259,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                         run_dir,
                         current_state(
                             run_id,
-                            cases,
+                            all_cases,
                             completed,
                             case,
                             "running",
@@ -2274,21 +2426,24 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     return exit_code
 
 
-def build_detach_command(config_path: Path, run_id: str,
+def build_detach_command(config_path: Path | None, run_id: str,
                          results_dir: Path,
-                         lock_token: str | None = None) -> list[str]:
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "run",
-        "--config",
-        str(config_path),
+                         lock_token: str | None = None,
+                         command_name: str = "run") -> list[str]:
+    cmd = [sys.executable, str(Path(__file__).resolve()), command_name]
+    if command_name == "run":
+        if config_path is None:
+            raise ValueError("run detached command requires config_path")
+        cmd.extend(["--config", str(config_path)])
+    elif command_name != "resume":
+        raise ValueError(f"unsupported detached command: {command_name}")
+    cmd.extend([
         "--run-id",
         run_id,
         "--child",
         "--results-dir",
         str(results_dir),
-    ]
+    ])
     if lock_token is not None:
         cmd.extend(["--lock-token", lock_token])
     return cmd
@@ -2350,7 +2505,8 @@ def terminate_detached_child(process: Any, timeout_sec: float = 5.0) -> bool:
     return _wait_for_process_exit(process, timeout_sec)
 
 
-def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> int:
+def start_detached(config_path: Path | None, config: AutoBenchConfig, run_id: str,
+                   command_name: str = "run") -> int:
     _safe_name(run_id, "run_id")
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
@@ -2382,6 +2538,13 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
     except (ConfigError, OSError) as exc:
         return fail_start(str(exc))
 
+    if command_name == "resume":
+        try:
+            startup_state = _read_json_object(run_dir / "state.json", "state")
+            write_json_atomic(run_dir / RESUME_STARTUP_STATE_FILE, startup_state)
+        except (ConfigError, OSError) as exc:
+            return fail_start(str(exc))
+
     try:
         write_state(run_dir, _detached_state(run_id, "starting", total))
     except OSError as exc:
@@ -2393,6 +2556,7 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
         run_id,
         config.run.results_dir,
         lock_token=run_lock.token,
+        command_name=command_name,
     )
     process: subprocess.Popen[Any] | None = None
     try:
@@ -2409,7 +2573,7 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
             "pid": process.pid,
             "run_id": run_id,
             "command": command,
-            "config_path": str(config_path),
+            "config_path": str(config_path) if config_path is not None else None,
             "started_at": time.time(),
         })
         update_run_lock_owner(run_lock, process.pid)
@@ -2607,7 +2771,7 @@ def controller_command_matches(command: list[str], run_id: str,
         return False
     if not _is_current_script_arg(command[1]):
         return False
-    if command[2] != "run":
+    if command[2] not in {"run", "resume"}:
         return False
     if "--child" not in command:
         return False
@@ -2665,6 +2829,30 @@ def is_controller_process(pid: int, run_id: str,
             and controller_command_matches(cmdline, run_id, results_dir)
         )
     return controller_command_matches(cmdline, run_id, results_dir)
+
+
+def resume_run(results_dir: Path, run_id: str, *,
+               runner: Runner | None = None,
+               lock_token: str | None = None) -> int:
+    context = load_resume_child_startup_context(results_dir, run_id, lock_token)
+    if context.unknown_manifest_cases:
+        print(
+            f"warning: ignoring manifest cases not in resolved config: {context.unknown_manifest_cases}",
+            file=sys.stderr,
+        )
+    if not context.pending_cases:
+        print(f"nothing to resume: {run_id}")
+        write_manifest(context.run_dir, context.initial_manifest)
+        write_state(context.run_dir, finished_state(run_id, context.initial_manifest))
+        return 0
+    return run_controller(
+        context.config,
+        run_id=run_id,
+        runner=runner,
+        lock_token=lock_token,
+        initial_manifest=context.initial_manifest,
+        cases_to_run=context.pending_cases,
+    )
 
 
 def _run_state_is_active(run_dir: Path) -> bool:
@@ -2882,6 +3070,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stop_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     stop_parser.add_argument("--run-id", required=True)
 
+    resume_parser = subparsers.add_parser("resume", help="resume interrupted benchmark cases")
+    resume_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    resume_parser.add_argument("--run-id", required=True)
+    resume_parser.add_argument("--detach", action="store_true")
+    resume_parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    resume_parser.add_argument("--lock-token", help=argparse.SUPPRESS)
+
     prepare_parser = subparsers.add_parser("prepare-model", help="prepare model assets")
     prepare_parser.add_argument("--modelscope-id", required=True)
     prepare_parser.add_argument("--target", required=True)
@@ -2969,6 +3164,65 @@ def main(argv: list[str] | None = None) -> int:
             controller=args.controller,
         )
         return follow_file(log_path) if args.follow else print_log(log_path)
+    if args.command == "resume":
+        if args.child:
+            try:
+                install_signal_handlers()
+                return resume_run(
+                    args.results_dir,
+                    args.run_id,
+                    lock_token=args.lock_token,
+                )
+            except StopRequested as exc:
+                error = str(exc) or "stop requested"
+                try:
+                    write_child_startup_state_best_effort(
+                        args.results_dir,
+                        args.run_id,
+                        "interrupted",
+                        error,
+                    )
+                finally:
+                    release_child_startup_lock(args.results_dir, args.run_id, args.lock_token)
+                print(error, file=sys.stderr)
+                return 130
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    write_child_startup_state_best_effort(
+                        args.results_dir,
+                        args.run_id,
+                        "failed",
+                        error,
+                    )
+                finally:
+                    release_child_startup_lock(args.results_dir, args.run_id, args.lock_token)
+                print(error, file=sys.stderr)
+                return 1
+        try:
+            context = load_resume_context(args.results_dir, args.run_id)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if not context.pending_cases:
+            print(f"nothing to resume: {args.run_id}")
+            write_manifest(context.run_dir, context.initial_manifest)
+            write_state(context.run_dir, finished_state(args.run_id, context.initial_manifest))
+            return 0
+        if args.detach:
+            return start_detached(
+                None,
+                context.config,
+                args.run_id,
+                command_name="resume",
+            )
+        install_signal_handlers()
+        return run_controller(
+            context.config,
+            run_id=args.run_id,
+            initial_manifest=context.initial_manifest,
+            cases_to_run=context.pending_cases,
+        )
     if args.command == "stop":
         return stop_run(args.results_dir / args.run_id)
     if args.command == "prepare-model":

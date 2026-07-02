@@ -116,9 +116,14 @@ python3 vllm_standalone_bench/auto_bench.py logs \
 python3 vllm_standalone_bench/auto_bench.py stop \
   --results-dir vllm_standalone_bench/results \
   --run-id <run_id>
+
+python3 vllm_standalone_bench/auto_bench.py resume \
+  --results-dir vllm_standalone_bench/results \
+  --run-id <run_id> \
+  --detach
 ```
 
-默认使用 Docker bridge network `vllm-bench-net`，不使用 `--network host`，也不暴露主机端口。控制器只会清理本次自动创建并带有本次运行标签或元数据的资源，包括 vLLM 容器和 Docker network；`stop` 会请求后台控制器优雅退出并执行这些清理。
+默认使用 Docker bridge network `vllm-bench-net`，不使用 `--network host`，也不暴露主机端口。控制器只会清理本次自动创建并带有本次运行标签或元数据的资源，包括 vLLM 容器和 Docker network；`stop` 会请求后台控制器优雅退出并执行这些清理。`stop` 不是容器暂停：中止后当前容器会被删除。需要继续同一 `run_id` 时，使用 `resume`，它会跳过 `manifest.json` 中已 `passed` 的 case，只补跑未成功或未记录的 case。
 
 ### 当前主机 smoke 验证
 
