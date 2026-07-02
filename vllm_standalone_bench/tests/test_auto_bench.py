@@ -135,27 +135,29 @@ def test_expand_cases_uses_topology_profiles(tmp_path):
     assert case.serving_name == "sglang_pd_2p2d"
 
 
-def test_topology_non_dry_run_still_rejected_before_lifecycle(tmp_path):
-    from test_remote_topology import pd_topology_config
-
-    config = ab.load_config(write_config(tmp_path, pd_topology_config(tmp_path)))
-
-    with pytest.raises(ab.ConfigError, match="topology_profiles.*not runnable"):
-        ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
-
-
-def test_start_detached_rejects_topology_profiles_before_lock(tmp_path):
+def test_start_detached_accepts_topology_profiles_before_lock(tmp_path, monkeypatch):
     from test_remote_topology import pd_topology_config
 
     config_path = write_config(tmp_path, pd_topology_config(tmp_path))
     config = ab.load_config(config_path)
     run_dir = tmp_path / "results" / "run123"
+    calls = []
 
-    with pytest.raises(ab.ConfigError, match="topology_profiles.*not runnable"):
-        ab.start_detached(config_path, config, "run123")
+    class FakeProcess:
+        pid = 12345
 
-    assert not (run_dir / "state.json").exists()
-    assert not (run_dir / ".run.lock").exists()
+    def fake_popen(command, **kwargs):
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+
+    exit_code = ab.start_detached(config_path, config, "run123")
+
+    assert exit_code == 0
+    assert calls
+    assert (run_dir / "state.json").exists()
+    assert (run_dir / ".run.lock").exists()
 
 
 def test_legacy_command_helpers_reject_topology_case(tmp_path):
@@ -1337,6 +1339,57 @@ class FakeRunner:
         return ab.Completed(list(args), 0, "ok\n", "")
 
 
+class FakeRemoteDockerRunner:
+    def __init__(self, failures=None):
+        self.commands = []
+        self.failures = failures or {}
+        self.labels = {}
+
+    def run(self, host, command, *, check=False, capture=True, text=True,
+            stdout=None, stderr=None):
+        self.commands.append((host.name, list(command)))
+        key = (host.name, " ".join(command[:3]))
+        if key in self.failures:
+            return ab.Completed(list(command), self.failures[key], "", "forced failure")
+        if command[:3] == ["docker", "run", "-d"]:
+            self.labels[value_after(command, "--name")] = {
+                label.split("=", 1)[0]: label.split("=", 1)[1]
+                for label in values_after(command, "--label")
+                if "=" in label
+            }
+            return ab.Completed(list(command), 0, "container-id\n", "")
+        if command[:4] == ["docker", "inspect", "--format", "{{json .Config.Labels}}"]:
+            labels = self.labels.get(command[4])
+            if labels is None:
+                return ab.Completed(list(command), 1, "", "not found")
+            return ab.Completed(list(command), 0, json.dumps(labels) + "\n", "")
+        if command[:2] == ["docker", "logs"]:
+            return ab.Completed(list(command), 0, f"{host.name} log\n", "")
+        if command[:2] == ["docker", "inspect"]:
+            return ab.Completed(list(command), 0, "[]\n", "")
+        if command[:2] == ["docker", "stop"]:
+            return ab.Completed(list(command), 0, "", "")
+        if command[:3] == ["docker", "rm", "-f"]:
+            return ab.Completed(list(command), 0, "", "")
+        return ab.Completed(list(command), 0, "ok\n", "")
+
+    def inspect_labels(self, host, container_name):
+        result = self.run(
+            host,
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{json .Config.Labels}}",
+                container_name,
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout.strip() or "{}")
+
+
 class FakeResourceMonitor:
     instances = []
 
@@ -1414,6 +1467,84 @@ def network_create_command(commands):
         if command[:3] == ["docker", "network", "create"]:
             return command
     raise AssertionError("docker network create command not found")
+
+
+def test_topology_run_starts_roles_then_bench_and_cleans_up(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["image"] = "sglang:pd"
+    data["topology_profiles"][0]["hosts"]["p1"]["auth"] = {
+        "type": "password",
+        "password": "inline-secret",
+    }
+    config = ab.load_config(write_config(tmp_path, data))
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 0
+    names = [
+        cmd[1][cmd[1].index("--name") + 1]
+        for cmd in remote.commands
+        if cmd[1][:3] == ["docker", "run", "-d"]
+    ]
+    assert names[:5] == [
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-p1",
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-p2",
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-d1",
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-d2",
+        "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-router",
+    ]
+    assert len(bench_run_commands(local.commands)) == 1
+    assert any(
+        cmd[1][:2] == ["docker", "stop"] and "router" in cmd[1][2]
+        for cmd in remote.commands
+    )
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    assert (layout.bench_dir / "commands" / "p1.txt").read_text(
+        encoding="utf-8"
+    ).startswith("docker run -d")
+    assert (layout.bench_dir / "logs" / "router.log").read_text(
+        encoding="utf-8"
+    ) == "router log\n"
+    assert (layout.bench_dir / "inspect" / "router.json").read_text(
+        encoding="utf-8"
+    ) == "[]\n"
+    topology_text = (layout.bench_dir / "topology.resolved.json").read_text(
+        encoding="utf-8"
+    )
+    assert "inline-secret" not in topology_text
+    resolved = json.loads(topology_text)
+    assert resolved["topology_profiles"][0]["hosts"]["p1"]["auth"]["password"] == "***"
+
+
+def test_topology_prefill_start_failure_cleans_started_roles(tmp_path, monkeypatch):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["image"] = "sglang:pd"
+    config = ab.load_config(write_config(tmp_path, data))
+    remote = FakeRemoteDockerRunner(failures={("p2", "docker run -d"): 1})
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+
+    result = ab.run_controller(config, run_id="run123", runner=FakeRunner())
+
+    assert result == 1
+    assert any(
+        cmd[0] == "p1" and cmd[1][:2] == ["docker", "stop"]
+        for cmd in remote.commands
+    )
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["cases"][0]["status"] == "failed"
 
 
 def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
