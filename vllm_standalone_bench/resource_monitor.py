@@ -3,10 +3,11 @@ import math
 from io import StringIO
 
 
-NVIDIA_SMI_QUERY = (
-    "index,name,uuid,utilization.gpu,memory.used,memory.total,"
-    "power.draw,temperature.gpu"
-)
+NVIDIA_SMI_QUERY = [
+    "nvidia-smi",
+    "--query-gpu=index,name,uuid,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+    "--format=csv,noheader,nounits",
+]
 
 _MB = 1024.0 * 1024.0
 
@@ -32,10 +33,10 @@ def parse_proc_stat(text):
 def cpu_utilization_pct(previous, current):
     total_delta = current["total"] - previous["total"]
     idle_delta = current["idle"] - previous["idle"]
-    if total_delta <= 0:
-        return 0.0
+    if total_delta <= 0 or idle_delta < 0 or idle_delta > total_delta:
+        return None
 
-    busy_delta = max(0, total_delta - idle_delta)
+    busy_delta = total_delta - idle_delta
     return busy_delta / total_delta * 100.0
 
 
@@ -97,7 +98,7 @@ def parse_net_dev(text):
 
 def network_rates_mb_s(previous, current, *, elapsed_s):
     if elapsed_s <= 0:
-        return {"net_rx_mb_s": 0.0, "net_tx_mb_s": 0.0}
+        return {"net_rx_mb_s": None, "net_tx_mb_s": None}
 
     rx_delta = max(0, current["rx_bytes"] - previous["rx_bytes"])
     tx_delta = max(0, current["tx_bytes"] - previous["tx_bytes"])
@@ -147,32 +148,60 @@ def summarize_samples(
     backend="nvidia-smi",
 ):
     sample_count = len(samples)
-    aggregate = {
-        "cpu_util_avg_pct": _average(_sample_values(samples, "cpu_util_pct")),
-        "cpu_util_p95_pct": _p95(_sample_values(samples, "cpu_util_pct")),
-        "cpu_util_max_pct": _maximum(_sample_values(samples, "cpu_util_pct")),
-        "mem_used_avg_mb": _average(_sample_values(samples, "mem_used_mb")),
-        "mem_used_p95_mb": _p95(_sample_values(samples, "mem_used_mb")),
-        "mem_used_max_mb": _maximum(_sample_values(samples, "mem_used_mb")),
-        "gpu_util_avg_pct": _average(_sample_values(samples, "gpu_util_avg_pct")),
-        "gpu_util_p95_pct": _p95(_sample_values(samples, "gpu_util_avg_pct")),
-        "gpu_util_max_pct": _maximum(_sample_values(samples, "gpu_util_avg_pct")),
-    }
+    gpu_details = list(gpu_details)
+    aggregate = {}
+    for sample_key, avg_key, p95_key, max_key in (
+        ("cpu_util_pct", "cpu_util_avg_pct", "cpu_util_p95_pct", "cpu_util_max_pct"),
+        ("mem_used_mb", "mem_used_avg_mb", "mem_used_p95_mb", "mem_used_max_mb"),
+        ("mem_used_pct", "mem_used_avg_pct", "mem_used_p95_pct", "mem_used_max_pct"),
+        ("net_rx_mb_s", "net_rx_avg_mb_s", "net_rx_p95_mb_s", "net_rx_max_mb_s"),
+        ("net_tx_mb_s", "net_tx_avg_mb_s", "net_tx_p95_mb_s", "net_tx_max_mb_s"),
+        ("disk_read_mb_s", "disk_read_avg_mb_s", "disk_read_p95_mb_s", "disk_read_max_mb_s"),
+        (
+            "disk_write_mb_s",
+            "disk_write_avg_mb_s",
+            "disk_write_p95_mb_s",
+            "disk_write_max_mb_s",
+        ),
+        ("gpu_util_avg_pct", "gpu_util_avg_pct", "gpu_util_p95_pct", "gpu_util_max_pct"),
+        (
+            "gpu_mem_used_mb",
+            "gpu_mem_used_avg_mb",
+            "gpu_mem_used_p95_mb",
+            "gpu_mem_used_max_mb",
+        ),
+        ("gpu_power_w", "gpu_power_avg_w", "gpu_power_p95_w", "gpu_power_max_w"),
+        (
+            "gpu_temperature_c",
+            "gpu_temp_avg_c",
+            "gpu_temp_p95_c",
+            "gpu_temp_max_c",
+        ),
+    ):
+        values = _sample_values(samples, sample_key)
+        aggregate[avg_key] = _average(values)
+        aggregate[p95_key] = _p95(values)
+        aggregate[max_key] = _maximum(values)
+
+    aggregate["gpu_count"] = len(gpu_details)
+    aggregate["gpu_mem_total_mb"] = _maximum(_sample_values(samples, "gpu_mem_total_mb"))
+    aggregate["gpu_mem_used_max_pct"] = _maximum(_sample_values(samples, "gpu_mem_used_pct"))
 
     return {
-        "available": sample_count > 0,
+        "system_available": sample_count > 0,
+        "gpu_available": bool(gpu_details),
         "backend": backend,
         "interval_sec": interval_sec,
         "sample_count": sample_count,
         "error_count": error_count,
         "aggregate": aggregate,
-        "gpu_details": gpu_details,
+        "gpus": gpu_details,
     }
 
 
 def _parse_float(value):
     value = value.strip()
-    if not value or value.upper() == "N/A" or value.startswith("["):
+    if not value or value.upper() == "N/A" or value.lower() == "not supported" or value.startswith("["):
         return None
     return float(value)
 
