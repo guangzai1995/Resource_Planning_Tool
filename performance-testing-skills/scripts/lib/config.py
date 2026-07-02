@@ -22,7 +22,10 @@ def expand_env(value: Any) -> Any:
     if isinstance(value, list):
         return [expand_env(item) for item in value]
     if isinstance(value, dict):
-        return {key: expand_env(item) for key, item in value.items()}
+        return {
+            key: item if key == "body_template" else expand_env(item)
+            for key, item in value.items()
+        }
     return value
 
 

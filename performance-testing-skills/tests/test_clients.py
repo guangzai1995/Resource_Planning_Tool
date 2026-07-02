@@ -3,6 +3,8 @@ from scripts.lib.clients import (
     classify_error,
     make_curl,
 )
+from scripts.lib.config import load_config
+from scripts.lib.datasets import load_dataset
 
 
 def test_build_openai_chat_request():
@@ -51,6 +53,17 @@ def test_build_generic_http_request_replaces_template_values():
     )
 
     assert request["json"] == {"input": "hello", "max_tokens": 9}
+
+
+def test_build_generic_http_request_preserves_loaded_body_templates():
+    config = load_config("configs/generic_http.json")
+    rows = load_dataset(config["dataset"])
+
+    request = build_request(config, rows[0])
+
+    assert request["json"]["prompt"] == rows[0]["prompt"]
+    assert request["json"]["max_tokens"] == rows[0]["expected_output_len"]
+    assert isinstance(request["json"]["max_tokens"], int)
 
 
 def test_make_curl_contains_method_url_and_json():
