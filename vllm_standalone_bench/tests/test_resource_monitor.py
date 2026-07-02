@@ -71,6 +71,7 @@ def test_parse_nvidia_smi_csv_handles_multi_gpu_and_empty_values():
     text = "\n".join([
         "0, NVIDIA H200, GPU-0, 98, 77320, 81559, 612.50, 76",
         "1, NVIDIA H200, GPU-1, N/A, 12000, 81559, Not Supported, Not Supported",
+        "2, NVIDIA H200, GPU-2, , 0, 81559, [Not Supported], ",
     ])
 
     gpus = rm.parse_nvidia_smi_csv(text)
@@ -81,6 +82,10 @@ def test_parse_nvidia_smi_csv_handles_multi_gpu_and_empty_values():
     assert gpus[1]["gpu_util_pct"] is None
     assert gpus[1]["gpu_power_w"] is None
     assert gpus[1]["gpu_temperature_c"] is None
+    assert gpus[2]["gpu_index"] == 2
+    assert gpus[2]["gpu_util_pct"] is None
+    assert gpus[2]["gpu_power_w"] is None
+    assert gpus[2]["gpu_temperature_c"] is None
 
 
 def test_summarize_samples_computes_avg_p95_and_max():
