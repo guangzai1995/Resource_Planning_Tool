@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -847,6 +848,130 @@ def test_load_resume_context_returns_unknown_manifest_cases(tmp_path):
     context = ab.load_resume_context(tmp_path / "results", "run123")
 
     assert context.unknown_manifest_cases == (("old_model", "old_serve", "old_bench"),)
+
+
+def test_controller_command_matches_resume_child(tmp_path):
+    cmd = [
+        sys.executable,
+        str(Path(ab.__file__).resolve()),
+        "resume",
+        "--run-id",
+        "run123",
+        "--child",
+        "--results-dir",
+        str(tmp_path / "results"),
+    ]
+
+    assert ab.controller_command_matches(cmd, "run123", tmp_path / "results") is True
+
+
+def test_main_resume_foreground_runs_pending_cases(tmp_path, monkeypatch):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    calls = []
+
+    def fake_run_controller(config_arg, run_id, runner=None, dry_run=False, lock_token=None,
+                            initial_manifest=None, cases_to_run=None):
+        calls.append((run_id, tuple(case.bench_profile.name for case in cases_to_run), len(initial_manifest.cases)))
+        return 0
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: calls.append("signals"), raising=False)
+    monkeypatch.setattr(ab, "run_controller", fake_run_controller)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(tmp_path / "results"),
+        "--run-id", "run123",
+    ])
+
+    assert exit_code == 0
+    assert calls == ["signals", ("run123", ("smoke2",), 1)]
+
+
+def test_main_resume_detach_starts_resume_child(tmp_path, monkeypatch):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir)
+    write_resume_manifest(run_dir, cases[:1], config, ["passed"])
+    popen_calls = []
+
+    class FakeProcess:
+        pid = 12345
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(ab.subprocess, "Popen", fake_popen)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(tmp_path / "results"),
+        "--run-id", "run123",
+        "--detach",
+    ])
+
+    controller = json.loads((run_dir / "controller.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert popen_calls[0][2] == "resume"
+    assert "--child" in popen_calls[0]
+    assert controller["command"][2] == "resume"
+
+
+def test_main_resume_empty_pending_does_not_start_controller(tmp_path, monkeypatch, capsys):
+    config, run_dir = write_resolved_config_for_resume(tmp_path)
+    cases = ab.expand_cases(config, run_id="run123")
+    write_resume_state(run_dir, status="completed")
+    write_resume_manifest(run_dir, cases, config, ["passed", "passed"])
+
+    def fail_run_controller(*args, **kwargs):
+        raise AssertionError("empty resume should not start controller")
+
+    monkeypatch.setattr(ab, "run_controller", fail_run_controller)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(tmp_path / "results"),
+        "--run-id", "run123",
+    ])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "no pending" in captured.out.lower() or "nothing to resume" in captured.out.lower()
+
+
+def test_main_resume_child_load_context_failure_releases_lock(tmp_path, monkeypatch, capsys):
+    results_dir = tmp_path / "results"
+    run_dir = results_dir / "run123"
+    run_dir.mkdir(parents=True)
+    (run_dir / ".run.lock").write_text(
+        json.dumps({"pid": os.getpid(), "token": "tok", "created_at": 1.0}),
+        encoding="utf-8",
+    )
+
+    def fail_context(*args, **kwargs):
+        raise ab.ConfigError("bad resume context")
+
+    monkeypatch.setattr(ab, "install_signal_handlers", lambda: None, raising=False)
+    monkeypatch.setattr(ab, "load_resume_context", fail_context)
+
+    exit_code = ab.main([
+        "resume",
+        "--results-dir", str(results_dir),
+        "--run-id", "run123",
+        "--child",
+        "--lock-token", "tok",
+    ])
+
+    captured = capsys.readouterr()
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert state["status"] == "failed"
+    assert "bad resume context" in state["error"]
+    assert "bad resume context" in captured.err
+    assert not (run_dir / ".run.lock").exists()
 
 
 class FakeRunner:

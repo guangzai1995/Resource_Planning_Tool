@@ -2402,21 +2402,24 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     return exit_code
 
 
-def build_detach_command(config_path: Path, run_id: str,
+def build_detach_command(config_path: Path | None, run_id: str,
                          results_dir: Path,
-                         lock_token: str | None = None) -> list[str]:
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "run",
-        "--config",
-        str(config_path),
+                         lock_token: str | None = None,
+                         command_name: str = "run") -> list[str]:
+    cmd = [sys.executable, str(Path(__file__).resolve()), command_name]
+    if command_name == "run":
+        if config_path is None:
+            raise ValueError("run detached command requires config_path")
+        cmd.extend(["--config", str(config_path)])
+    elif command_name != "resume":
+        raise ValueError(f"unsupported detached command: {command_name}")
+    cmd.extend([
         "--run-id",
         run_id,
         "--child",
         "--results-dir",
         str(results_dir),
-    ]
+    ])
     if lock_token is not None:
         cmd.extend(["--lock-token", lock_token])
     return cmd
@@ -2478,7 +2481,8 @@ def terminate_detached_child(process: Any, timeout_sec: float = 5.0) -> bool:
     return _wait_for_process_exit(process, timeout_sec)
 
 
-def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> int:
+def start_detached(config_path: Path | None, config: AutoBenchConfig, run_id: str,
+                   command_name: str = "run") -> int:
     _safe_name(run_id, "run_id")
     cases = expand_cases(config, run_id=run_id)
     run_dir = config.run.results_dir / run_id
@@ -2521,6 +2525,7 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
         run_id,
         config.run.results_dir,
         lock_token=run_lock.token,
+        command_name=command_name,
     )
     process: subprocess.Popen[Any] | None = None
     try:
@@ -2537,7 +2542,7 @@ def start_detached(config_path: Path, config: AutoBenchConfig, run_id: str) -> i
             "pid": process.pid,
             "run_id": run_id,
             "command": command,
-            "config_path": str(config_path),
+            "config_path": str(config_path) if config_path is not None else None,
             "started_at": time.time(),
         })
         update_run_lock_owner(run_lock, process.pid)
@@ -2735,7 +2740,7 @@ def controller_command_matches(command: list[str], run_id: str,
         return False
     if not _is_current_script_arg(command[1]):
         return False
-    if command[2] != "run":
+    if command[2] not in {"run", "resume"}:
         return False
     if "--child" not in command:
         return False
@@ -2793,6 +2798,30 @@ def is_controller_process(pid: int, run_id: str,
             and controller_command_matches(cmdline, run_id, results_dir)
         )
     return controller_command_matches(cmdline, run_id, results_dir)
+
+
+def resume_run(results_dir: Path, run_id: str, *,
+               runner: Runner | None = None,
+               lock_token: str | None = None) -> int:
+    context = load_resume_context(results_dir, run_id)
+    if context.unknown_manifest_cases:
+        print(
+            f"warning: ignoring manifest cases not in resolved config: {context.unknown_manifest_cases}",
+            file=sys.stderr,
+        )
+    if not context.pending_cases:
+        print(f"nothing to resume: {run_id}")
+        write_manifest(context.run_dir, context.initial_manifest)
+        write_state(context.run_dir, finished_state(run_id, context.initial_manifest))
+        return 0
+    return run_controller(
+        context.config,
+        run_id=run_id,
+        runner=runner,
+        lock_token=lock_token,
+        initial_manifest=context.initial_manifest,
+        cases_to_run=context.pending_cases,
+    )
 
 
 def _run_state_is_active(run_dir: Path) -> bool:
@@ -3010,6 +3039,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stop_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     stop_parser.add_argument("--run-id", required=True)
 
+    resume_parser = subparsers.add_parser("resume", help="resume interrupted benchmark cases")
+    resume_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    resume_parser.add_argument("--run-id", required=True)
+    resume_parser.add_argument("--detach", action="store_true")
+    resume_parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
+    resume_parser.add_argument("--lock-token", help=argparse.SUPPRESS)
+
     prepare_parser = subparsers.add_parser("prepare-model", help="prepare model assets")
     prepare_parser.add_argument("--modelscope-id", required=True)
     prepare_parser.add_argument("--target", required=True)
@@ -3097,6 +3133,65 @@ def main(argv: list[str] | None = None) -> int:
             controller=args.controller,
         )
         return follow_file(log_path) if args.follow else print_log(log_path)
+    if args.command == "resume":
+        if args.child:
+            try:
+                install_signal_handlers()
+                return resume_run(
+                    args.results_dir,
+                    args.run_id,
+                    lock_token=args.lock_token,
+                )
+            except StopRequested as exc:
+                error = str(exc) or "stop requested"
+                try:
+                    write_child_startup_state_best_effort(
+                        args.results_dir,
+                        args.run_id,
+                        "interrupted",
+                        error,
+                    )
+                finally:
+                    release_child_startup_lock(args.results_dir, args.run_id, args.lock_token)
+                print(error, file=sys.stderr)
+                return 130
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    write_child_startup_state_best_effort(
+                        args.results_dir,
+                        args.run_id,
+                        "failed",
+                        error,
+                    )
+                finally:
+                    release_child_startup_lock(args.results_dir, args.run_id, args.lock_token)
+                print(error, file=sys.stderr)
+                return 1
+        try:
+            context = load_resume_context(args.results_dir, args.run_id)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if not context.pending_cases:
+            print(f"nothing to resume: {args.run_id}")
+            write_manifest(context.run_dir, context.initial_manifest)
+            write_state(context.run_dir, finished_state(args.run_id, context.initial_manifest))
+            return 0
+        if args.detach:
+            return start_detached(
+                None,
+                context.config,
+                args.run_id,
+                command_name="resume",
+            )
+        install_signal_handlers()
+        return run_controller(
+            context.config,
+            run_id=args.run_id,
+            initial_manifest=context.initial_manifest,
+            cases_to_run=context.pending_cases,
+        )
     if args.command == "stop":
         return stop_run(args.results_dir / args.run_id)
     if args.command == "prepare-model":
