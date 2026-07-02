@@ -5,8 +5,14 @@ import subprocess
 import pytest
 
 from auto_bench import ConfigError
-from remote_docker import RemoteDockerRunner, build_ssh_base_command, mask_command
+from remote_docker import (
+    RemoteDockerRunner,
+    RemoteResourceReaders,
+    build_ssh_base_command,
+    mask_command,
+)
 from remote_topology import RemoteAuth, RemoteHost
+from resource_monitor import NVIDIA_SMI_QUERY
 
 
 def value_after(argv, flag):
@@ -28,6 +34,32 @@ def test_key_auth_uses_plain_ssh_command():
     assert value_after(cmd, "-i") == "/keys/id_rsa"
     assert "root@10.0.0.11" in cmd
     assert env == {}
+
+
+def test_remote_resource_readers_capture_host_proc_and_gpu_commands():
+    calls = []
+
+    class FakeRunner:
+        def capture(self, host, command):
+            calls.append((host, list(command)))
+            return f"value-{len(calls)}"
+
+    host = RemoteHost("p1", "10.0.0.11", "root", RemoteAuth("key"))
+    readers = RemoteResourceReaders(FakeRunner(), host)
+
+    assert readers.proc_stat() == "value-1"
+    assert readers.meminfo() == "value-2"
+    assert readers.net_dev() == "value-3"
+    assert readers.diskstats() == "value-4"
+    assert readers.nvidia_smi() == "value-5"
+    assert [call[0] for call in calls] == [host, host, host, host, host]
+    assert [call[1] for call in calls] == [
+        ["cat", "/proc/stat"],
+        ["cat", "/proc/meminfo"],
+        ["cat", "/proc/net/dev"],
+        ["cat", "/proc/diskstats"],
+        NVIDIA_SMI_QUERY,
+    ]
 
 
 def test_password_env_uses_sshpass_env_without_password_in_args(monkeypatch):

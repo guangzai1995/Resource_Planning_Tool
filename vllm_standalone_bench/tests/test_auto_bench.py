@@ -1555,6 +1555,15 @@ class StopFailingResourceMonitor(FakeResourceMonitor):
         raise RuntimeError("stop failed")
 
 
+class SecondStartInterruptingResourceMonitor(FakeResourceMonitor):
+    instances = []
+
+    def start(self):
+        self.started = True
+        if len(type(self).instances) == 2:
+            raise ab.StopRequested("monitor interrupted")
+
+
 def command_index(commands, prefix):
     for index, command in enumerate(commands):
         if command[:len(prefix)] == prefix:
@@ -1708,6 +1717,40 @@ def test_topology_remote_resource_monitor_start_failed_does_not_fail_bench(
     assert result == 0
     assert len(bench_run_commands(local.commands)) == 1
     assert len(StartFailingResourceMonitor.instances) == 5
+    assert all(monitor.stopped for monitor in StartFailingResourceMonitor.instances)
+
+
+def test_topology_resource_monitor_start_interrupt_stops_started_monitors(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    role_commands = case.topology_profile.build_commands(config, case, layout.run_dir)
+    started_roles = [role_commands["p1"], role_commands["p2"]]
+    SecondStartInterruptingResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "ResourceMonitor", SecondStartInterruptingResourceMonitor)
+
+    with pytest.raises(ab.StopRequested, match="monitor interrupted"):
+        ab._start_topology_resource_monitors(
+            config,
+            remote,
+            case,
+            layout,
+            started_roles,
+        )
+
+    assert len(SecondStartInterruptingResourceMonitor.instances) == 2
+    assert [monitor.started for monitor in SecondStartInterruptingResourceMonitor.instances] == [
+        True,
+        True,
+    ]
+    assert [monitor.stopped for monitor in SecondStartInterruptingResourceMonitor.instances] == [
+        True,
+        True,
+    ]
 
 
 def test_topology_remote_resource_monitor_stop_failed_does_not_fail_bench(
@@ -1728,6 +1771,45 @@ def test_topology_remote_resource_monitor_stop_failed_does_not_fail_bench(
     assert len(bench_run_commands(local.commands)) == 1
     assert len(StopFailingResourceMonitor.instances) == 5
     assert all(monitor.stopped for monitor in StopFailingResourceMonitor.instances)
+
+
+def test_topology_prefixed_resource_merge_failed_does_not_fail_bench(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    config = topology_config_with_image(tmp_path)
+    remote = FakeRemoteDockerRunner()
+    local = FakeRunner()
+    FakeResourceMonitor.instances = []
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+    monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
+
+    def fail_merge(*args, **kwargs):
+        raise RuntimeError("prefixed merge failed")
+
+    monkeypatch.setattr(ab, "append_prefixed_summaries_to_result_files", fail_merge)
+
+    result = ab.run_controller(config, run_id="run123", runner=local)
+
+    assert result == 0
+    assert len(bench_run_commands(local.commands)) == 1
+    assert "remote resource monitor result merge failed" in caplog.text
+    assert any(
+        cmd[1][:2] == ["docker", "stop"] and "router" in cmd[1][2]
+        for cmd in remote.commands
+    )
+    manifest = json.loads(
+        (tmp_path / "results" / "run123" / "manifest.json").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert manifest["cases"][0]["status"] == "passed"
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    status = json.loads((layout.bench_dir / "status.json").read_text(encoding="utf-8"))
+    assert status == {"status": "passed", "error": None}
 
 
 def test_topology_owned_stale_role_removed_before_start(tmp_path, monkeypatch):

@@ -2756,6 +2756,7 @@ def _start_topology_resource_monitors(
     monitors: dict[str, Any] = {}
     for role_command in started_roles:
         role_name = role_command.role_name
+        monitor = None
         try:
             host = _topology_role_host(case, role_command)
             monitor = ResourceMonitor(
@@ -2767,8 +2768,11 @@ def _start_topology_resource_monitors(
             )
             monitor.start()
         except (StopRequested, KeyboardInterrupt):
+            _stop_topology_resource_monitor_best_effort(role_name, monitor)
+            _stop_topology_resource_monitors_best_effort(monitors)
             raise
         except Exception as exc:
+            _stop_topology_resource_monitor_best_effort(role_name, monitor)
             logger.warning(
                 "remote resource monitor start failed for %s: %s",
                 role_name,
@@ -2777,6 +2781,30 @@ def _start_topology_resource_monitors(
             continue
         monitors[role_name] = monitor
     return monitors
+
+
+def _stop_topology_resource_monitor_best_effort(role_name: str, monitor: Any) -> None:
+    if monitor is None:
+        return
+    try:
+        monitor.stop()
+    except (StopRequested, KeyboardInterrupt) as exc:
+        logger.warning(
+            "remote resource monitor cleanup interrupted for %s: %s",
+            role_name,
+            exc,
+        )
+    except Exception as exc:
+        logger.warning(
+            "remote resource monitor cleanup failed for %s: %s",
+            role_name,
+            exc,
+        )
+
+
+def _stop_topology_resource_monitors_best_effort(monitors: Mapping[str, Any]) -> None:
+    for role_name, monitor in monitors.items():
+        _stop_topology_resource_monitor_best_effort(role_name, monitor)
 
 
 def _stop_topology_resource_monitors(

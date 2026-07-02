@@ -569,6 +569,52 @@ def test_append_prefixed_summaries_to_result_csv(tmp_path):
     assert rows[0]["router_gpu_mem_used_max_mb"] == "1234.0"
 
 
+def test_append_prefixed_summaries_to_result_xlsx(tmp_path):
+    import openpyxl
+
+    result_xlsx = tmp_path / "result.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.cell(row=1, column=1, value="model")
+    worksheet.cell(row=1, column=2, value="throughput_tok_s")
+    worksheet.cell(row=2, column=1, value="模型")
+    worksheet.cell(row=2, column=2, value="吞吐")
+    worksheet.cell(row=3, column=1, value="m")
+    worksheet.cell(row=3, column=2, value=12.5)
+    workbook.save(result_xlsx)
+    summary = {
+        "available": True,
+        "sample_count": 2,
+        "aggregate": {"cpu_util_avg_pct": 50.0, "gpu_mem_used_max_mb": 1234.0},
+    }
+
+    rm.append_prefixed_summaries_to_result_files(
+        tmp_path,
+        {"p1": summary, "router": summary},
+    )
+
+    loaded = openpyxl.load_workbook(result_xlsx)
+    sheet = loaded.active
+    columns = {
+        sheet.cell(row=1, column=column).value: column
+        for column in range(1, sheet.max_column + 1)
+    }
+    assert sheet.cell(row=1, column=columns["model"]).value == "model"
+    assert sheet.cell(row=2, column=columns["model"]).value == "模型"
+    assert sheet.cell(row=3, column=columns["model"]).value == "m"
+    assert sheet.cell(row=3, column=columns["throughput_tok_s"]).value == 12.5
+
+    p1_available = columns["p1_resource_monitor_available"]
+    p1_cpu_avg = columns["p1_cpu_util_avg_pct"]
+    router_gpu_mem = columns["router_gpu_mem_used_max_mb"]
+    assert sheet.cell(row=2, column=p1_available).value == "p1_resource_monitor_available"
+    assert sheet.cell(row=2, column=p1_cpu_avg).value == "p1_cpu_util_avg_pct"
+    assert sheet.cell(row=2, column=router_gpu_mem).value == "router_gpu_mem_used_max_mb"
+    assert sheet.cell(row=3, column=p1_available).value == "true"
+    assert sheet.cell(row=3, column=p1_cpu_avg).value == 50.0
+    assert sheet.cell(row=3, column=router_gpu_mem).value == 1234.0
+
+
 def test_append_summary_to_result_xlsx_adds_chinese_resource_headers(tmp_path):
     import openpyxl
 

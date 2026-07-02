@@ -629,8 +629,11 @@ def flatten_prefixed_summaries(summaries):
     values = {}
     for prefix, summary in summaries.items():
         flattened = flatten_summary_for_result(summary)
-        for column in RESOURCE_RESULT_COLUMNS:
-            values[f"{prefix}_{column}"] = flattened.get(column, "")
+        for column, prefixed_column in zip(
+            RESOURCE_RESULT_COLUMNS,
+            prefixed_resource_columns(prefix),
+        ):
+            values[prefixed_column] = flattened.get(column, "")
     return values
 
 
