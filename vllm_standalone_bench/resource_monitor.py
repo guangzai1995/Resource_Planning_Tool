@@ -235,9 +235,13 @@ class ResourceMonitor:
         if not self.enabled:
             return {"available": False, "sample_count": 0, "aggregate": {}}
 
+        was_started = self._thread is not None
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(self.interval_sec, 1.0) + 1.0)
+
+        if was_started and self._started_at is not None:
+            self.sample_once()
 
         with self._lock:
             samples = list(self.samples)

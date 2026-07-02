@@ -362,6 +362,84 @@ def test_resource_monitor_stop_writes_samples_from_snapshot(tmp_path, monkeypatc
     assert captured["samples"][0]["timestamp"] != "late"
 
 
+def test_resource_monitor_stop_takes_final_sample_for_short_lifecycle(tmp_path, monkeypatch):
+    times = iter([100.0, 101.0])
+
+    def fake_time():
+        return next(times)
+
+    def sequence(values):
+        values = iter(values)
+        last = None
+
+        def read():
+            nonlocal last
+            try:
+                last = next(values)
+            except StopIteration:
+                pass
+            return last
+
+        return read
+
+    proc_stat = sequence([
+        "cpu  100 0 0 900 0 0 0 0 0 0\n",
+        "cpu  150 0 0 950 0 0 0 0 0 0\n",
+    ])
+    net_dev = sequence([
+        """
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 1048576 0 0 0 0 0 0 0 2097152 0 0 0 0 0 0 0
+""",
+        """
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  eth0: 3145728 0 0 0 0 0 0 0 5242880 0 0 0 0 0 0 0
+""",
+    ])
+    diskstats = sequence([
+        "   8       0 sda 10 0 100 0 5 0 20 0 0 0 0 0 0 0 0 0 0\n",
+        "   8       0 sda 20 0 2148 0 7 0 1044 0 0 0 0 0 0 0 0 0 0\n",
+    ])
+    monitor = rm.ResourceMonitor(
+        output_dir=tmp_path,
+        interval_sec=3600.0,
+        enabled=True,
+        backend="nvidia-smi",
+        readers=rm.ResourceReaders(
+            proc_stat=proc_stat,
+            meminfo=lambda: "MemTotal: 1024000 kB\nMemAvailable: 512000 kB\n",
+            net_dev=net_dev,
+            diskstats=diskstats,
+            nvidia_smi=lambda: "",
+        ),
+    )
+    monkeypatch.setattr(rm.time, "time", fake_time)
+
+    monitor.start()
+    summary = monitor.stop()
+
+    assert summary["sample_count"] >= 2
+    aggregate = summary["aggregate"]
+    for key in (
+        "cpu_util_avg_pct",
+        "net_rx_avg_mb_s",
+        "net_tx_avg_mb_s",
+        "disk_read_avg_mb_s",
+        "disk_write_avg_mb_s",
+    ):
+        assert aggregate[key] is not None
+
+    samples_path = tmp_path / "resource_samples.csv"
+    summary_path = tmp_path / "resource_summary.json"
+    assert samples_path.is_file()
+    assert summary_path.is_file()
+    with samples_path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) >= 2
+
+
 def test_resource_monitor_degrades_when_nvidia_smi_missing(tmp_path):
     def missing_gpu():
         raise FileNotFoundError("nvidia-smi")
