@@ -195,10 +195,10 @@ class TopologyProfile:
         case: Any,
         run_dir: os.PathLike[str] | str,
     ) -> RoleCommand:
-        if self.frontend.kind != "router":
+        if self.frontend.kind not in {"router", "sglang_router"}:
             raise _config_error(
                 f"topology profile {self.name} frontend.kind must be router "
-                "for sglang pd"
+                "or sglang_router for sglang pd"
             )
         image = self.router_image or self._required_image()
         argv = self._docker_run_base(

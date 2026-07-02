@@ -5168,6 +5168,21 @@ def test_shipped_sglang_compare_config_parses():
     assert "sglang" in config.run.images
 
 
+def test_shipped_sglang_pd_remote_config_parses(tmp_path):
+    path = CONFIG_DIR / "auto_bench.sglang_pd_remote.example.json"
+    config = ab.load_config(path)
+    assert config.serve_profiles == ()
+    assert config.topology_profiles[0].engine == "sglang"
+    assert config.topology_profiles[0].frontend.kind == "sglang_router"
+    case = ab.expand_cases(config, run_id="dryrun")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "dryrun")
+    assert {"p1", "p2", "d1", "d2", "router"} <= set(commands)
+    router = commands["router"].argv
+    assert "sglang_router.launch_router" in router
+    assert "http://192.0.2.11:30000" in values_after(router, "--prefill")
+    assert "http://192.0.2.21:30001" in values_after(router, "--decode")
+
+
 def test_controller_dry_run_prints_sglang_command(tmp_path, capsys):
     data = minimal_config(tmp_path)
     data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
