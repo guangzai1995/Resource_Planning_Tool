@@ -1,6 +1,8 @@
 from pathlib import Path
 import subprocess
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,6 +38,15 @@ def test_manual_cli_mode_curl_only_outputs_curl():
     assert lines[0].startswith("curl ")
     assert "DRY RUN" not in result.stdout
     assert "hello curl" in result.stdout
+
+
+@pytest.mark.parametrize("timeout_value", ["nan", "inf"])
+def test_manual_cli_rejects_non_finite_timeout_values(timeout_value):
+    result = run_manual_cli("--dry-run", "--timeout-seconds", timeout_value)
+
+    assert result.returncode != 0
+    assert "error:" in result.stderr
+    assert "argument --timeout-seconds" in result.stderr
 
 
 def test_run_manual_shell_wrapper_forwards_to_manual_cli():
