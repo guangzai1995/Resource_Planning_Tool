@@ -140,6 +140,24 @@ def test_sglang_pd_commands_include_expected_labels_and_masked_argv(tmp_path):
     assert labels["vllm_auto_bench.role_name"] == "p1"
 
 
+def test_sglang_pd_commands_render_disaggregation_ib_device(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["disaggregation_ib_device"] = "mlx5_0"
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1 = commands["p1"].argv
+    d1 = commands["d1"].argv
+    router = commands["router"].argv
+    assert value_after(p1, "--disaggregation-ib-device") == "mlx5_0"
+    assert value_after(d1, "--disaggregation-ib-device") == "mlx5_0"
+    assert "--disaggregation-ib-device" not in router
+
+
 def test_vllm_pd_worker_command_renders_kv_template(tmp_path):
     data = pd_topology_config(tmp_path)
     topology = data["topology_profiles"][0]

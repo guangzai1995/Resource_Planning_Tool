@@ -177,6 +177,11 @@ class TopologyProfile:
                 "--disaggregation-bootstrap-port",
                 str(node.bootstrap_port),
             ])
+        if self.disaggregation_ib_device:
+            argv.extend([
+                "--disaggregation-ib-device",
+                self.disaggregation_ib_device,
+            ])
         argv.extend(node.args)
         return _role_command(
             role_name=node.name,
