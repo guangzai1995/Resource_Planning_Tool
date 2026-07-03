@@ -291,6 +291,25 @@ def test_vllm_pd_p2p_commands_render_structured_builtin_proxy(tmp_path):
     }
 
 
+def test_vllm_pd_p2p_rejects_overlapping_kv_port_ranges_on_same_host(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "p2p_nccl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+    topology["hosts"]["p2"]["address"] = topology["hosts"]["p1"]["address"]
+    for node in topology["prefill"] + topology["decode"]:
+        node["args"] = ["--tensor-parallel-size", "4"]
+    topology["prefill"][0]["kv_port"] = 21001
+    topology["prefill"][1]["kv_port"] = 21002
+    topology["decode"][0]["kv_port"] = 22001
+    topology["decode"][1]["kv_port"] = 22011
+
+    with pytest.raises(ab.ConfigError, match="kv_port ranges overlap.*p1.*p2"):
+        ab.load_config(write_config(tmp_path, data))
+
+
 def test_vllm_pd_nixl_commands_render_side_channel_env(tmp_path):
     data = pd_topology_config(tmp_path)
     topology = data["topology_profiles"][0]
@@ -478,17 +497,13 @@ def test_minimax_p2p_compare_config_expands_all_profiles():
     )
     cases = ab.expand_cases(config, run_id="minimax_compare")
 
-    assert [profile.name for profile in config.serve_profiles] == [
-        "minimax_tp8_single",
-    ]
+    assert [profile.name for profile in config.serve_profiles] == []
     assert [profile.name for profile in config.topology_profiles] == [
         "vllm_pd_p2p_minimax_m27_2p2d",
         "vllm_pd_p2p_minimax_m27_3p1d",
         "vllm_pd_p2p_minimax_m27_1p3d",
     ]
-    assert [case.serve_profile.name for case in cases if case.serve_profile] == [
-        "minimax_tp8_single",
-    ]
+    assert [case.serve_profile.name for case in cases if case.serve_profile] == []
     assert [
         case.topology_profile.name for case in cases if case.topology_profile
     ] == [

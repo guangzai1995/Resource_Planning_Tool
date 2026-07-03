@@ -63,7 +63,7 @@
           "name": "p2",
           "host": "p2",
           "port": 4138,
-          "kv_port": 21002,
+          "kv_port": 21011,
           "gpus": "4,5,6,7",
           "args": [
             "--tensor-parallel-size", "4",
@@ -107,7 +107,7 @@
           "name": "d2",
           "host": "d2",
           "port": 4138,
-          "kv_port": 22002,
+          "kv_port": 22011,
           "gpus": "4,5,6,7",
           "args": [
             "--tensor-parallel-size", "4",
@@ -125,7 +125,7 @@
           ]
         }
       ],
-      "frontend": {"kind": "builtin", "host": "router", "port": 8000}
+      "frontend": {"kind": "builtin", "host": "router", "port": 18000}
     },
     {
       "name": "vllm_pd_p2p_minimax_m27_3p1d",
@@ -173,7 +173,7 @@
           "name": "p2",
           "host": "p2",
           "port": 4138,
-          "kv_port": 21002,
+          "kv_port": 21011,
           "gpus": "4,5,6,7",
           "args": [
             "--tensor-parallel-size", "4",
@@ -194,7 +194,7 @@
           "name": "p3",
           "host": "p3",
           "port": 4137,
-          "kv_port": 21003,
+          "kv_port": 21021,
           "gpus": "0,1,2,3",
           "args": [
             "--tensor-parallel-size", "4",
@@ -233,7 +233,7 @@
           "--reasoning-parser", "minimax_m2"
         ]
       }],
-      "frontend": {"kind": "builtin", "host": "router", "port": 8000}
+      "frontend": {"kind": "builtin", "host": "router", "port": 18000}
     },
     {
       "name": "vllm_pd_p2p_minimax_m27_1p3d",
@@ -302,7 +302,7 @@
           "name": "d2",
           "host": "d2",
           "port": 4138,
-          "kv_port": 22002,
+          "kv_port": 22011,
           "gpus": "4,5,6,7",
           "args": [
             "--tensor-parallel-size", "4",
@@ -323,7 +323,7 @@
           "name": "d3",
           "host": "d3",
           "port": 4138,
-          "kv_port": 22003,
+          "kv_port": 22021,
           "gpus": "4,5,6,7",
           "args": [
             "--tensor-parallel-size", "4",
@@ -341,7 +341,7 @@
           ]
         }
       ],
-      "frontend": {"kind": "builtin", "host": "router", "port": 8000}
+      "frontend": {"kind": "builtin", "host": "router", "port": 18000}
     }
   ],
   "bench_profiles": [{

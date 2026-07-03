@@ -3997,6 +3997,56 @@ def test_stop_run_sends_sigterm(tmp_path, monkeypatch, capsys):
     assert "12345" in captured.out
 
 
+def test_cleanup_run_removes_remote_managed_containers_by_run_id(
+    tmp_path,
+    monkeypatch,
+):
+    config = topology_config_with_image(tmp_path)
+    run_dir = config.run.results_dir / "run123"
+    run_dir.mkdir(parents=True)
+    ab.write_private_json_atomic(
+        run_dir / ab.RESUME_CONFIG_FILE,
+        ab.resume_config_to_dict(config),
+    )
+
+    class CleanupRemoteRunner(FakeRemoteDockerRunner):
+        def run(self, host, command, *, check=False, capture=True, text=True,
+                stdout=None, stderr=None):
+            if command[:3] == ["docker", "ps", "-aq"]:
+                self.commands.append((host.name, list(command)))
+                return ab.Completed(list(command), 0, "old-a\nold-b\n", "")
+            return super().run(
+                host,
+                command,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    remote = CleanupRemoteRunner()
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+
+    exit_code = ab.cleanup_run(run_dir)
+
+    assert exit_code == 0
+    ps_commands = [
+        command for _host, command in remote.commands
+        if command[:3] == ["docker", "ps", "-aq"]
+    ]
+    assert ps_commands
+    assert all(
+        f"label={ab.NETWORK_MANAGED_LABEL}=true" in command
+        and f"label={ab.NETWORK_RUN_ID_LABEL}=run123" in command
+        for command in ps_commands
+    )
+    assert any(
+        command == ["docker", "rm", "-f", "old-a", "old-b"]
+        for _host, command in remote.commands
+    )
+
+
 def test_stop_run_rejects_unsafe_pid(tmp_path, monkeypatch, capsys):
     run_dir = tmp_path / "run123"
     run_dir.mkdir()

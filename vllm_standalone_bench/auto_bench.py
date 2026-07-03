@@ -2246,6 +2246,69 @@ def cleanup_topology_roles_best_effort(remote_runner: RemoteDockerRunner,
     return stop_requested
 
 
+def _unique_topology_hosts(config: AutoBenchConfig):
+    seen: set[tuple[str, str, str, str | None, str | None]] = set()
+    for topology in config.topology_profiles:
+        for host in topology.hosts.values():
+            key = (
+                host.ssh_user,
+                host.address,
+                host.auth.type,
+                host.auth.key_path,
+                host.auth.env,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            yield host
+
+
+def cleanup_remote_managed_containers_for_run(
+    config: AutoBenchConfig,
+    remote_runner: RemoteDockerRunner,
+    run_id: str,
+) -> int:
+    removed = 0
+    for host in _unique_topology_hosts(config):
+        result = remote_runner.run(
+            host,
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                f"label={NETWORK_MANAGED_LABEL}=true",
+                "--filter",
+                f"label={NETWORK_RUN_ID_LABEL}={run_id}",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            print(
+                f"warning: remote cleanup list failed on {host.name}: "
+                f"{result.stderr or result.stdout}",
+                file=sys.stderr,
+            )
+            continue
+        container_ids = result.stdout.split()
+        if not container_ids:
+            continue
+        remove = remote_runner.run(
+            host,
+            ["docker", "rm", "-f", *container_ids],
+            check=False,
+        )
+        if remove.returncode != 0:
+            print(
+                f"warning: remote cleanup failed on {host.name}: "
+                f"{remove.stderr or remove.stdout}",
+                file=sys.stderr,
+            )
+            continue
+        removed += len(container_ids)
+    return removed
+
+
 def remove_existing_topology_role_if_owned(remote_runner: RemoteDockerRunner,
                                            case: BenchmarkCase,
                                            role_command: RoleCommand,
@@ -2656,6 +2719,18 @@ def _load_resume_config(run_dir: Path) -> AutoBenchConfig:
             "password_env/auth.env or rerun the benchmark."
         )
     return load_config(public_config)
+
+
+def _load_cleanup_config(run_dir: Path) -> AutoBenchConfig:
+    private_config = run_dir / RESUME_CONFIG_FILE
+    if private_config.exists():
+        return load_config(private_config)
+    public_config = run_dir / "config.resolved.json"
+    if public_config.exists():
+        return load_config(public_config)
+    raise ConfigError(
+        f"run is missing cleanup config: {RESUME_CONFIG_FILE} or config.resolved.json"
+    )
 
 
 def _resume_context_from_state(results_dir: Path, run_id: str,
@@ -4228,6 +4303,34 @@ def stop_run(run_dir: Path) -> int:
         print(f"failed to stop {pid}: {exc}", file=sys.stderr)
         return 1
     print(f"sent SIGTERM to {pid}")
+    cleanup_run_best_effort(run_dir)
+    return 0
+
+
+def cleanup_run_best_effort(run_dir: Path) -> None:
+    if not (
+        (run_dir / RESUME_CONFIG_FILE).exists()
+        or (run_dir / "config.resolved.json").exists()
+    ):
+        return
+    try:
+        cleanup_run(run_dir)
+    except Exception as exc:
+        print(f"warning: remote cleanup failed: {exc}", file=sys.stderr)
+
+
+def cleanup_run(run_dir: Path) -> int:
+    try:
+        config = _load_cleanup_config(run_dir)
+    except (ConfigError, OSError, json.JSONDecodeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    removed = cleanup_remote_managed_containers_for_run(
+        config,
+        RemoteDockerRunner(),
+        run_dir.name,
+    )
+    print(f"removed {removed} remote managed container(s) for run_id {run_dir.name}")
     return 0
 
 
@@ -4388,6 +4491,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     stop_parser = subparsers.add_parser("stop", help="stop detached controller")
     stop_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     stop_parser.add_argument("--run-id", required=True)
+
+    cleanup_parser = subparsers.add_parser("cleanup", help="remove remote managed containers for a run")
+    cleanup_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    cleanup_parser.add_argument("--run-id", required=True)
 
     resume_parser = subparsers.add_parser("resume", help="resume interrupted benchmark cases")
     resume_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
@@ -4556,6 +4663,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "stop":
         return stop_run(args.results_dir / args.run_id)
+    if args.command == "cleanup":
+        return cleanup_run(args.results_dir / args.run_id)
     if args.command == "prepare-model":
         return prepare_model(
             modelscope_id=args.modelscope_id,
