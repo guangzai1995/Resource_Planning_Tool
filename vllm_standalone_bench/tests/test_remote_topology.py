@@ -249,6 +249,7 @@ def test_vllm_pd_p2p_commands_render_structured_builtin_proxy(tmp_path):
         "nccl_num_channels": 16,
     }
     topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+    topology["prefill"][0]["gpus"] = "0,1,2,3"
     topology["prefill"][0]["kv_port"] = 21001
     topology["prefill"][1]["kv_port"] = 21002
     topology["decode"][0]["kv_port"] = 22001
@@ -259,6 +260,7 @@ def test_vllm_pd_p2p_commands_render_structured_builtin_proxy(tmp_path):
     commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
 
     p1_config = kv_config_after(commands["p1"].argv)
+    assert value_after(commands["p1"].argv, "--gpus") == '"device=0,1,2,3"'
     assert p1_config["kv_connector"] == "P2pNcclConnector"
     assert p1_config["kv_role"] == "kv_producer"
     assert p1_config["kv_port"] == 21001

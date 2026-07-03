@@ -1172,7 +1172,7 @@ def _container_name(case: Any, topology_name: str, role_name: str) -> str:
 def _docker_gpus(value: str) -> str:
     if value == "all":
         return "all"
-    return f"device={value}"
+    return f'"device={value}"'
 
 
 def _role_command(
