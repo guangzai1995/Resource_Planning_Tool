@@ -168,8 +168,12 @@ def test_p2p_proxy_sends_prefill_then_decode():
     assert session.calls[1][1] == "http://d1:31000/v1/completions"
     prefill_json = session.calls[0][2]["json"]
     decode_json = session.calls[1][2]["json"]
+    prefill_headers = session.calls[0][2]["headers"]
+    decode_headers = session.calls[1][2]["headers"]
     assert prefill_json["max_tokens"] == 1
     assert decode_json["request_id"] == prefill_json["request_id"]
+    assert prefill_headers["X-Request-Id"] == prefill_json["request_id"]
+    assert decode_headers["X-Request-Id"] == prefill_json["request_id"]
 
 
 def test_p2p_proxy_stops_when_prefill_fails():

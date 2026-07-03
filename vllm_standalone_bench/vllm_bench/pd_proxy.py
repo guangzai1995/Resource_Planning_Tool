@@ -25,6 +25,7 @@ HOP_BY_HOP_HEADERS = {
 }
 
 MAX_PREFILL_ERROR_CHARS = 2048
+REQUEST_ID_HEADER = "X-Request-Id"
 
 
 @dataclass(frozen=True)
@@ -132,14 +133,14 @@ class PdProxy:
         path: str,
         body: dict[str, Any],
     ) -> tuple[int, dict[str, str], bytes]:
-        decode, decode_body = await self.prepare_decode_request(path, body)
-        return await self._post_json(decode, path, decode_body)
+        decode, decode_body, headers = await self.prepare_decode_request(path, body)
+        return await self._post_json(decode, path, decode_body, headers=headers)
 
     async def prepare_decode_request(
         self,
         path: str,
         body: dict[str, Any],
-    ) -> tuple[Endpoint, dict[str, Any]]:
+    ) -> tuple[Endpoint, dict[str, Any], dict[str, str] | None]:
         prefill = next(self._prefill_cycle)
         decode = next(self._decode_cycle)
         if self.connector == "p2p_nccl":
@@ -152,11 +153,12 @@ class PdProxy:
                 prefill,
                 path,
                 prefill_body,
+                headers={REQUEST_ID_HEADER: request_id},
             )
             _raise_for_prefill_error(prefill, status, payload)
             decode_body = copy.deepcopy(body)
             decode_body["request_id"] = request_id
-            return decode, decode_body
+            return decode, decode_body, {REQUEST_ID_HEADER: request_id}
 
         prefill_body = build_nixl_prefill_body(body)
         status, _headers, prefill_payload = await self._post_json(
@@ -171,15 +173,21 @@ class PdProxy:
             raise web.HTTPBadGateway(
                 reason="prefill response missing kv_transfer_params"
             )
-        return decode, inject_kv_transfer_params(body, params)
+        return decode, inject_kv_transfer_params(body, params), None
 
     async def _post_json(
         self,
         endpoint: Endpoint,
         path: str,
         body: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
-        async with self.session.post(f"{endpoint.url}{path}", json=body) as response:
+        async with self.session.post(
+            f"{endpoint.url}{path}",
+            json=body,
+            headers=headers,
+        ) as response:
             payload = await response.read()
             return response.status, dict(response.headers), payload
 
@@ -276,8 +284,12 @@ async def _stream_completion(
     path: str,
     body: dict[str, Any],
 ) -> web.StreamResponse:
-    decode, decode_body = await proxy.prepare_decode_request(path, body)
-    async with proxy.session.post(f"{decode.url}{path}", json=decode_body) as response:
+    decode, decode_body, headers = await proxy.prepare_decode_request(path, body)
+    async with proxy.session.post(
+        f"{decode.url}{path}",
+        json=decode_body,
+        headers=headers,
+    ) as response:
         stream = web.StreamResponse(
             status=response.status,
             headers=_response_headers(response.headers),
