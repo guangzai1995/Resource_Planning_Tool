@@ -1,0 +1,20 @@
+{
+  "pid": 143491,
+  "run_id": "pd-test-0704-3",
+  "command": [
+    "/aipaas_test/miniconda3/bin/python3",
+    "/aipublic_jf_a40/sunlg/project/Resource_Planning_Tool/vllm_standalone_bench/auto_bench.py",
+    "run",
+    "--config",
+    "/aipublic_jf_a40/sunlg/project/Resource_Planning_Tool/vllm_standalone_bench/configs/auto_bench.vllm_pd_p2p_remote.example.json",
+    "--run-id",
+    "pd-test-0704-3",
+    "--child",
+    "--results-dir",
+    "vllm_standalone_bench/results",
+    "--lock-token",
+    "ffee69c3e080469fbf6d4725170fbc9f"
+  ],
+  "config_path": "/aipublic_jf_a40/sunlg/project/Resource_Planning_Tool/vllm_standalone_bench/configs/auto_bench.vllm_pd_p2p_remote.example.json",
+  "started_at": 1783099658.5613742
+}

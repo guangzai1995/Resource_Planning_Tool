@@ -1,0 +1,12 @@
+{
+  "run_id": "pd-test-0704-3",
+  "status": "interrupted",
+  "current": null,
+  "counts": {
+    "passed": 0,
+    "failed": 0,
+    "skipped": 0,
+    "running": 0,
+    "total": 3
+  }
+}
