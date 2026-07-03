@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +28,10 @@ def labels_from(argv):
         if separator:
             labels[key] = label_value
     return labels
+
+
+def kv_config_after(argv):
+    return json.loads(value_after(argv, "--kv-transfer-config"))
 
 
 def pd_topology_config(tmp_path):
@@ -65,8 +70,8 @@ def pd_topology_config(tmp_path):
             },
         },
         "prefill": [
-            {"name": "p1", "host": "p1", "port": 30000},
-            {"name": "p2", "host": "p2", "port": 30000},
+            {"name": "p1", "host": "p1", "port": 30000, "bootstrap_port": 12335},
+            {"name": "p2", "host": "p2", "port": 30000, "bootstrap_port": 12336},
         ],
         "decode": [
             {"name": "d1", "host": "d1", "port": 31000},
@@ -88,7 +93,6 @@ def test_sglang_pd_commands_render_worker_and_router_flags(tmp_path):
     topology["router_image"] = "sglang-router:offline"
     topology["network"] = "pd-net"
     topology["transfer_backend"] = "nixl"
-    topology["prefill"][0]["bootstrap_port"] = 12335
 
     config = ab.load_config(write_config(tmp_path, data))
     case = ab.expand_cases(config, run_id="run123")[0]
@@ -102,15 +106,20 @@ def test_sglang_pd_commands_render_worker_and_router_flags(tmp_path):
     pd_flag_index = router.index("--pd-disaggregation")
     assert router[pd_flag_index + 1] == "--prefill"
     assert "repeated" not in router
-    assert values_after(router, "--prefill") == [
-        "http://10.0.0.11:30000",
-        "http://10.0.0.12:30000",
+    prefill_positions = [
+        index for index, value in enumerate(router) if value == "--prefill"
+    ]
+    assert [
+        router[position + 1:position + 3]
+        for position in prefill_positions
+    ] == [
+        ("http://10.0.0.11:30000", "12335"),
+        ("http://10.0.0.12:30000", "12336"),
     ]
     assert values_after(router, "--decode") == [
         "http://10.0.0.21:31000",
         "http://10.0.0.22:31000",
     ]
-    assert "12335" not in values_after(router, "--prefill")
     assert (
         commands["p1"].container_name
         == "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-p1"
@@ -140,6 +149,14 @@ def test_sglang_pd_commands_include_expected_labels_and_masked_argv(tmp_path):
     assert labels["vllm_auto_bench.role_name"] == "p1"
 
 
+def test_sglang_pd_rejects_prefill_without_bootstrap_port(tmp_path):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["prefill"][0].pop("bootstrap_port")
+
+    with pytest.raises(ab.ConfigError, match="prefill.*bootstrap_port"):
+        ab.load_config(write_config(tmp_path, data))
+
+
 def test_sglang_pd_commands_render_disaggregation_ib_device(tmp_path):
     data = pd_topology_config(tmp_path)
     topology = data["topology_profiles"][0]
@@ -156,6 +173,136 @@ def test_sglang_pd_commands_render_disaggregation_ib_device(tmp_path):
     assert value_after(p1, "--disaggregation-ib-device") == "mlx5_0"
     assert value_after(d1, "--disaggregation-ib-device") == "mlx5_0"
     assert "--disaggregation-ib-device" not in router
+
+
+def test_vllm_pd_p2p_rejects_missing_kv_port(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "p2p_nccl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+
+    with pytest.raises(ab.ConfigError, match="kv_port"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_vllm_pd_nixl_rejects_missing_side_channel_port(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "nixl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+
+    with pytest.raises(ab.ConfigError, match="side_channel_port"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_vllm_pd_rejects_unknown_structured_key(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {
+        "connector": "p2p_nccl",
+        "proxy": {"kind": "builtin"},
+        "unknown": True,
+    }
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+
+    with pytest.raises(ab.ConfigError, match="unknown"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_vllm_pd_p2p_commands_render_structured_builtin_proxy(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {
+        "connector": "p2p_nccl",
+        "proxy": {"kind": "builtin"},
+        "p2p_send_type": "PUT_ASYNC",
+        "nccl_num_channels": 16,
+    }
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+    topology["prefill"][0]["kv_port"] = 21001
+    topology["prefill"][1]["kv_port"] = 21002
+    topology["decode"][0]["kv_port"] = 22001
+    topology["decode"][1]["kv_port"] = 22002
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1_config = kv_config_after(commands["p1"].argv)
+    assert p1_config["kv_connector"] == "P2pNcclConnector"
+    assert p1_config["kv_role"] == "kv_producer"
+    assert p1_config["kv_port"] == 21001
+    assert "kv_rank" not in p1_config
+    assert "kv_parallel_size" not in p1_config
+    assert p1_config["kv_connector_extra_config"] == {
+        "http_port": 30000,
+        "send_type": "PUT_ASYNC",
+        "nccl_num_channels": 16,
+    }
+
+    d1_config = kv_config_after(commands["d1"].argv)
+    assert d1_config["kv_connector"] == "P2pNcclConnector"
+    assert d1_config["kv_role"] == "kv_consumer"
+    assert d1_config["kv_port"] == 22001
+
+    frontend = commands["router"].argv
+    assert "vllm_bench.pd_proxy" in frontend
+    assert value_after(frontend, "--connector") == "p2p_nccl"
+    assert value_after(frontend, "--port") == "8000"
+    assert len(values_after(frontend, "--prefill")) == 2
+    assert len(values_after(frontend, "--decode")) == 2
+    first_prefill = json.loads(values_after(frontend, "--prefill")[0])
+    assert first_prefill == {
+        "name": "p1",
+        "url": "http://10.0.0.11:30000",
+        "kv_address": "10.0.0.11:21001",
+    }
+
+
+def test_vllm_pd_nixl_commands_render_side_channel_env(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "nixl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+    topology["prefill"][0]["side_channel_port"] = 5601
+    topology["prefill"][1]["side_channel_port"] = 5602
+    topology["decode"][0]["side_channel_port"] = 5701
+    topology["decode"][1]["side_channel_port"] = 5702
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1_config = kv_config_after(commands["p1"].argv)
+    assert p1_config == {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_producer",
+    }
+    p1_env = values_after(commands["p1"].argv, "-e")
+    assert "VLLM_NIXL_SIDE_CHANNEL_HOST=10.0.0.11" in p1_env
+    assert "VLLM_NIXL_SIDE_CHANNEL_PORT=5601" in p1_env
+
+    d1_config = kv_config_after(commands["d1"].argv)
+    assert d1_config == {
+        "kv_connector": "NixlConnector",
+        "kv_role": "kv_consumer",
+    }
+    frontend = commands["router"].argv
+    first_prefill = json.loads(values_after(frontend, "--prefill")[0])
+    assert first_prefill == {
+        "name": "p1",
+        "url": "http://10.0.0.11:30000",
+    }
 
 
 def test_vllm_pd_worker_command_renders_kv_template(tmp_path):
@@ -284,6 +431,20 @@ def test_config_to_dict_masks_inline_password(tmp_path):
         resolved["topology_profiles"][0]["hosts"]["p1"]["auth"].get("password")
         == "***"
     )
+
+
+@pytest.mark.parametrize("filename", [
+    "auto_bench.vllm_pd_p2p_remote.example.json",
+    "auto_bench.vllm_pd_nixl_remote.example.json",
+])
+def test_vllm_pd_example_configs_load(filename):
+    config = ab.load_config(
+        Path("vllm_standalone_bench/configs") / filename
+    )
+
+    assert len(config.topology_profiles) == 1
+    assert config.topology_profiles[0].engine == "vllm"
+    assert config.topology_profiles[0].vllm_pd is not None
 
 
 def test_topology_profile_name_cannot_duplicate_serve_profile(tmp_path):

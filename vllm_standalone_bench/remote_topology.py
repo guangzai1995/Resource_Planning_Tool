@@ -31,6 +31,8 @@ class TopologyNode:
     host: str
     port: int
     bootstrap_port: int | None = None
+    kv_port: int | None = None
+    side_channel_port: int | None = None
     gpus: str = "all"
     args: tuple[str, ...] = field(default_factory=tuple)
     env: Mapping[str, str] = field(
@@ -47,6 +49,14 @@ class TopologyFrontend:
     image: str | None = None
     command: tuple[str, ...] = field(default_factory=tuple)
     args: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class VllmPdConfig:
+    connector: str
+    proxy_kind: str = "builtin"
+    p2p_send_type: str = "PUT_ASYNC"
+    nccl_num_channels: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +86,7 @@ class TopologyProfile:
         default_factory=lambda: types.MappingProxyType({})
     )
     disaggregation_ib_device: str | None = None
+    vllm_pd: VllmPdConfig | None = None
     env: Mapping[str, str] = field(
         default_factory=lambda: types.MappingProxyType({})
     )
@@ -223,7 +234,16 @@ class TopologyProfile:
         ])
         for node in self.prefill:
             host = self.hosts[node.host]
-            argv.extend(["--prefill", f"http://{host.address}:{node.port}"])
+            if node.bootstrap_port is None:
+                raise _config_error(
+                    f"topology profile {self.name} prefill node {node.name} "
+                    "bootstrap_port is required for sglang pd"
+                )
+            argv.extend([
+                "--prefill",
+                f"http://{host.address}:{node.port}",
+                str(node.bootstrap_port),
+            ])
         for node in self.decode:
             host = self.hosts[node.host]
             argv.extend(["--decode", f"http://{host.address}:{node.port}"])
@@ -242,6 +262,16 @@ class TopologyProfile:
         )
 
     def _build_vllm_pd_commands(
+        self,
+        config: Any,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+    ) -> dict[str, RoleCommand]:
+        if self.vllm_pd is None:
+            return self._build_legacy_vllm_pd_commands(config, case, run_dir)
+        return self._build_structured_vllm_pd_commands(config, case, run_dir)
+
+    def _build_legacy_vllm_pd_commands(
         self,
         config: Any,
         case: Any,
@@ -281,6 +311,86 @@ class TopologyProfile:
         )
         return commands
 
+    def _build_structured_vllm_pd_commands(
+        self,
+        config: Any,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+    ) -> dict[str, RoleCommand]:
+        image = self._worker_image(config)
+        commands: dict[str, RoleCommand] = {}
+        for node in self.prefill:
+            commands[node.name] = self._build_vllm_worker_command(
+                config,
+                case,
+                run_dir,
+                node,
+                kv_role="kv_producer",
+                image=image,
+                kv_config=self._structured_vllm_kv_config(
+                    node,
+                    kv_role="kv_producer",
+                ),
+                extra_env=self._structured_vllm_node_env(node),
+            )
+        for node in self.decode:
+            commands[node.name] = self._build_vllm_worker_command(
+                config,
+                case,
+                run_dir,
+                node,
+                kv_role="kv_consumer",
+                image=image,
+                kv_config=self._structured_vllm_kv_config(
+                    node,
+                    kv_role="kv_consumer",
+                ),
+                extra_env=self._structured_vllm_node_env(node),
+            )
+        commands[self.frontend.host] = self._build_builtin_vllm_pd_proxy_command(
+            config,
+            case,
+            run_dir,
+        )
+        return commands
+
+    def _structured_vllm_kv_config(
+        self,
+        node: TopologyNode,
+        *,
+        kv_role: str,
+    ) -> dict[str, Any]:
+        if self.vllm_pd is None:
+            raise _config_error(
+                f"topology profile {self.name} vllm_pd is required"
+            )
+        if self.vllm_pd.connector == "p2p_nccl":
+            extra: dict[str, Any] = {
+                "http_port": node.port,
+                "send_type": self.vllm_pd.p2p_send_type,
+            }
+            if self.vllm_pd.nccl_num_channels is not None:
+                extra["nccl_num_channels"] = self.vllm_pd.nccl_num_channels
+            return {
+                "kv_connector": "P2pNcclConnector",
+                "kv_role": kv_role,
+                "kv_port": node.kv_port,
+                "kv_connector_extra_config": extra,
+            }
+        return {
+            "kv_connector": "NixlConnector",
+            "kv_role": kv_role,
+        }
+
+    def _structured_vllm_node_env(self, node: TopologyNode) -> Mapping[str, str]:
+        if self.vllm_pd is None or self.vllm_pd.connector != "nixl":
+            return types.MappingProxyType({})
+        host = self.hosts[node.host]
+        return {
+            "VLLM_NIXL_SIDE_CHANNEL_HOST": host.address,
+            "VLLM_NIXL_SIDE_CHANNEL_PORT": str(node.side_channel_port),
+        }
+
     def _build_vllm_worker_command(
         self,
         config: Any,
@@ -289,10 +399,31 @@ class TopologyProfile:
         node: TopologyNode,
         *,
         kv_role: str,
-        kv_rank: int,
-        kv_parallel_size: int,
         image: str,
+        kv_rank: int | None = None,
+        kv_parallel_size: int | None = None,
+        kv_config: Mapping[str, Any] | None = None,
+        extra_env: Mapping[str, str] | None = None,
     ) -> RoleCommand:
+        if kv_config is None:
+            if kv_rank is None or kv_parallel_size is None:
+                raise _config_error(
+                    f"topology profile {self.name} kv_rank and "
+                    "kv_parallel_size are required for legacy vllm pd"
+                )
+            kv_config_text = self._render_kv_transfer_config(
+                case,
+                node,
+                kv_role=kv_role,
+                kv_rank=kv_rank,
+                kv_parallel_size=kv_parallel_size,
+            )
+        else:
+            kv_config_text = json.dumps(
+                kv_config,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
         argv = self._docker_run_base(
             case,
             run_dir,
@@ -308,7 +439,7 @@ class TopologyProfile:
             "-v",
             f"{config.mounts.models}:/models:ro",
         ])
-        self._append_env_and_volumes(argv, node)
+        self._append_env_and_volumes(argv, node, extra_env=extra_env)
         argv.extend([
             "--entrypoint",
             "vllm",
@@ -322,13 +453,7 @@ class TopologyProfile:
             "--port",
             str(node.port),
             "--kv-transfer-config",
-            self._render_kv_transfer_config(
-                case,
-                node,
-                kv_role=kv_role,
-                kv_rank=kv_rank,
-                kv_parallel_size=kv_parallel_size,
-            ),
+            kv_config_text,
         ])
         argv.extend(node.args)
         return _role_command(
@@ -337,6 +462,73 @@ class TopologyProfile:
             container_name=_container_name(case, self.name, node.name),
             argv=argv,
         )
+
+    def _build_builtin_vllm_pd_proxy_command(
+        self,
+        config: Any,
+        case: Any,
+        run_dir: os.PathLike[str] | str,
+    ) -> RoleCommand:
+        if self.frontend.kind != "builtin":
+            raise _config_error(
+                f"topology profile {self.name} frontend.kind must be builtin "
+                "for structured vllm pd"
+            )
+        if self.vllm_pd is None:
+            raise _config_error(
+                f"topology profile {self.name} vllm_pd is required"
+            )
+        image = self.frontend.image or config.run.bench_image
+        argv = self._docker_run_base(
+            case,
+            run_dir,
+            self.frontend.host,
+            self.frontend.host,
+            "frontend",
+        )
+        argv.extend([
+            "--network",
+            self.network,
+        ])
+        self._append_env_and_volumes(argv, None)
+        argv.extend([
+            "--entrypoint",
+            "python",
+            image,
+            "-m",
+            "vllm_bench.pd_proxy",
+            "--connector",
+            self.vllm_pd.connector,
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(self.frontend.port),
+        ])
+        for node in self.prefill:
+            argv.extend(["--prefill", self._vllm_pd_proxy_endpoint_json(node)])
+        for node in self.decode:
+            argv.extend(["--decode", self._vllm_pd_proxy_endpoint_json(node)])
+        argv.extend(self.frontend.args)
+        return _role_command(
+            role_name=self.frontend.host,
+            host_name=self.frontend.host,
+            container_name=_container_name(case, self.name, self.frontend.host),
+            argv=argv,
+        )
+
+    def _vllm_pd_proxy_endpoint_json(self, node: TopologyNode) -> str:
+        if self.vllm_pd is None:
+            raise _config_error(
+                f"topology profile {self.name} vllm_pd is required"
+            )
+        host = self.hosts[node.host]
+        payload: dict[str, Any] = {
+            "name": node.name,
+            "url": f"http://{host.address}:{node.port}",
+        }
+        if self.vllm_pd.connector == "p2p_nccl":
+            payload["kv_address"] = f"{host.address}:{node.kv_port}"
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
 
     def _build_external_frontend_command(
         self,
@@ -476,10 +668,14 @@ class TopologyProfile:
         self,
         argv: list[str],
         node: TopologyNode | None,
+        *,
+        extra_env: Mapping[str, str] | None = None,
     ) -> None:
         env = dict(self.env)
         if node is not None:
             env.update(node.env)
+        if extra_env:
+            env.update(extra_env)
         for name, value in env.items():
             argv.extend(["-e", f"{name}={value}"])
         for volume in self.volumes:
@@ -556,7 +752,22 @@ def parse_topology_profiles(
             hosts,
             error,
         )
+        vllm_pd = _parse_vllm_pd_config(
+            profile.get("vllm_pd"),
+            f"{path}.vllm_pd",
+            error,
+        )
         _validate_role_names_unique(path, name, prefill, decode, frontend, error)
+        _validate_topology_profile(
+            path,
+            name,
+            engine,
+            prefill,
+            decode,
+            frontend,
+            vllm_pd,
+            error,
+        )
         parsed.append(TopologyProfile(
             name=name,
             engine=engine,
@@ -588,6 +799,7 @@ def parse_topology_profiles(
                 f"{path}.disaggregation_ib_device",
                 error,
             ),
+            vllm_pd=vllm_pd,
             env=_string_mapping(profile.get("env"), f"{path}.env", error),
             volumes=_string_tuple(profile.get("volumes", []), f"{path}.volumes", error),
         ))
@@ -687,6 +899,52 @@ def _validate_json_template_value(
     raise error(f"{path} must contain JSON-compatible values")
 
 
+def _parse_vllm_pd_config(
+    value: Any,
+    path: str,
+    error: ErrorFactory,
+) -> VllmPdConfig | None:
+    if value is None:
+        return None
+    raw = _mapping(value, path, error)
+    allowed = {"connector", "proxy", "p2p_send_type", "nccl_num_channels"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise error(f"{path} contains unsupported keys: {', '.join(unknown)}")
+    connector = _string(
+        _required(raw, "connector", f"{path}.connector", error),
+        f"{path}.connector",
+        error,
+    )
+    if connector not in {"p2p_nccl", "nixl"}:
+        raise error(f"{path}.connector must be one of p2p_nccl, nixl")
+    proxy = _mapping(raw.get("proxy", {"kind": "builtin"}), f"{path}.proxy", error)
+    proxy_unknown = sorted(set(proxy) - {"kind"})
+    if proxy_unknown:
+        raise error(
+            f"{path}.proxy contains unsupported keys: "
+            + ", ".join(proxy_unknown)
+        )
+    proxy_kind = _string(proxy.get("kind", "builtin"), f"{path}.proxy.kind", error)
+    if proxy_kind != "builtin":
+        raise error(f"{path}.proxy.kind only supports builtin")
+    p2p_send_type = _string(
+        raw.get("p2p_send_type", "PUT_ASYNC"),
+        f"{path}.p2p_send_type",
+        error,
+    )
+    return VllmPdConfig(
+        connector=connector,
+        proxy_kind=proxy_kind,
+        p2p_send_type=p2p_send_type,
+        nccl_num_channels=_optional_positive_int(
+            raw.get("nccl_num_channels"),
+            f"{path}.nccl_num_channels",
+            error,
+        ),
+    )
+
+
 def _parse_auth(
     value: Any,
     path: str,
@@ -781,6 +1039,48 @@ def _validate_role_names_unique(
         )
 
 
+def _validate_topology_profile(
+    path: str,
+    profile_name: str,
+    engine: str,
+    prefill: tuple[TopologyNode, ...],
+    decode: tuple[TopologyNode, ...],
+    frontend: TopologyFrontend,
+    vllm_pd: VllmPdConfig | None,
+    error: ErrorFactory,
+) -> None:
+    if engine == "sglang":
+        for node in prefill:
+            if node.bootstrap_port is None:
+                raise error(
+                    f"{path} ({profile_name}) prefill node {node.name} "
+                    "bootstrap_port is required for sglang pd"
+                )
+        return
+    if engine != "vllm" or vllm_pd is None:
+        return
+    if frontend.kind != "builtin":
+        raise error(
+            f"{path} ({profile_name}) frontend.kind must be builtin when "
+            "structured vllm_pd is used"
+        )
+    if vllm_pd.connector == "p2p_nccl":
+        for node in (*prefill, *decode):
+            if node.kv_port is None:
+                raise error(
+                    f"{path} ({profile_name}) node {node.name} kv_port is "
+                    "required for p2p_nccl"
+                )
+        return
+    if vllm_pd.connector == "nixl":
+        for node in (*prefill, *decode):
+            if node.side_channel_port is None:
+                raise error(
+                    f"{path} ({profile_name}) node {node.name} "
+                    "side_channel_port is required for nixl"
+                )
+
+
 def _parse_nodes(
     value: Any,
     path: str,
@@ -806,6 +1106,16 @@ def _parse_nodes(
             bootstrap_port=_optional_positive_int(
                 node.get("bootstrap_port"),
                 f"{node_path}.bootstrap_port",
+                error,
+            ),
+            kv_port=_optional_positive_int(
+                node.get("kv_port"),
+                f"{node_path}.kv_port",
+                error,
+            ),
+            side_channel_port=_optional_positive_int(
+                node.get("side_channel_port"),
+                f"{node_path}.side_channel_port",
                 error,
             ),
             gpus=_string(node.get("gpus", "all"), f"{node_path}.gpus", error),

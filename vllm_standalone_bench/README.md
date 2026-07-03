@@ -174,6 +174,28 @@ python3 vllm_standalone_bench/auto_bench.py run \
   --dry-run
 ```
 
+vLLM PD topology 使用结构化 `vllm_pd.connector` 配置，当前支持
+`p2p_nccl` 和 `nixl`。P2P/NCCL 每个 prefill/decode 节点都需要
+`kv_port`，内置 proxy 会把配置的 KV 地址写入请求 `request_id`；NIXL
+每个节点都需要 `side_channel_port`，容器启动命令会注入
+`VLLM_NIXL_SIDE_CHANNEL_HOST` 和 `VLLM_NIXL_SIDE_CHANNEL_PORT`。
+
+内置 vLLM PD proxy 来自 bench-runner 镜像，启动入口是
+`python -m vllm_bench.pd_proxy`。本地测试覆盖命令渲染和 proxy 请求编排；
+真实 GPU P2P/NCCL 或 NIXL 跨节点传输仍需要在目标机器上验证。
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.vllm_pd_p2p_remote.example.json \
+  --run-id vllm_pd_p2p_dry_run_001 \
+  --dry-run
+
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.vllm_pd_nixl_remote.example.json \
+  --run-id vllm_pd_nixl_dry_run_001 \
+  --dry-run
+```
+
 示例中的 `192.0.2.x` 是 RFC 5737 文档地址，只适合 dry-run/示例；实际运行前需要替换 host 地址、镜像名、远程模型路径和 SSH auth。
 
 准备好 vLLM 镜像、bench-runner 镜像和完整模型后，运行真实 smoke：

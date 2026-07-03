@@ -1,0 +1,54 @@
+{
+  "run": {
+    "name": "vllm_pd_p2p_remote_bench",
+    "results_dir": "vllm_standalone_bench/results",
+    "bench_image": "vllm-bench-runner:offline",
+    "api_key": "local-bench-key",
+    "ready_timeout_sec": 1800
+  },
+  "mounts": {"models": "/models", "datasets": "/datasets"},
+  "models": [{
+    "name": "glm52",
+    "model_path": "/models/GLM-5.2-FP8",
+    "tokenizer_path": "/models/GLM-5.2-FP8",
+    "served_model_name": "GLM-5.2"
+  }],
+  "topology_profiles": [{
+    "name": "vllm_pd_p2p_2p2d",
+    "engine": "vllm",
+    "mode": "pd",
+    "provider": "ssh_docker",
+    "network": "host",
+    "image": "vllm/vllm-openai:0.23.0",
+    "vllm_pd": {
+      "connector": "p2p_nccl",
+      "proxy": {"kind": "builtin"},
+      "p2p_send_type": "PUT_ASYNC",
+      "nccl_num_channels": 16
+    },
+    "hosts": {
+      "p1": {"address": "192.0.2.11", "ssh_user": "root", "auth": {"type": "key"}},
+      "p2": {"address": "192.0.2.12", "ssh_user": "root", "auth": {"type": "key"}},
+      "d1": {"address": "192.0.2.21", "ssh_user": "root", "auth": {"type": "key"}},
+      "d2": {"address": "192.0.2.22", "ssh_user": "root", "auth": {"type": "key"}},
+      "router": {"address": "192.0.2.30", "ssh_user": "root", "auth": {"type": "key"}}
+    },
+    "prefill": [
+      {"name": "p1", "host": "p1", "port": 30000, "kv_port": 21001, "gpus": "0", "args": ["--tensor-parallel-size", "1"]},
+      {"name": "p2", "host": "p2", "port": 30000, "kv_port": 21002, "gpus": "0", "args": ["--tensor-parallel-size", "1"]}
+    ],
+    "decode": [
+      {"name": "d1", "host": "d1", "port": 30001, "kv_port": 22001, "gpus": "0", "args": ["--tensor-parallel-size", "1"]},
+      {"name": "d2", "host": "d2", "port": 30001, "kv_port": 22002, "gpus": "0", "args": ["--tensor-parallel-size", "1"]}
+    ],
+    "frontend": {"kind": "builtin", "host": "router", "port": 8000}
+  }],
+  "bench_profiles": [{
+    "name": "latency_matrix",
+    "backend": "openai-chat",
+    "input_lens": [512],
+    "output_lens": [256],
+    "parallel_nums": [1],
+    "epochs": 1
+  }]
+}
