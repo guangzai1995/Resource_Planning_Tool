@@ -442,9 +442,36 @@ def test_vllm_pd_example_configs_load(filename):
         Path("vllm_standalone_bench/configs") / filename
     )
 
-    assert len(config.topology_profiles) == 1
-    assert config.topology_profiles[0].engine == "vllm"
-    assert config.topology_profiles[0].vllm_pd is not None
+    assert config.topology_profiles
+    assert all(profile.engine == "vllm" for profile in config.topology_profiles)
+    assert all(profile.vllm_pd is not None for profile in config.topology_profiles)
+
+
+def test_minimax_p2p_compare_config_expands_all_profiles():
+    config = ab.load_config(
+        Path("vllm_standalone_bench/configs")
+        / "auto_bench.vllm_pd_p2p_remote.example.json"
+    )
+    cases = ab.expand_cases(config, run_id="minimax_compare")
+
+    assert [profile.name for profile in config.serve_profiles] == [
+        "minimax_tp8_single",
+    ]
+    assert [profile.name for profile in config.topology_profiles] == [
+        "vllm_pd_p2p_minimax_m27_2p2d",
+        "vllm_pd_p2p_minimax_m27_3p1d",
+        "vllm_pd_p2p_minimax_m27_1p3d",
+    ]
+    assert [case.serve_profile.name for case in cases if case.serve_profile] == [
+        "minimax_tp8_single",
+    ]
+    assert [
+        case.topology_profile.name for case in cases if case.topology_profile
+    ] == [
+        "vllm_pd_p2p_minimax_m27_2p2d",
+        "vllm_pd_p2p_minimax_m27_3p1d",
+        "vllm_pd_p2p_minimax_m27_1p3d",
+    ]
 
 
 def test_topology_profile_name_cannot_duplicate_serve_profile(tmp_path):
