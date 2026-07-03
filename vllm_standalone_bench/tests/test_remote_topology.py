@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -430,6 +431,20 @@ def test_config_to_dict_masks_inline_password(tmp_path):
         resolved["topology_profiles"][0]["hosts"]["p1"]["auth"].get("password")
         == "***"
     )
+
+
+@pytest.mark.parametrize("filename", [
+    "auto_bench.vllm_pd_p2p_remote.example.json",
+    "auto_bench.vllm_pd_nixl_remote.example.json",
+])
+def test_vllm_pd_example_configs_load(filename):
+    config = ab.load_config(
+        Path("vllm_standalone_bench/configs") / filename
+    )
+
+    assert len(config.topology_profiles) == 1
+    assert config.topology_profiles[0].engine == "vllm"
+    assert config.topology_profiles[0].vllm_pd is not None
 
 
 def test_topology_profile_name_cannot_duplicate_serve_profile(tmp_path):
