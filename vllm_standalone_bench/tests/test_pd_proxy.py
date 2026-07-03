@@ -12,6 +12,36 @@ from vllm_bench.pd_proxy import (
 )
 
 
+def test_parse_args_accepts_builtin_proxy_command():
+    from vllm_bench.pd_proxy import parse_args
+
+    args = parse_args([
+        "--connector",
+        "p2p_nccl",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--prefill",
+        json.dumps({
+            "name": "p1",
+            "url": "http://p1:30000",
+            "kv_address": "p1:21001",
+        }),
+        "--decode",
+        json.dumps({
+            "name": "d1",
+            "url": "http://d1:31000",
+            "kv_address": "d1:22001",
+        }),
+    ])
+
+    assert args.connector == "p2p_nccl"
+    assert args.host == "0.0.0.0"
+    assert args.port == 8000
+    assert args.prefill[0].name == "p1"
+
+
 def test_parse_endpoint_accepts_json_with_kv_address():
     endpoint = parse_endpoint(json.dumps({
         "name": "p1",

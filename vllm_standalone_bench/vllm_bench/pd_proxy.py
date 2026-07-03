@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import copy
 import itertools
 import json
@@ -8,7 +9,20 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from aiohttp import web
+from aiohttp import ClientSession, web
+
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
 
 
 @dataclass(frozen=True)
@@ -19,7 +33,12 @@ class Endpoint:
 
 
 def parse_endpoint(value: str) -> Endpoint:
-    raw = json.loads(value)
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(
+            "endpoint must be a JSON object"
+        ) from exc
     if not isinstance(raw, dict):
         raise argparse.ArgumentTypeError("endpoint must be a JSON object")
     name = raw.get("name")
@@ -111,6 +130,14 @@ class PdProxy:
         path: str,
         body: dict[str, Any],
     ) -> tuple[int, dict[str, str], bytes]:
+        decode, decode_body = await self.prepare_decode_request(path, body)
+        return await self._post_json(decode, path, decode_body)
+
+    async def prepare_decode_request(
+        self,
+        path: str,
+        body: dict[str, Any],
+    ) -> tuple[Endpoint, dict[str, Any]]:
         prefill = next(self._prefill_cycle)
         decode = next(self._decode_cycle)
         if self.connector == "p2p_nccl":
@@ -122,7 +149,7 @@ class PdProxy:
             await self._post_json(prefill, path, prefill_body)
             decode_body = copy.deepcopy(body)
             decode_body["request_id"] = request_id
-            return await self._post_json(decode, path, decode_body)
+            return decode, decode_body
 
         prefill_body = build_nixl_prefill_body(body)
         _status, _headers, prefill_payload = await self._post_json(
@@ -136,11 +163,7 @@ class PdProxy:
             raise web.HTTPBadGateway(
                 reason="prefill response missing kv_transfer_params"
             )
-        return await self._post_json(
-            decode,
-            path,
-            inject_kv_transfer_params(body, params),
-        )
+        return decode, inject_kv_transfer_params(body, params)
 
     async def _post_json(
         self,
@@ -157,3 +180,123 @@ def _required_kv_address(endpoint: Endpoint) -> str:
     if endpoint.kv_address is None:
         raise web.HTTPBadGateway(reason=f"{endpoint.name} missing kv_address")
     return endpoint.kv_address
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="vLLM PD proxy")
+    parser.add_argument("--connector", choices=("p2p_nccl", "nixl"), required=True)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument(
+        "--prefill",
+        action="append",
+        type=parse_endpoint,
+        required=True,
+    )
+    parser.add_argument(
+        "--decode",
+        action="append",
+        type=parse_endpoint,
+        required=True,
+    )
+    return parser.parse_args(argv)
+
+
+async def health(_request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+async def root_v1(_request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+def create_app(proxy: PdProxy) -> web.Application:
+    app = web.Application()
+    app["proxy"] = proxy
+    app.router.add_get("/health", health)
+    app.router.add_get("/v1", root_v1)
+    app.router.add_get("/v1/models", handle_models)
+    app.router.add_post("/v1/completions", handle_completion)
+    app.router.add_post("/v1/chat/completions", handle_completion)
+    return app
+
+
+async def handle_completion(request: web.Request) -> web.StreamResponse:
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(reason="request body must be a JSON object")
+    proxy: PdProxy = request.app["proxy"]
+    if body.get("stream") is True:
+        return await _stream_completion(request, proxy, request.path, body)
+    status, headers, payload = await proxy.handle_json_completion(
+        request.path,
+        body,
+    )
+    return web.Response(
+        body=payload,
+        status=status,
+        headers=_response_headers(headers),
+    )
+
+
+async def _stream_completion(
+    request: web.Request,
+    proxy: PdProxy,
+    path: str,
+    body: dict[str, Any],
+) -> web.StreamResponse:
+    decode, decode_body = await proxy.prepare_decode_request(path, body)
+    async with proxy.session.post(f"{decode.url}{path}", json=decode_body) as response:
+        stream = web.StreamResponse(
+            status=response.status,
+            headers=_response_headers(response.headers),
+        )
+        await stream.prepare(request)
+        async for chunk in response.content.iter_any():
+            await stream.write(chunk)
+        await stream.write_eof()
+        return stream
+
+
+async def handle_models(request: web.Request) -> web.StreamResponse:
+    proxy: PdProxy = request.app["proxy"]
+    endpoint = proxy.decode[0] if proxy.decode else proxy.prefill[0]
+    async with proxy.session.get(f"{endpoint.url}/v1/models") as response:
+        payload = await response.read()
+        return web.Response(
+            body=payload,
+            status=response.status,
+            headers=_response_headers(response.headers),
+        )
+
+
+def _response_headers(headers: Any) -> dict[str, str]:
+    return {
+        str(key): str(value)
+        for key, value in headers.items()
+        if str(key).lower() not in HOP_BY_HOP_HEADERS
+    }
+
+
+async def _async_main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    async with ClientSession() as session:
+        proxy = PdProxy(
+            connector=args.connector,
+            prefill=args.prefill,
+            decode=args.decode,
+            session=session,
+        )
+        runner = web.AppRunner(create_app(proxy))
+        await runner.setup()
+        site = web.TCPSite(runner, args.host, args.port)
+        await site.start()
+        await asyncio.Event().wait()
+
+
+def main() -> None:
+    asyncio.run(_async_main())
+
+
+if __name__ == "__main__":
+    main()
