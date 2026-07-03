@@ -1,20 +1,22 @@
 {
   "run": {
-    "name": "vllm_pd_p2p_remote_bench",
+    "name": "vllm_pd_p2p_minimax_m27_remote_bench",
     "results_dir": "vllm_standalone_bench/results",
     "bench_image": "vllm-bench-runner:offline",
     "api_key": "local-bench-key",
-    "ready_timeout_sec": 1800
+    "ready_timeout_sec": 3600
   },
-  "mounts": {"models": "/models", "datasets": "/datasets"},
+  "mounts": {
+    "models": "/NVME1/models"
+  },
   "models": [{
-    "name": "glm52",
-    "model_path": "/models/GLM-5.2-FP8",
-    "tokenizer_path": "/models/GLM-5.2-FP8",
-    "served_model_name": "GLM-5.2"
+    "name": "MINIMAX-M2.7",
+    "model_path": "/models/MiniMax-M2.7-NVFP4",
+    "tokenizer_path": "/models/MiniMax-M2.7-NVFP4",
+    "served_model_name": "minimax-m2.7"
   }],
   "topology_profiles": [{
-    "name": "vllm_pd_p2p_2p2d",
+    "name": "vllm_pd_p2p_minimax_m27_2p2d",
     "engine": "vllm",
     "mode": "pd",
     "provider": "ssh_docker",
@@ -27,28 +29,115 @@
       "nccl_num_channels": 16
     },
     "hosts": {
-      "p1": {"address": "192.0.2.11", "ssh_user": "root", "auth": {"type": "key"}},
-      "p2": {"address": "192.0.2.12", "ssh_user": "root", "auth": {"type": "key"}},
-      "d1": {"address": "192.0.2.21", "ssh_user": "root", "auth": {"type": "key"}},
-      "d2": {"address": "192.0.2.22", "ssh_user": "root", "auth": {"type": "key"}},
-      "router": {"address": "192.0.2.30", "ssh_user": "root", "auth": {"type": "key"}}
+      "p1": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
+      "p2": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
+      "d1": {"address": "10.200.1.14", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
+      "d2": {"address": "10.200.1.14", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
+      "router": {"address": "10.200.1.14", "ssh_user": "aipaas_test", "auth": {"type": "key"}}
     },
     "prefill": [
-      {"name": "p1", "host": "p1", "port": 30000, "kv_port": 21001, "gpus": "0", "args": ["--tensor-parallel-size", "1"]},
-      {"name": "p2", "host": "p2", "port": 30000, "kv_port": 21002, "gpus": "0", "args": ["--tensor-parallel-size", "1"]}
+      {
+        "name": "p1",
+        "host": "p1",
+        "port": 4137,
+        "kv_port": 21001,
+        "gpus": "0,1,2,3",
+        "args": [
+          "--tensor-parallel-size", "4",
+          "--trust-remote-code",
+          "--quantization", "compressed-tensors",
+          "--kv-cache-dtype", "fp8",
+          "--gpu-memory-utilization", "0.92",
+          "--max-num-seqs", "96",
+          "--enable-chunked-prefill",
+          "--enable-auto-tool-choice",
+          "--tool-call-parser", "minimax_m2",
+          "--enable-force-include-usage",
+          "--enable-prompt-tokens-details",
+          "--reasoning-parser", "minimax_m2"
+        ]
+      },
+      {
+        "name": "p2",
+        "host": "p2",
+        "port": 4138,
+        "kv_port": 21002,
+        "gpus": "4,5,6,7",
+        "args": [
+          "--tensor-parallel-size", "4",
+          "--trust-remote-code",
+          "--quantization", "compressed-tensors",
+          "--kv-cache-dtype", "fp8",
+          "--gpu-memory-utilization", "0.92",
+          "--max-num-seqs", "96",
+          "--enable-chunked-prefill",
+          "--enable-auto-tool-choice",
+          "--tool-call-parser", "minimax_m2",
+          "--enable-force-include-usage",
+          "--enable-prompt-tokens-details",
+          "--reasoning-parser", "minimax_m2"
+        ]
+      }
     ],
     "decode": [
-      {"name": "d1", "host": "d1", "port": 30001, "kv_port": 22001, "gpus": "0", "args": ["--tensor-parallel-size", "1"]},
-      {"name": "d2", "host": "d2", "port": 30001, "kv_port": 22002, "gpus": "0", "args": ["--tensor-parallel-size", "1"]}
+      {
+        "name": "d1",
+        "host": "d1",
+        "port": 4137,
+        "kv_port": 22001,
+        "gpus": "0,1,2,3",
+        "args": [
+          "--tensor-parallel-size", "4",
+          "--trust-remote-code",
+          "--quantization", "compressed-tensors",
+          "--kv-cache-dtype", "fp8",
+          "--gpu-memory-utilization", "0.92",
+          "--max-num-seqs", "96",
+          "--enable-chunked-prefill",
+          "--enable-auto-tool-choice",
+          "--tool-call-parser", "minimax_m2",
+          "--enable-force-include-usage",
+          "--enable-prompt-tokens-details",
+          "--reasoning-parser", "minimax_m2"
+        ]
+      },
+      {
+        "name": "d2",
+        "host": "d2",
+        "port": 4138,
+        "kv_port": 22002,
+        "gpus": "4,5,6,7",
+        "args": [
+          "--tensor-parallel-size", "4",
+          "--trust-remote-code",
+          "--quantization", "compressed-tensors",
+          "--kv-cache-dtype", "fp8",
+          "--gpu-memory-utilization", "0.92",
+          "--max-num-seqs", "96",
+          "--enable-chunked-prefill",
+          "--enable-auto-tool-choice",
+          "--tool-call-parser", "minimax_m2",
+          "--enable-force-include-usage",
+          "--enable-prompt-tokens-details",
+          "--reasoning-parser", "minimax_m2"
+        ]
+      }
     ],
     "frontend": {"kind": "builtin", "host": "router", "port": 8000}
   }],
   "bench_profiles": [{
     "name": "latency_matrix",
     "backend": "openai-chat",
-    "input_lens": [512],
-    "output_lens": [256],
-    "parallel_nums": [1],
-    "epochs": 1
+    "input_lens": [4096, 8192, 16384, 32768, 65536, 131072],
+    "output_lens": [1024],
+    "parallel_nums": [1, 4, 8, 16, 24, 32],
+    "epochs": 3,
+    "prefix_ratio": 0.65,
+    "warmup_requests": 4,
+    "warmup_concurrency": 8,
+    "cross_product": true,
+    "max_ttft_ms": 15000,
+    "min_throughput_tok_s": 5,
+    "min_output_compliance": 0.95
   }]
 }
