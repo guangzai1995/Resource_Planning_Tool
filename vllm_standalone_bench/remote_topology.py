@@ -762,6 +762,7 @@ def parse_topology_profiles(
             path,
             name,
             engine,
+            hosts,
             prefill,
             decode,
             frontend,
@@ -1058,6 +1059,7 @@ def _validate_topology_profile(
     path: str,
     profile_name: str,
     engine: str,
+    hosts: Mapping[str, RemoteHost],
     prefill: tuple[TopologyNode, ...],
     decode: tuple[TopologyNode, ...],
     frontend: TopologyFrontend,
@@ -1086,6 +1088,13 @@ def _validate_topology_profile(
                     f"{path} ({profile_name}) node {node.name} kv_port is "
                     "required for p2p_nccl"
                 )
+        _validate_vllm_p2p_kv_port_ranges(
+            path,
+            profile_name,
+            hosts,
+            (*prefill, *decode),
+            error,
+        )
         return
     if vllm_pd.connector == "nixl":
         for node in (*prefill, *decode):
@@ -1094,6 +1103,63 @@ def _validate_topology_profile(
                     f"{path} ({profile_name}) node {node.name} "
                     "side_channel_port is required for nixl"
                 )
+
+
+def _node_tensor_parallel_size(node: TopologyNode, error: ErrorFactory) -> int:
+    for index, arg in enumerate(node.args):
+        value: str | None = None
+        if arg == "--tensor-parallel-size":
+            if index + 1 >= len(node.args):
+                raise error(
+                    f"node {node.name} --tensor-parallel-size requires a value"
+                )
+            value = node.args[index + 1]
+        elif arg.startswith("--tensor-parallel-size="):
+            value = arg.partition("=")[2]
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except ValueError:
+            raise error(
+                f"node {node.name} --tensor-parallel-size must be a positive integer"
+            )
+        if parsed <= 0:
+            raise error(
+                f"node {node.name} --tensor-parallel-size must be a positive integer"
+            )
+        return parsed
+    return 1
+
+
+def _validate_vllm_p2p_kv_port_ranges(
+    path: str,
+    profile_name: str,
+    hosts: Mapping[str, RemoteHost],
+    nodes: tuple[TopologyNode, ...],
+    error: ErrorFactory,
+) -> None:
+    ranges_by_host: dict[
+        tuple[str, str],
+        list[tuple[str, int, int]],
+    ] = {}
+    for node in nodes:
+        if node.kv_port is None:
+            continue
+        host = hosts[node.host]
+        start = node.kv_port
+        end = start + _node_tensor_parallel_size(node, error) - 1
+        host_key = (host.ssh_user, host.address)
+        existing_ranges = ranges_by_host.setdefault(host_key, [])
+        for existing_name, existing_start, existing_end in existing_ranges:
+            if start <= existing_end and existing_start <= end:
+                raise error(
+                    f"{path} ({profile_name}) p2p_nccl kv_port ranges overlap "
+                    f"on host {host.address}: {existing_name} "
+                    f"{existing_start}-{existing_end} and {node.name} "
+                    f"{start}-{end}; increase kv_port spacing"
+                )
+        existing_ranges.append((node.name, start, end))
 
 
 def _parse_nodes(

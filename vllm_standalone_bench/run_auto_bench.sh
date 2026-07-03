@@ -14,6 +14,7 @@
 #   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh logs
 #   RUN_ID=qwen_smoke_001 FOLLOW=true ./run_auto_bench.sh logs
 #   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh stop
+#   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh cleanup
 #   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh resume
 #   RUN_ID=qwen_smoke_001 DETACH=false ./run_auto_bench.sh resume
 #   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh postprocess
@@ -66,7 +67,7 @@ FOLLOW="${FOLLOW:-false}"
 COMMAND="run"
 if [[ "$#" -gt 0 ]]; then
     case "$1" in
-        run|status|logs|stop|resume|postprocess)
+        run|status|logs|stop|cleanup|resume|postprocess)
             COMMAND="$1"
             shift
             ;;
@@ -122,7 +123,7 @@ case "${COMMAND}" in
             CMD+=(--dry-run)
         fi
         ;;
-    status|stop)
+    status|stop|cleanup)
         CMD=("${PYTHON_BIN}" "${AUTO_BENCH}" "${COMMAND}" --results-dir "${RESULTS_DIR}" --run-id "${RUN_ID}")
         ;;
     resume)
