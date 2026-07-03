@@ -36,13 +36,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 
 # Python 解释器；如主机 Python 命令不同，可通过 PYTHON_BIN 覆盖
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-/aipaas_test/miniconda3/bin/python3}"
 
 # auto_bench.py 入口
 AUTO_BENCH="${AUTO_BENCH:-${SCRIPT_DIR}/auto_bench.py}"
 
 # 默认 smoke 配置；可通过 CONFIG=/path/to/config.json 覆盖
-CONFIG="${CONFIG:-${SCRIPT_DIR}/configs/auto_bench.qwen2_5_1_5b.smoke.json}"
+CONFIG="${CONFIG:-${SCRIPT_DIR}/configs/auto_bench.vllm_pd_p2p_remote.example.json}"
 
 # status/logs/stop 使用的结果目录；通常应与配置中的 run.results_dir 一致
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"

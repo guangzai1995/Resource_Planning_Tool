@@ -2,7 +2,7 @@
   "run": {
     "name": "vllm_minimax_m27_pd_p2p_compare",
     "results_dir": "vllm_standalone_bench/results",
-    "vllm_image": "vllm/vllm-openai:0.23.0",
+    "vllm_image": "vllm/vllm-openai:latest-0616-msgpack",
     "bench_image": "vllm-bench-runner:offline",
     "api_key": "local-bench-key",
     "ready_timeout_sec": 3600
@@ -16,24 +16,6 @@
     "tokenizer_path": "/models/MiniMax-M2.7-NVFP4",
     "served_model_name": "minimax-m2.7"
   }],
-  "serve_profiles": [{
-    "name": "minimax_tp8_single",
-    "gpus": "all",
-    "args": [
-      "--tensor-parallel-size", "8",
-      "--trust-remote-code",
-      "--quantization", "compressed-tensors",
-      "--kv-cache-dtype", "fp8",
-      "--gpu-memory-utilization", "0.92",
-      "--max-num-seqs", "96",
-      "--enable-chunked-prefill",
-      "--enable-auto-tool-choice",
-      "--tool-call-parser", "minimax_m2",
-      "--enable-force-include-usage",
-      "--enable-prompt-tokens-details",
-      "--reasoning-parser", "minimax_m2"
-    ]
-  }],
   "topology_profiles": [
     {
       "name": "vllm_pd_p2p_minimax_m27_2p2d",
@@ -41,7 +23,7 @@
       "mode": "pd",
       "provider": "ssh_docker",
       "network": "host",
-      "image": "vllm/vllm-openai:0.23.0",
+      "image": "vllm/vllm-openai:latest-0616-msgpack",
       "vllm_pd": {
         "connector": "p2p_nccl",
         "proxy": {"kind": "builtin"},
@@ -151,7 +133,7 @@
       "mode": "pd",
       "provider": "ssh_docker",
       "network": "host",
-      "image": "vllm/vllm-openai:0.23.0",
+      "image": "vllm/vllm-openai:latest-0616-msgpack",
       "vllm_pd": {
         "connector": "p2p_nccl",
         "proxy": {"kind": "builtin"},
@@ -259,7 +241,7 @@
       "mode": "pd",
       "provider": "ssh_docker",
       "network": "host",
-      "image": "vllm/vllm-openai:0.23.0",
+      "image": "vllm/vllm-openai:latest-0616-msgpack",
       "vllm_pd": {
         "connector": "p2p_nccl",
         "proxy": {"kind": "builtin"},
@@ -365,9 +347,9 @@
   "bench_profiles": [{
     "name": "latency_matrix",
     "backend": "openai-chat",
-    "input_lens": [4096, 8192, 16384, 32768, 65536, 131072],
+    "input_lens": [4096],
     "output_lens": [1024],
-    "parallel_nums": [1, 4, 8, 16, 24, 32],
+    "parallel_nums": [1, 4, 8, 16],
     "epochs": 3,
     "prefix_ratio": 0.65,
     "warmup_requests": 4,
