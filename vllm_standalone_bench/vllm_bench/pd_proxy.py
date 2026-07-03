@@ -24,6 +24,8 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 
+MAX_PREFILL_ERROR_CHARS = 2048
+
 
 @dataclass(frozen=True)
 class Endpoint:
@@ -146,17 +148,23 @@ class PdProxy:
                 _required_kv_address(decode),
             )
             prefill_body = build_p2p_prefill_body(body, request_id=request_id)
-            await self._post_json(prefill, path, prefill_body)
+            status, _headers, payload = await self._post_json(
+                prefill,
+                path,
+                prefill_body,
+            )
+            _raise_for_prefill_error(prefill, status, payload)
             decode_body = copy.deepcopy(body)
             decode_body["request_id"] = request_id
             return decode, decode_body
 
         prefill_body = build_nixl_prefill_body(body)
-        _status, _headers, prefill_payload = await self._post_json(
+        status, _headers, prefill_payload = await self._post_json(
             prefill,
             path,
             prefill_body,
         )
+        _raise_for_prefill_error(prefill, status, prefill_payload)
         prefill_json = json.loads(prefill_payload.decode("utf-8"))
         params = prefill_json.get("kv_transfer_params")
         if not isinstance(params, dict):
@@ -180,6 +188,29 @@ def _required_kv_address(endpoint: Endpoint) -> str:
     if endpoint.kv_address is None:
         raise web.HTTPBadGateway(reason=f"{endpoint.name} missing kv_address")
     return endpoint.kv_address
+
+
+def _raise_for_prefill_error(
+    endpoint: Endpoint,
+    status: int,
+    payload: bytes,
+) -> None:
+    if 200 <= status < 300:
+        return
+    detail = _compact_error_payload(payload)
+    message = f"prefill {endpoint.name} failed ({status})"
+    if detail:
+        message = f"{message}: {detail}"
+    raise web.HTTPBadGateway(
+        reason=f"prefill {endpoint.name} failed ({status})",
+        text=message,
+    )
+
+
+def _compact_error_payload(payload: bytes) -> str:
+    text = payload.decode("utf-8", errors="replace").strip()
+    text = " ".join(text.split())
+    return text[:MAX_PREFILL_ERROR_CHARS]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

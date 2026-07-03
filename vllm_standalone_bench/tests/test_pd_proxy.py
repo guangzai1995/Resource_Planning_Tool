@@ -1,6 +1,9 @@
 import asyncio
 import json
 
+import pytest
+from aiohttp import web
+
 from vllm_bench.pd_proxy import (
     Endpoint,
     PdProxy,
@@ -167,6 +170,34 @@ def test_p2p_proxy_sends_prefill_then_decode():
     decode_json = session.calls[1][2]["json"]
     assert prefill_json["max_tokens"] == 1
     assert decode_json["request_id"] == prefill_json["request_id"]
+
+
+def test_p2p_proxy_stops_when_prefill_fails():
+    async def run_case():
+        session = FakeSession([
+            FakeResponse({"error": "bad prefill"}, status=400),
+            FakeResponse({"choices": [{"text": "should not decode"}]}),
+        ])
+        proxy = PdProxy(
+            connector="p2p_nccl",
+            prefill=[Endpoint("p1", "http://p1:30000", "p1:21001")],
+            decode=[Endpoint("d1", "http://d1:31000", "d1:22001")],
+            session=session,
+        )
+
+        with pytest.raises(web.HTTPBadGateway) as exc_info:
+            await proxy.handle_json_completion(
+                "/v1/completions",
+                {"model": "m", "prompt": "hi", "max_tokens": 8},
+            )
+        return session, exc_info.value
+
+    session, exc = asyncio.run(run_case())
+
+    assert len(session.calls) == 1
+    assert session.calls[0][1] == "http://p1:30000/v1/completions"
+    assert exc.reason == "prefill p1 failed (400)"
+    assert exc.text == 'prefill p1 failed (400): {"error": "bad prefill"}'
 
 
 def test_nixl_proxy_forwards_prefill_transfer_params_to_decode():
