@@ -1,0 +1,168 @@
+{
+  "run": {
+    "name": "offline_full_bench_minimax_m27_compare",
+    "results_dir": "vllm_standalone_bench/results",
+    "vllm_image": "vllm/vllm-openai:latest-0616-msgpack",
+    "bench_image": "vllm-bench-runner:offline",
+    "network": "vllm-bench-net",
+    "create_network": true,
+    "cleanup_network": true,
+    "container_port": 8004,
+    "publish_host_port": false,
+    "host_port": 18000,
+    "api_key": "local-bench-key",
+    "ready_timeout_sec": 3600,
+    "cooldown_sec": 20,
+    "vllm_cache": {
+      "enabled": true,
+      "root": "../.cache/vllm_auto_bench",
+      "container_path": "/vllm-cache",
+      "set_default_env": true
+    }
+  },
+  "mounts": {
+    "models": "/NVME1/models"
+  },
+  "models": [
+    {
+      "name": "minimax_m27_nvfp4",
+      "model_path": "/models/MiniMax-M2.7-NVFP4",
+      "tokenizer_path": "/models/MiniMax-M2.7-NVFP4",
+      "served_model_name": "minimax-m2.7-nvfp4"
+    },
+    {
+      "name": "minimax_m27",
+      "model_path": "/models/MiniMax-M2.7",
+      "tokenizer_path": "/models/MiniMax-M2.7",
+      "served_model_name": "minimax-m2.7"
+    }
+  ],
+  "serve_profiles": [
+    {
+      "name": "tp8_prefix_chunked_kv_fp8",
+      "gpus": "all",
+      "args": [
+        "--tensor-parallel-size", "8",
+        "--max-model-len", "199999",
+        "--max-num-seqs", "128",
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--trust-remote-code",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", "minimax_m2",
+        "--reasoning-parser", "minimax_m2",
+        "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
+        "--enable-log-requests",
+        "--quantization", "compressed-tensors",
+        "--kv-cache-dtype", "fp8"
+      ]
+    },
+    {
+      "name": "tp8_prefix_chunked_kv_auto",
+      "gpus": "all",
+      "args": [
+        "--tensor-parallel-size", "8",
+        "--max-model-len", "199999",
+        "--max-num-seqs", "128",
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--trust-remote-code",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", "minimax_m2",
+        "--reasoning-parser", "minimax_m2",
+        "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
+        "--enable-log-requests",
+        "--quantization", "compressed-tensors",
+        "--kv-cache-dtype", "auto"
+      ]
+    },
+    {
+      "name": "tp8_no_prefix_chunked_kv_fp8",
+      "gpus": "all",
+      "args": [
+        "--tensor-parallel-size", "8",
+        "--max-model-len", "199999",
+        "--max-num-seqs", "128",
+        "--no-enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--trust-remote-code",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", "minimax_m2",
+        "--reasoning-parser", "minimax_m2",
+        "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
+        "--enable-log-requests",
+        "--quantization", "compressed-tensors",
+        "--kv-cache-dtype", "fp8"
+      ]
+    },
+    {
+      "name": "tp8_prefix_no_chunked_kv_fp8",
+      "gpus": "all",
+      "args": [
+        "--tensor-parallel-size", "8",
+        "--max-model-len", "199999",
+        "--max-num-seqs", "128",
+        "--enable-prefix-caching",
+        "--trust-remote-code",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", "minimax_m2",
+        "--reasoning-parser", "minimax_m2",
+        "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
+        "--enable-log-requests",
+        "--quantization", "compressed-tensors",
+        "--kv-cache-dtype", "fp8"
+      ]
+    }
+  ],
+  "bench_profiles": [
+    {
+      "name": "latency_prefix_25",
+      "backend": "openai-chat",
+      "input_lens": [4096, 16384, 65536, 131072],
+      "output_lens": [1024],
+      "parallel_nums": [1, 8, 16, 32],
+      "epochs": 3,
+      "prefix_ratio": 0.25,
+      "warmup_requests": 4,
+      "warmup_concurrency": 8,
+      "cross_product": true,
+      "max_ttft_ms": 15000,
+      "min_throughput_tok_s": 5,
+      "min_output_compliance": 0.95
+    },
+    {
+      "name": "latency_prefix_65",
+      "backend": "openai-chat",
+      "input_lens": [4096, 16384, 65536, 131072],
+      "output_lens": [1024],
+      "parallel_nums": [1, 8, 16, 32],
+      "epochs": 3,
+      "prefix_ratio": 0.65,
+      "warmup_requests": 4,
+      "warmup_concurrency": 8,
+      "cross_product": true,
+      "max_ttft_ms": 15000,
+      "min_throughput_tok_s": 5,
+      "min_output_compliance": 0.95
+    },
+    {
+      "name": "latency_prefix_90",
+      "backend": "openai-chat",
+      "input_lens": [4096, 16384, 65536, 131072],
+      "output_lens": [1024],
+      "parallel_nums": [1, 8, 16, 32],
+      "epochs": 3,
+      "prefix_ratio": 0.9,
+      "warmup_requests": 4,
+      "warmup_concurrency": 8,
+      "cross_product": true,
+      "max_ttft_ms": 15000,
+      "min_throughput_tok_s": 5,
+      "min_output_compliance": 0.95
+    }
+  ]
+}
