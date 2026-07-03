@@ -215,6 +215,28 @@ def test_vllm_pd_rejects_unknown_structured_key(tmp_path):
         ab.load_config(write_config(tmp_path, data))
 
 
+def test_vllm_pd_accepts_normalized_proxy_kind_from_resume_config(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {
+        "connector": "p2p_nccl",
+        "proxy_kind": "builtin",
+        "p2p_send_type": "PUT_ASYNC",
+        "nccl_num_channels": 16,
+    }
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+    topology["prefill"][0]["kv_port"] = 21001
+    topology["prefill"][1]["kv_port"] = 21002
+    topology["decode"][0]["kv_port"] = 22001
+    topology["decode"][1]["kv_port"] = 22002
+
+    config = ab.load_config(write_config(tmp_path, data))
+
+    assert config.topology_profiles[0].vllm_pd.proxy_kind == "builtin"
+
+
 def test_vllm_pd_p2p_commands_render_structured_builtin_proxy(tmp_path):
     data = pd_topology_config(tmp_path)
     topology = data["topology_profiles"][0]

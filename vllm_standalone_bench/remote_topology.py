@@ -907,7 +907,13 @@ def _parse_vllm_pd_config(
     if value is None:
         return None
     raw = _mapping(value, path, error)
-    allowed = {"connector", "proxy", "p2p_send_type", "nccl_num_channels"}
+    allowed = {
+        "connector",
+        "proxy",
+        "proxy_kind",
+        "p2p_send_type",
+        "nccl_num_channels",
+    }
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise error(f"{path} contains unsupported keys: {', '.join(unknown)}")
@@ -926,6 +932,15 @@ def _parse_vllm_pd_config(
             + ", ".join(proxy_unknown)
         )
     proxy_kind = _string(proxy.get("kind", "builtin"), f"{path}.proxy.kind", error)
+    if "proxy_kind" in raw:
+        normalized_proxy_kind = _string(
+            raw["proxy_kind"],
+            f"{path}.proxy_kind",
+            error,
+        )
+        if "proxy" in raw and normalized_proxy_kind != proxy_kind:
+            raise error(f"{path}.proxy_kind must match {path}.proxy.kind")
+        proxy_kind = normalized_proxy_kind
     if proxy_kind != "builtin":
         raise error(f"{path}.proxy.kind only supports builtin")
     p2p_send_type = _string(
