@@ -56,9 +56,11 @@ import gc
 import math
 import re
 import argparse
+import atexit
 import logging
 import json
 import random
+import shutil
 import uuid
 import warnings
 import importlib.util as _ilu
@@ -560,6 +562,35 @@ def _dynamic_audio_output_dir(args: argparse.Namespace, dataset_path: Path) -> P
     )
 
 
+# Auto-generated dynamic-audio directories scheduled for best-effort removal at
+# process exit. Only the TMPDIR default (no --generated-audio-dir) is
+# auto-cleaned; an explicitly configured output dir is retained for inspection
+# (e.g. run_asr_bench.sh writes results/asr_dynamic_audio_<ts>/ on purpose).
+_dynamic_audio_cleanup_dirs: set[Path] = set()
+_dynamic_audio_cleanup_registered = False
+
+
+def _cleanup_dynamic_audio_dirs() -> None:
+    """Remove auto-generated dynamic-audio temp directories.
+
+    Best-effort: missing dirs and removal errors are ignored so a cleanup
+    failure can never mask the real benchmark result. Safe to call repeatedly.
+    Registered once via atexit; also invoked directly by tests.
+    """
+    for path in list(_dynamic_audio_cleanup_dirs):
+        shutil.rmtree(path, ignore_errors=True)
+    _dynamic_audio_cleanup_dirs.clear()
+
+
+def _schedule_dynamic_audio_cleanup(path: Path) -> None:
+    """Record an auto-generated audio dir for removal at process exit."""
+    global _dynamic_audio_cleanup_registered
+    _dynamic_audio_cleanup_dirs.add(path)
+    if not _dynamic_audio_cleanup_registered:
+        atexit.register(_cleanup_dynamic_audio_dirs)
+        _dynamic_audio_cleanup_registered = True
+
+
 def _coprime_stride(row_count: int) -> int:
     if row_count <= 1:
         return 1
@@ -694,6 +725,10 @@ def _load_dynamic_custom_audio_requests(
 ) -> list[SampleRequest]:
     generated_dir = _dynamic_audio_output_dir(args, dataset_path)
     generated_dir.mkdir(parents=True, exist_ok=True)
+    # Only the auto-generated TMPDIR default is cleaned up at exit; an
+    # explicitly configured --generated-audio-dir is retained for inspection.
+    if not getattr(args, 'generated_audio_dir', None):
+        _schedule_dynamic_audio_cleanup(generated_dir)
     target_duration_s = float(getattr(args, 'audio_duration_s'))
     silence_ms = int(getattr(args, 'audio_silence_ms', 500))
     seed = int(getattr(args, 'seed', 0) or 0)

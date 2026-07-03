@@ -1,10 +1,37 @@
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
 
 import run_bench_serve as rbs
+
+
+def _write_tiny_audio_dataset(tmp_path: Path, *, count: int = 2) -> Path:
+    """Create a minimal custom_audio dataset of short WAV files; return jsonl path."""
+    import numpy as np
+    import soundfile
+
+    src = tmp_path / "src"
+    src.mkdir()
+    sample_rate = 16_000
+    for idx in range(count):
+        soundfile.write(
+            src / f"s{idx}.wav",
+            np.full(int(sample_rate * 0.25), 0.1, dtype=np.float32),
+            sample_rate,
+        )
+    jsonl = tmp_path / "asr.jsonl"
+    jsonl.write_text(
+        "".join(
+            json.dumps({"audio": f"src/s{i}.wav", "output_tokens": 8}) + "\n"
+            for i in range(count)
+        ),
+        encoding="utf-8",
+    )
+    return jsonl
 
 
 def test_custom_audio_dataset_reads_jsonl_and_repeats_to_num_prompts(tmp_path):
@@ -182,3 +209,127 @@ def test_dataset_path_help_mentions_custom_audio():
         if "--dataset-path" in action.option_strings
     )
     assert "custom_audio" in dataset_path_action.help
+
+
+def test_dynamic_audio_auto_cleaned_when_no_generated_dir(tmp_path, monkeypatch):
+    """No --generated-audio-dir => temp dir under TMPDIR, scheduled for cleanup."""
+    # isolate TMPDIR so the auto-generated dir lands under tmp_path, not real /tmp
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    # drain any state left over from earlier tests in this same process
+    rbs._cleanup_dynamic_audio_dirs()
+
+    jsonl = _write_tiny_audio_dataset(tmp_path)
+    args = argparse.Namespace(
+        dataset_name="custom_audio",
+        dataset_path=str(jsonl),
+        num_prompts=2,
+        custom_output_len=None,
+        random_output_len=128,
+        seed=123,
+        audio_duration_s=0.5,
+        audio_silence_ms=100,
+        generated_audio_dir=None,  # <-- the leak path: falls back to /tmp default
+    )
+
+    requests = rbs.get_samples(args, tokenizer=None)
+    audio_paths = [Path(r.multi_modal_data["audio_path"]) for r in requests]
+    generated_dir = audio_paths[0].parent
+
+    # landed under TMPDIR (not results/), files exist for the duration of the run
+    assert tmp_path in generated_dir.parents
+    assert all(path.exists() for path in audio_paths)
+    # registered for auto-cleanup at process exit
+    assert generated_dir in rbs._dynamic_audio_cleanup_dirs
+
+    # simulate process-exit cleanup
+    rbs._cleanup_dynamic_audio_dirs()
+
+    assert not generated_dir.exists()
+    assert rbs._dynamic_audio_cleanup_dirs == set()
+
+
+def test_dynamic_audio_keeps_configured_generated_dir(tmp_path, monkeypatch):
+    """Explicit --generated-audio-dir is retained (never auto-cleaned)."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    rbs._cleanup_dynamic_audio_dirs()
+
+    jsonl = _write_tiny_audio_dataset(tmp_path)
+    configured = tmp_path / "keep" / "generated"
+    args = argparse.Namespace(
+        dataset_name="custom_audio",
+        dataset_path=str(jsonl),
+        num_prompts=2,
+        custom_output_len=None,
+        random_output_len=128,
+        seed=123,
+        audio_duration_s=0.5,
+        audio_silence_ms=100,
+        generated_audio_dir=str(configured),
+    )
+
+    requests = rbs.get_samples(args, tokenizer=None)
+    generated_dir = Path(requests[0].multi_modal_data["audio_path"]).parent
+
+    assert generated_dir == configured
+    assert generated_dir not in rbs._dynamic_audio_cleanup_dirs
+
+    rbs._cleanup_dynamic_audio_dirs()  # must NOT touch the configured dir
+    assert generated_dir.exists()
+
+
+def test_dynamic_audio_auto_cleanup_runs_at_process_exit(tmp_path):
+    """End-to-end: atexit must remove the auto-generated temp dir when the
+    benchmark process exits (the exact scenario the user reported leaking)."""
+    import subprocess
+    import textwrap
+
+    bench_dir = Path(__file__).resolve().parent.parent
+    driver = tmp_path / "driver.py"
+    driver.write_text(
+        textwrap.dedent(
+            """
+            import argparse, json, os
+            import numpy as np
+            import soundfile
+            import run_bench_serve as rbs
+
+            work = os.environ["WORK_DIR"]
+            src = os.path.join(work, "src")
+            os.makedirs(src)
+            sr = 16000
+            for i in range(2):
+                soundfile.write(os.path.join(src, f"s{i}.wav"),
+                                np.full(int(sr * 0.25), 0.1, dtype=np.float32), sr)
+            jsonl = os.path.join(work, "asr.jsonl")
+            with open(jsonl, "w", encoding="utf-8") as f:
+                for i in range(2):
+                    f.write(json.dumps({"audio": f"src/s{i}.wav", "output_tokens": 8}) + "\\n")
+            args = argparse.Namespace(
+                dataset_name="custom_audio", dataset_path=jsonl, num_prompts=2,
+                custom_output_len=None, random_output_len=128, seed=123,
+                audio_duration_s=0.5, audio_silence_ms=100, generated_audio_dir=None)
+            reqs = rbs.get_samples(args, tokenizer=None)
+            print(os.path.dirname(reqs[0].multi_modal_data["audio_path"]))
+            """
+        ),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(bench_dir)
+    env["WORK_DIR"] = str(tmp_path)
+    env["TMPDIR"] = str(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, str(driver)],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    generated_dir = Path(proc.stdout.strip().splitlines()[-1])
+    # the path was produced during the run; after the process exited, atexit
+    # must have removed it — otherwise it is exactly the reported leak.
+    assert not generated_dir.exists(), (
+        f"dynamic audio temp dir leaked after process exit: {generated_dir}"
+    )
