@@ -1,0 +1,169 @@
+import asyncio
+import json
+
+from vllm_bench.pd_proxy import (
+    Endpoint,
+    PdProxy,
+    build_nixl_prefill_body,
+    build_p2p_prefill_body,
+    build_p2p_request_id,
+    inject_kv_transfer_params,
+    parse_endpoint,
+)
+
+
+def test_parse_endpoint_accepts_json_with_kv_address():
+    endpoint = parse_endpoint(json.dumps({
+        "name": "p1",
+        "url": "http://10.0.0.11:30000",
+        "kv_address": "10.0.0.11:21001",
+    }))
+
+    assert endpoint == Endpoint(
+        name="p1",
+        url="http://10.0.0.11:30000",
+        kv_address="10.0.0.11:21001",
+    )
+
+
+def test_build_p2p_request_id_matches_vllm_parser_format():
+    request_id = build_p2p_request_id(
+        "10.0.0.11:21001",
+        "10.0.0.21:22001",
+        request_uuid="abc",
+    )
+
+    assert request_id == (
+        "___prefill_addr_10.0.0.11:21001"
+        "___decode_addr_10.0.0.21:22001_abc"
+    )
+
+
+def test_build_p2p_prefill_body_forces_one_token_non_streaming():
+    body = {"model": "m", "prompt": "hello", "max_tokens": 32, "stream": True}
+    prefill_body = build_p2p_prefill_body(body, request_id="rid")
+
+    assert prefill_body["max_tokens"] == 1
+    assert prefill_body["stream"] is False
+    assert prefill_body["request_id"] == "rid"
+    assert body["max_tokens"] == 32
+
+
+def test_build_nixl_prefill_body_injects_remote_decode_marker():
+    body = {"model": "m", "messages": [], "max_tokens": 32, "stream": True}
+    prefill_body = build_nixl_prefill_body(body)
+
+    assert prefill_body["max_tokens"] == 1
+    assert prefill_body["stream"] is False
+    assert prefill_body["kv_transfer_params"] == {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "remote_block_ids": None,
+        "remote_host": None,
+        "remote_port": None,
+    }
+
+
+def test_inject_kv_transfer_params_preserves_original_body():
+    body = {"model": "m", "prompt": "hello"}
+    params = {"remote_engine_id": "engine-a"}
+    decode_body = inject_kv_transfer_params(body, params)
+
+    assert decode_body == {
+        "model": "m",
+        "prompt": "hello",
+        "kv_transfer_params": {"remote_engine_id": "engine-a"},
+    }
+    assert "kv_transfer_params" not in body
+
+
+class FakeResponse:
+    def __init__(self, payload, *, status=200, headers=None):
+        self._payload = payload
+        self.status = status
+        self.headers = headers or {"content-type": "application/json"}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def json(self):
+        return self._payload
+
+    async def read(self):
+        return json.dumps(self._payload).encode("utf-8")
+
+
+class FakeSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self.responses.pop(0)
+
+
+def test_p2p_proxy_sends_prefill_then_decode():
+    async def run_case():
+        session = FakeSession([
+            FakeResponse({"choices": []}),
+            FakeResponse({"choices": [{"text": "ok"}]}),
+        ])
+        proxy = PdProxy(
+            connector="p2p_nccl",
+            prefill=[Endpoint("p1", "http://p1:30000", "p1:21001")],
+            decode=[Endpoint("d1", "http://d1:31000", "d1:22001")],
+            session=session,
+        )
+
+        status, headers, payload = await proxy.handle_json_completion(
+            "/v1/completions",
+            {"model": "m", "prompt": "hi", "max_tokens": 8},
+        )
+        return session, status, headers, payload
+
+    session, status, headers, payload = asyncio.run(run_case())
+
+    assert status == 200
+    assert headers["content-type"] == "application/json"
+    assert payload == b'{"choices": [{"text": "ok"}]}'
+    assert session.calls[0][1] == "http://p1:30000/v1/completions"
+    assert session.calls[1][1] == "http://d1:31000/v1/completions"
+    prefill_json = session.calls[0][2]["json"]
+    decode_json = session.calls[1][2]["json"]
+    assert prefill_json["max_tokens"] == 1
+    assert decode_json["request_id"] == prefill_json["request_id"]
+
+
+def test_nixl_proxy_forwards_prefill_transfer_params_to_decode():
+    async def run_case():
+        params = {"remote_engine_id": "engine-a", "remote_block_ids": [1]}
+        session = FakeSession([
+            FakeResponse({"kv_transfer_params": params}),
+            FakeResponse({"choices": [{"message": {"content": "ok"}}]}),
+        ])
+        proxy = PdProxy(
+            connector="nixl",
+            prefill=[Endpoint("p1", "http://p1:30000")],
+            decode=[Endpoint("d1", "http://d1:31000")],
+            session=session,
+        )
+
+        status, headers, payload = await proxy.handle_json_completion(
+            "/v1/chat/completions",
+            {"model": "m", "messages": [], "max_tokens": 8},
+        )
+        return params, session, status, headers, payload
+
+    params, session, status, headers, payload = asyncio.run(run_case())
+
+    assert status == 200
+    assert headers["content-type"] == "application/json"
+    assert payload == b'{"choices": [{"message": {"content": "ok"}}]}'
+    assert session.calls[0][1] == "http://p1:30000/v1/chat/completions"
+    assert session.calls[1][1] == "http://d1:31000/v1/chat/completions"
+    assert session.calls[1][2]["json"]["kv_transfer_params"] == params
