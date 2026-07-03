@@ -35,7 +35,39 @@
     {
       "name": "all_fp8_default",
       "gpus": "all",
-      "cache_key": "glm52-fp8-tp8-all-latest0616-ep-mtp5-len150k-prefix",
+      "cache_key": "glm52-fp8-tp8-all-latest0616-ep-mtp5-len150k-prefix1",
+      "args": [
+        "--tensor-parallel-size",
+        "8",
+        "--max-model-len",
+        "149999",
+        "--max-num-seqs",
+        "48",
+        "--enable-prefix-caching",
+        "--tool-call-parser",
+        "glm47",
+        "--reasoning-parser",
+        "glm45",
+        "--enable-auto-tool-choice",
+        "--chat-template-content-format",
+        "string",
+        "--trust-remote-code",
+        "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
+        "--enable-log-requests",
+        "--enable-expert-parallel",
+        "--kv-cache-dtype",
+        "auto",
+        "--speculative-config.method",
+        "mtp",
+        "--speculative-config.num_speculative_tokens",
+        "5"
+      ]
+    },
+    {
+      "name": "all_fp8_kv_fp8",
+      "gpus": "all",
+      "cache_key": "glm52-fp8-no-kvfp8-tp8-all-latest0616-ep-mtp5-len150k-prefix-1",
       "args": [
         "--tensor-parallel-size",
         "8",
@@ -58,36 +90,6 @@
         "--enable-expert-parallel",
         "--kv-cache-dtype",
         "fp8",
-        "--speculative-config.method",
-        "mtp",
-        "--speculative-config.num_speculative_tokens",
-        "5"
-      ]
-    },
-    {
-      "name": "all_fp8_no_kv_fp8",
-      "gpus": "all",
-      "cache_key": "glm52-fp8-no-kvfp8-tp8-all-latest0616-ep-mtp5-len150k-prefix",
-      "args": [
-        "--tensor-parallel-size",
-        "8",
-        "--max-model-len",
-        "149999",
-        "--max-num-seqs",
-        "48",
-        "--enable-prefix-caching",
-        "--tool-call-parser",
-        "glm47",
-        "--reasoning-parser",
-        "glm45",
-        "--enable-auto-tool-choice",
-        "--chat-template-content-format",
-        "string",
-        "--trust-remote-code",
-        "--enable-force-include-usage",
-        "--enable-prompt-tokens-details",
-        "--enable-log-requests",
-        "--enable-expert-parallel",
         "--speculative-config.method",
         "mtp",
         "--speculative-config.num_speculative_tokens",
@@ -97,7 +99,7 @@
     {
       "name": "all_fp8_no_spec_decode",
       "gpus": "all",
-      "cache_key": "glm52-fp8-no-spec-tp8-all-latest0616-ep-kvfp8-len150k-prefix",
+      "cache_key": "glm52-fp8-no-spec-tp8-all-latest0616-ep-kvfp8-len150k-prefix1",
       "args": [
         "--tensor-parallel-size",
         "8",
@@ -119,13 +121,13 @@
         "--enable-log-requests",
         "--enable-expert-parallel",
         "--kv-cache-dtype",
-        "fp8"
+        "auto"
       ]
     },
     {
       "name": "all_fp8_no_moe_ep",
       "gpus": "all",
-      "cache_key": "glm52-fp8-no-moep-tp8-all-latest0616-kvfp8-mtp5-len150k-prefix",
+      "cache_key": "glm52-fp8-no-moep-tp8-all-latest0616-kvfp8-mtp5-len150k-prefix1",
       "args": [
         "--tensor-parallel-size",
         "8",
@@ -146,7 +148,7 @@
         "--enable-prompt-tokens-details",
         "--enable-log-requests",
         "--kv-cache-dtype",
-        "fp8",
+        "auto",
         "--speculative-config.method",
         "mtp",
         "--speculative-config.num_speculative_tokens",
@@ -156,7 +158,7 @@
     {
       "name": "all_fp8_no_prefix_cache",
       "gpus": "all",
-      "cache_key": "glm52-fp8-no-prefix-tp8-all-latest0616-ep-kvfp8-mtp5-len150k",
+      "cache_key": "glm52-fp8-no-prefix-tp8-all-latest0616-ep-kvfp8-mtp5-len150k1",
       "args": [
         "--tensor-parallel-size",
         "8",
@@ -178,7 +180,7 @@
         "--enable-log-requests",
         "--enable-expert-parallel",
         "--kv-cache-dtype",
-        "fp8",
+        "auto",
         "--speculative-config.method",
         "mtp",
         "--speculative-config.num_speculative_tokens",
@@ -188,7 +190,7 @@
     {
       "name": "all_fp8_all_opts_off",
       "gpus": "all",
-      "cache_key": "glm52-fp8-allopts-off-tp8-all-latest0616-len150k",
+      "cache_key": "glm52-fp8-allopts-off-tp8-all-latest0616-len150k1",
       "args": [
         "--tensor-parallel-size",
         "8",
@@ -207,13 +209,15 @@
         "--trust-remote-code",
         "--enable-force-include-usage",
         "--enable-prompt-tokens-details",
-        "--enable-log-requests"
+        "--enable-log-requests",
+        "--kv-cache-dtype",
+        "fp8"
       ]
     },
     {
       "name": "all_fp8_mtp3",
       "gpus": "all",
-      "cache_key": "glm52-fp8-tp8-all-latest0616-ep-mtp3-len150k-prefix",
+      "cache_key": "glm52-fp8-tp8-all-latest0616-ep-mtp3-len150k-prefix1",
       "args": [
         "--tensor-parallel-size",
         "8",
@@ -235,7 +239,7 @@
         "--enable-log-requests",
         "--enable-expert-parallel",
         "--kv-cache-dtype",
-        "fp8",
+        "auto",
         "--speculative-config.method",
         "mtp",
         "--speculative-config.num_speculative_tokens",
