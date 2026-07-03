@@ -108,8 +108,8 @@ def test_sglang_pd_commands_render_worker_and_router_flags(tmp_path):
         router[position + 1:position + 3]
         for position in prefill_positions
     ] == [
-        ["http://10.0.0.11:30000", "12335"],
-        ["http://10.0.0.12:30000", "12336"],
+        ("http://10.0.0.11:30000", "12335"),
+        ("http://10.0.0.12:30000", "12336"),
     ]
     assert values_after(router, "--decode") == [
         "http://10.0.0.21:31000",

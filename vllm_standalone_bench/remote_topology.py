@@ -31,6 +31,8 @@ class TopologyNode:
     host: str
     port: int
     bootstrap_port: int | None = None
+    kv_port: int | None = None
+    side_channel_port: int | None = None
     gpus: str = "all"
     args: tuple[str, ...] = field(default_factory=tuple)
     env: Mapping[str, str] = field(
@@ -47,6 +49,14 @@ class TopologyFrontend:
     image: str | None = None
     command: tuple[str, ...] = field(default_factory=tuple)
     args: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class VllmPdConfig:
+    connector: str
+    proxy_kind: str = "builtin"
+    p2p_send_type: str = "PUT_ASYNC"
+    nccl_num_channels: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +86,7 @@ class TopologyProfile:
         default_factory=lambda: types.MappingProxyType({})
     )
     disaggregation_ib_device: str | None = None
+    vllm_pd: VllmPdConfig | None = None
     env: Mapping[str, str] = field(
         default_factory=lambda: types.MappingProxyType({})
     )
@@ -223,7 +234,16 @@ class TopologyProfile:
         ])
         for node in self.prefill:
             host = self.hosts[node.host]
-            argv.extend(["--prefill", f"http://{host.address}:{node.port}"])
+            if node.bootstrap_port is None:
+                raise _config_error(
+                    f"topology profile {self.name} prefill node {node.name} "
+                    "bootstrap_port is required for sglang pd"
+                )
+            argv.extend([
+                "--prefill",
+                f"http://{host.address}:{node.port}",
+                str(node.bootstrap_port),
+            ])
         for node in self.decode:
             host = self.hosts[node.host]
             argv.extend(["--decode", f"http://{host.address}:{node.port}"])
@@ -556,7 +576,22 @@ def parse_topology_profiles(
             hosts,
             error,
         )
+        vllm_pd = _parse_vllm_pd_config(
+            profile.get("vllm_pd"),
+            f"{path}.vllm_pd",
+            error,
+        )
         _validate_role_names_unique(path, name, prefill, decode, frontend, error)
+        _validate_topology_profile(
+            path,
+            name,
+            engine,
+            prefill,
+            decode,
+            frontend,
+            vllm_pd,
+            error,
+        )
         parsed.append(TopologyProfile(
             name=name,
             engine=engine,
@@ -588,6 +623,7 @@ def parse_topology_profiles(
                 f"{path}.disaggregation_ib_device",
                 error,
             ),
+            vllm_pd=vllm_pd,
             env=_string_mapping(profile.get("env"), f"{path}.env", error),
             volumes=_string_tuple(profile.get("volumes", []), f"{path}.volumes", error),
         ))
@@ -687,6 +723,52 @@ def _validate_json_template_value(
     raise error(f"{path} must contain JSON-compatible values")
 
 
+def _parse_vllm_pd_config(
+    value: Any,
+    path: str,
+    error: ErrorFactory,
+) -> VllmPdConfig | None:
+    if value is None:
+        return None
+    raw = _mapping(value, path, error)
+    allowed = {"connector", "proxy", "p2p_send_type", "nccl_num_channels"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise error(f"{path} contains unsupported keys: {', '.join(unknown)}")
+    connector = _string(
+        _required(raw, "connector", f"{path}.connector", error),
+        f"{path}.connector",
+        error,
+    )
+    if connector not in {"p2p_nccl", "nixl"}:
+        raise error(f"{path}.connector must be one of p2p_nccl, nixl")
+    proxy = _mapping(raw.get("proxy", {"kind": "builtin"}), f"{path}.proxy", error)
+    proxy_unknown = sorted(set(proxy) - {"kind"})
+    if proxy_unknown:
+        raise error(
+            f"{path}.proxy contains unsupported keys: "
+            + ", ".join(proxy_unknown)
+        )
+    proxy_kind = _string(proxy.get("kind", "builtin"), f"{path}.proxy.kind", error)
+    if proxy_kind != "builtin":
+        raise error(f"{path}.proxy.kind only supports builtin")
+    p2p_send_type = _string(
+        raw.get("p2p_send_type", "PUT_ASYNC"),
+        f"{path}.p2p_send_type",
+        error,
+    )
+    return VllmPdConfig(
+        connector=connector,
+        proxy_kind=proxy_kind,
+        p2p_send_type=p2p_send_type,
+        nccl_num_channels=_optional_positive_int(
+            raw.get("nccl_num_channels"),
+            f"{path}.nccl_num_channels",
+            error,
+        ),
+    )
+
+
 def _parse_auth(
     value: Any,
     path: str,
@@ -781,6 +863,48 @@ def _validate_role_names_unique(
         )
 
 
+def _validate_topology_profile(
+    path: str,
+    profile_name: str,
+    engine: str,
+    prefill: tuple[TopologyNode, ...],
+    decode: tuple[TopologyNode, ...],
+    frontend: TopologyFrontend,
+    vllm_pd: VllmPdConfig | None,
+    error: ErrorFactory,
+) -> None:
+    if engine == "sglang":
+        for node in prefill:
+            if node.bootstrap_port is None:
+                raise error(
+                    f"{path} ({profile_name}) prefill node {node.name} "
+                    "bootstrap_port is required for sglang pd"
+                )
+        return
+    if engine != "vllm" or vllm_pd is None:
+        return
+    if frontend.kind != "builtin":
+        raise error(
+            f"{path} ({profile_name}) frontend.kind must be builtin when "
+            "structured vllm_pd is used"
+        )
+    if vllm_pd.connector == "p2p_nccl":
+        for node in (*prefill, *decode):
+            if node.kv_port is None:
+                raise error(
+                    f"{path} ({profile_name}) node {node.name} kv_port is "
+                    "required for p2p_nccl"
+                )
+        return
+    if vllm_pd.connector == "nixl":
+        for node in (*prefill, *decode):
+            if node.side_channel_port is None:
+                raise error(
+                    f"{path} ({profile_name}) node {node.name} "
+                    "side_channel_port is required for nixl"
+                )
+
+
 def _parse_nodes(
     value: Any,
     path: str,
@@ -806,6 +930,16 @@ def _parse_nodes(
             bootstrap_port=_optional_positive_int(
                 node.get("bootstrap_port"),
                 f"{node_path}.bootstrap_port",
+                error,
+            ),
+            kv_port=_optional_positive_int(
+                node.get("kv_port"),
+                f"{node_path}.kv_port",
+                error,
+            ),
+            side_channel_port=_optional_positive_int(
+                node.get("side_channel_port"),
+                f"{node_path}.side_channel_port",
                 error,
             ),
             gpus=_string(node.get("gpus", "all"), f"{node_path}.gpus", error),
