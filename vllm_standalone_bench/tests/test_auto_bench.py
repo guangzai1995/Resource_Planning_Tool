@@ -657,6 +657,8 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
     assert "--network" in cmd
     assert "vllm-bench-net" in cmd
+    assert "--user" in cmd
+    assert value_after(cmd, "--user") == f"{os.getuid()}:{os.getgid()}"
     assert f"{bench_dir.resolve()}:/results" in mounts
     assert "--base-url" in cmd
     assert f"http://{case.container_name}:8000/v1" in cmd
@@ -2557,6 +2559,40 @@ def test_topology_prefill_start_failure_cleans_started_roles(tmp_path, monkeypat
         )
     )
     assert manifest["cases"][0]["status"] == "failed"
+
+
+def test_topology_start_failure_writes_start_log_and_status_error(
+    tmp_path,
+    monkeypatch,
+):
+    from test_remote_topology import pd_topology_config, write_config
+
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["image"] = "sglang:pd"
+    config_path = write_config(tmp_path, data)
+    config = ab.load_config(config_path)
+    remote = FakeRemoteDockerRunner(failures={("p1", "docker run -d"): 125})
+    monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
+
+    result = ab.run_controller(
+        config,
+        run_id="run123",
+        runner=FakeRunner(),
+        config_path=config_path,
+    )
+
+    assert result == 1
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    start_log = (layout.bench_dir / "logs" / "p1.start.log").read_text(
+        encoding="utf-8",
+    )
+    assert "returncode: 125" in start_log
+    assert "forced failure" in start_log
+    status = json.loads((layout.bench_dir / "status.json").read_text(
+        encoding="utf-8",
+    ))
+    assert "forced failure" in status["error"]
 
 
 def test_controller_runs_case_and_cleans_owned_network(tmp_path, monkeypatch):
@@ -5356,7 +5392,78 @@ def test_build_serve_command_dispatches_vllm(tmp_path):
     assert "serve" in cmd
 
 
-def test_controller_invokes_aggregate_after_groups(tmp_path, monkeypatch):
+def test_build_postprocess_container_command_uses_bench_image_and_host_user(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    monkeypatch.setattr(ab.os, "getuid", lambda: 1001)
+    monkeypatch.setattr(ab.os, "getgid", lambda: 1002)
+
+    cmd = ab.build_postprocess_container_command(
+        config,
+        config_path=config_path,
+        run_id="run123",
+    )
+
+    mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
+    assert cmd[:3] == ["docker", "run", "--rm"]
+    assert value_after(cmd, "--user") == "1001:1002"
+    assert value_after(cmd, "-w") == "/workspace"
+    assert f"{ab.project_root()}:/workspace" in mounts
+    assert f"{config_path.parent.resolve()}:/auto-bench-config:ro" in mounts
+    assert f"{config.run.results_dir.resolve()}:/auto-bench-results" in mounts
+    assert "vllm-bench-runner:offline" in cmd
+    assert "postprocess" in cmd
+    assert value_after(cmd, "--config") == "/auto-bench-config/config.json"
+    assert value_after(cmd, "--results-dir") == "/auto-bench-results"
+    assert values_after(cmd, "--run-id") == ["run123"]
+
+
+def test_postprocess_run_merges_resource_summaries_and_aggregates(
+    tmp_path,
+    monkeypatch,
+):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    run_id = "run123"
+    run_dir = config.run.results_dir / run_id
+    case = ab.expand_cases(config, run_id=run_id)[0]
+    layout = ab.build_layout(config, run_id, case)
+    layout.bench_dir.mkdir(parents=True)
+    (layout.bench_dir / "result.csv").write_text(
+        "model,throughput_tok_s\nm,1\n",
+        encoding="utf-8-sig",
+    )
+    (layout.bench_dir / "resource_summary.json").write_text(
+        json.dumps({
+            "available": True,
+            "sample_count": 1,
+            "aggregate": {"cpu_util_avg_pct": 12.5},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(
+        ab,
+        "aggregate_compare",
+        lambda config_arg, run_dir_arg: calls.append(Path(run_dir_arg)) or None,
+    )
+
+    assert ab.run_postprocess(config, run_id) == 0
+
+    assert calls == [run_dir]
+    with (layout.bench_dir / "result.csv").open(
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["resource_monitor_available"] == "true"
+    assert rows[0]["resource_sample_count"] == "1"
+    assert rows[0]["cpu_util_avg_pct"] == "12.5"
+
+
+def test_controller_invokes_postprocess_container_after_groups(tmp_path, monkeypatch):
     data = minimal_config(tmp_path)
     data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
     sglang_profile = {
@@ -5366,26 +5473,38 @@ def test_controller_invokes_aggregate_after_groups(tmp_path, monkeypatch):
         "args": ["--dtype", "bfloat16"],
     }
     data["serve_profiles"].append(sglang_profile)
-    config = ab.load_config(write_config(tmp_path, data))
-    calls = []
-    monkeypatch.setattr(ab, "aggregate_compare", lambda c, rd: calls.append(Path(rd)) or None)
+    config_path = write_config(tmp_path, data)
+    config = ab.load_config(config_path)
+    runner = FakeRunner()
     monkeypatch.setattr(ab, "wait_for_ready", lambda *a, **k: True)
 
-    result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
+    result = ab.run_controller(
+        config,
+        run_id="run123",
+        runner=runner,
+        dry_run=False,
+        config_path=config_path,
+    )
 
+    postprocess_commands = [
+        command for command in runner.commands
+        if command[:3] == ["docker", "run", "--rm"] and "postprocess" in command
+    ]
     assert result == 0
-    assert len(calls) == 1
-    assert calls[0].name == "run123"
+    assert len(postprocess_commands) == 1
+    assert "vllm-bench-runner:offline" in postprocess_commands[0]
 
 
 def test_controller_dry_run_skips_aggregate(tmp_path, monkeypatch):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
-    calls = []
-    monkeypatch.setattr(ab, "aggregate_compare", lambda c, rd: calls.append(rd))
+    runner = FakeRunner()
 
-    ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=True)
+    ab.run_controller(config, run_id="run123", runner=runner, dry_run=True)
 
-    assert calls == []
+    assert not any(
+        command[:3] == ["docker", "run", "--rm"] and "postprocess" in command
+        for command in runner.commands
+    )
 
 
 def test_shipped_sglang_compare_config_parses():

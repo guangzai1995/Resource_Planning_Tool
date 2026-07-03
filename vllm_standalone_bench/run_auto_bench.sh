@@ -16,6 +16,7 @@
 #   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh stop
 #   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh resume
 #   RUN_ID=qwen_smoke_001 DETACH=false ./run_auto_bench.sh resume
+#   RUN_ID=qwen_smoke_001 ./run_auto_bench.sh postprocess
 #
 # 说明:
 #   该脚本只负责拼装并调用 auto_bench.py。vLLM 镜像、bench-runner 镜像、
@@ -65,7 +66,7 @@ FOLLOW="${FOLLOW:-false}"
 COMMAND="run"
 if [[ "$#" -gt 0 ]]; then
     case "$1" in
-        run|status|logs|stop|resume)
+        run|status|logs|stop|resume|postprocess)
             COMMAND="$1"
             shift
             ;;
@@ -91,7 +92,7 @@ if [[ ! -d "${PROJECT_ROOT}" ]]; then
     exit 1
 fi
 
-if [[ "${COMMAND}" == "run" && ! -f "${CONFIG}" ]]; then
+if [[ "${COMMAND}" == "run" || "${COMMAND}" == "postprocess" ]] && [[ ! -f "${CONFIG}" ]]; then
     echo "[ERROR] 找不到自动压测配置: ${CONFIG}" >&2
     exit 1
 fi
@@ -130,6 +131,9 @@ case "${COMMAND}" in
             CMD+=(--detach)
         fi
         ;;
+    postprocess)
+        CMD=("${PYTHON_BIN}" "${AUTO_BENCH}" postprocess --config "${CONFIG}" --results-dir "${RESULTS_DIR}" --run-id "${RUN_ID}" --container)
+        ;;
     logs)
         CMD=("${PYTHON_BIN}" "${AUTO_BENCH}" logs --results-dir "${RESULTS_DIR}" --run-id "${RUN_ID}")
         if [[ "${FOLLOW}" == "true" ]]; then
@@ -155,8 +159,10 @@ echo "╔═══════════════════════�
 echo "║                vLLM 离线自动化压测控制器                    ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 printf "║  子命令    : %-48s║\n" "${COMMAND}"
-if [[ "${COMMAND}" == "run" ]]; then
+if [[ "${COMMAND}" == "run" || "${COMMAND}" == "postprocess" ]]; then
     printf "║  配置文件  : %-48s║\n" "${CONFIG}"
+fi
+if [[ "${COMMAND}" == "run" ]]; then
     printf "║  工作目录  : %-48s║\n" "${PROJECT_ROOT}"
     printf "║  后台运行  : %-48s║\n" "${DETACH}"
     printf "║  Dry-run   : %-48s║\n" "${DRY_RUN}"

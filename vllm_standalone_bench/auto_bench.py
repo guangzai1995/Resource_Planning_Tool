@@ -1091,6 +1091,100 @@ def case_endpoint_base_url(config: AutoBenchConfig, case: BenchmarkCase) -> str:
     return f"http://{case.container_name}:{config.run.container_port}/v1"
 
 
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def host_user_spec() -> str:
+    uid = getattr(os, "getuid", lambda: 0)()
+    gid = getattr(os, "getgid", lambda: 0)()
+    return f"{uid}:{gid}"
+
+
+def _path_relative_to_project(path: Path) -> Path | None:
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(project_root())
+    except ValueError:
+        return None
+
+
+def _postprocess_config_container_path(config_path: Path) -> PurePosixPath:
+    relative = _path_relative_to_project(config_path)
+    if relative is not None:
+        return PurePosixPath("/workspace") / PurePosixPath(relative.as_posix())
+    return PurePosixPath("/auto-bench-config") / Path(config_path).resolve().name
+
+
+def _postprocess_results_container_path(results_dir: Path) -> PurePosixPath:
+    relative = _path_relative_to_project(results_dir)
+    if relative is not None:
+        return PurePosixPath("/workspace") / PurePosixPath(relative.as_posix())
+    return PurePosixPath("/auto-bench-results")
+
+
+def build_postprocess_container_command(
+    config: AutoBenchConfig,
+    *,
+    config_path: Path,
+    run_id: str,
+) -> list[str]:
+    mounts = ["-v", f"{project_root()}:/workspace"]
+    if _path_relative_to_project(config_path) is None:
+        mounts.extend([
+            "-v",
+            f"{Path(config_path).resolve().parent}:/auto-bench-config:ro",
+        ])
+    if _path_relative_to_project(config.run.results_dir) is None:
+        mounts.extend([
+            "-v",
+            f"{config.run.results_dir.resolve()}:/auto-bench-results",
+        ])
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--user",
+        host_user_spec(),
+        *mounts,
+        "-w",
+        "/workspace",
+        config.run.bench_image,
+        "python",
+        "/workspace/vllm_standalone_bench/auto_bench.py",
+        "postprocess",
+        "--config",
+        str(_postprocess_config_container_path(config_path)),
+        "--results-dir",
+        str(_postprocess_results_container_path(config.run.results_dir)),
+        "--run-id",
+        run_id,
+    ]
+
+
+def run_postprocess_container(
+    config: AutoBenchConfig,
+    *,
+    config_path: Path,
+    run_id: str,
+    runner: RunnerProtocol,
+) -> int:
+    command = build_postprocess_container_command(
+        config,
+        config_path=config_path,
+        run_id=run_id,
+    )
+    result = runner.run(command, check=False)
+    if result.returncode != 0:
+        details = result.stderr or result.stdout or "postprocess container failed"
+        logger.warning(
+            "postprocess container failed (%s): %s",
+            result.returncode,
+            details.strip(),
+        )
+    return result.returncode
+
+
 def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                             bench_dir: Path) -> list[str]:
     bench = case.bench_profile
@@ -1104,6 +1198,7 @@ def build_bench_run_command(config: AutoBenchConfig, case: BenchmarkCase,
     cmd = [
         "docker", "run", "--rm",
         "--name", make_bench_container_name(case),
+        "--user", host_user_spec(),
         "--label", f"{NETWORK_MANAGED_LABEL}=true",
         "--label", f"{NETWORK_RUN_ID_LABEL}={case.run_id}",
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
@@ -3061,6 +3156,108 @@ def _stop_topology_resource_monitors(
         logger.warning("remote resource monitor result merge failed: %s", exc)
 
 
+def _read_optional_json_object(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("postprocess JSON read failed for %s: %s", path, exc)
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("postprocess JSON ignored because it is not an object: %s", path)
+        return None
+    return payload
+
+
+def _merge_resource_summaries_for_case(layout: CaseLayout) -> None:
+    summary = _read_optional_json_object(layout.bench_dir / "resource_summary.json")
+    if summary is not None:
+        append_summary_to_result_files(layout.bench_dir, summary)
+
+    resources_dir = layout.bench_dir / "resources"
+    if not resources_dir.is_dir():
+        return
+    summaries: dict[str, Any] = {}
+    for role_dir in sorted(resources_dir.iterdir()):
+        if not role_dir.is_dir():
+            continue
+        role_summary = _read_optional_json_object(role_dir / "resource_summary.json")
+        if role_summary is not None:
+            summaries[role_dir.name] = role_summary
+    if summaries:
+        append_prefixed_summaries_to_result_files(layout.bench_dir, summaries)
+
+
+def run_postprocess(config: AutoBenchConfig, run_id: str) -> int:
+    run_dir = config.run.results_dir / run_id
+    for case in expand_cases(config, run_id=run_id):
+        layout = build_layout(config, run_id, case)
+        try:
+            _merge_resource_summaries_for_case(layout)
+        except Exception as exc:
+            logger.warning(
+                "postprocess resource monitor result merge failed for %s: %s",
+                layout.bench_dir,
+                exc,
+            )
+    try:
+        aggregate_compare(config, run_dir)
+    except Exception as exc:
+        logger.warning("结果对比聚合失败：%s", exc)
+    return 0
+
+
+def _topology_start_failure_message(
+    role_command: RoleCommand,
+    result: Completed,
+    *,
+    secrets_to_redact: set[str],
+) -> str:
+    detail = _redact_known_secrets(
+        (result.stderr or result.stdout or "").strip(),
+        secrets_to_redact,
+    )
+    first_line = detail.splitlines()[0].strip() if detail else ""
+    message = (
+        "topology role failed to start: "
+        f"{role_command.role_name} ({result.returncode})"
+    )
+    if first_line:
+        message = f"{message}: {first_line[:500]}"
+    return message
+
+
+def _write_topology_start_failure_artifact(
+    layout: CaseLayout,
+    role_command: RoleCommand,
+    result: Completed,
+    *,
+    secrets_to_redact: set[str],
+) -> None:
+    log_dir = layout.bench_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stdout_text = _redact_known_secrets(result.stdout or "", secrets_to_redact)
+    stderr_text = _redact_known_secrets(result.stderr or "", secrets_to_redact)
+    content = "\n".join([
+        f"role: {role_command.role_name}",
+        f"container: {role_command.container_name}",
+        f"returncode: {result.returncode}",
+        f"command: {shlex.join(role_command.masked_argv)}",
+        "",
+        "stdout:",
+        stdout_text.rstrip(),
+        "",
+        "stderr:",
+        stderr_text.rstrip(),
+        "",
+    ])
+    (log_dir / f"{role_command.role_name}.start.log").write_text(
+        content,
+        encoding="utf-8",
+    )
+
+
 def run_topology_group(config: AutoBenchConfig, run_id: str,
                        local_runner: Runner,
                        remote_runner: RemoteDockerRunner,
@@ -3103,10 +3300,22 @@ def run_topology_group(config: AutoBenchConfig, run_id: str,
                 check=False,
             )
             if start_result.returncode != 0:
-                raise RuntimeError(
-                    "topology role failed to start: "
-                    f"{role_command.role_name} ({start_result.returncode})"
+                secrets_to_redact = _topology_secret_values(
+                    config,
+                    serve_case,
+                    role_commands,
                 )
+                _write_topology_start_failure_artifact(
+                    serve_layout,
+                    role_command,
+                    start_result,
+                    secrets_to_redact=secrets_to_redact,
+                )
+                raise RuntimeError(_topology_start_failure_message(
+                    role_command,
+                    start_result,
+                    secrets_to_redact=secrets_to_redact,
+                ))
             started_roles.append(role_command)
 
         for role_command in started_roles:
@@ -3263,7 +3472,8 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                    dry_run: bool = False,
                    lock_token: str | None = None,
                    initial_manifest: Manifest | None = None,
-                   cases_to_run: tuple[BenchmarkCase, ...] | None = None) -> int:
+                   cases_to_run: tuple[BenchmarkCase, ...] | None = None,
+                   config_path: Path | None = None) -> int:
     active_runner: Runner = runner or DockerRunner()
     if dry_run:
         return _run_controller_dry_run(config, run_id)
@@ -3471,9 +3681,14 @@ def run_controller(config: AutoBenchConfig, run_id: str,
 
         if not dry_run and not interrupted:
             try:
-                aggregate_compare(config, run_dir)
+                run_postprocess_container(
+                    config,
+                    config_path=config_path or (run_dir / RESUME_CONFIG_FILE),
+                    run_id=run_id,
+                    runner=active_runner,
+                )
             except Exception as exc:
-                logger.warning("结果对比聚合失败：%s", exc)
+                logger.warning("postprocess container failed: %s", exc)
 
         write_state(run_dir, finished_state(run_id, manifest))
     except StopRequested as exc:
@@ -4164,6 +4379,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     logs_parser.add_argument("-f", "--follow", action="store_true")
     logs_parser.add_argument("--controller", action="store_true")
 
+    postprocess_parser = subparsers.add_parser("postprocess", help="merge resource metrics and compare results")
+    postprocess_parser.add_argument("--config", required=True, type=Path)
+    postprocess_parser.add_argument("--results-dir", type=Path)
+    postprocess_parser.add_argument("--run-id", required=True)
+    postprocess_parser.add_argument("--container", action="store_true")
+
     stop_parser = subparsers.add_parser("stop", help="stop detached controller")
     stop_parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     stop_parser.add_argument("--run-id", required=True)
@@ -4262,6 +4483,18 @@ def main(argv: list[str] | None = None) -> int:
             controller=args.controller,
         )
         return follow_file(log_path) if args.follow else print_log(log_path)
+    if args.command == "postprocess":
+        config = load_config(args.config)
+        if args.results_dir is not None:
+            config = _config_with_results_dir(config, args.results_dir)
+        if args.container:
+            return run_postprocess_container(
+                config,
+                config_path=args.config,
+                run_id=args.run_id,
+                runner=DockerRunner(),
+            )
+        return run_postprocess(config, args.run_id)
     if args.command == "resume":
         if args.child:
             try:
