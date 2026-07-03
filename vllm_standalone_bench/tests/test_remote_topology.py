@@ -65,8 +65,8 @@ def pd_topology_config(tmp_path):
             },
         },
         "prefill": [
-            {"name": "p1", "host": "p1", "port": 30000},
-            {"name": "p2", "host": "p2", "port": 30000},
+            {"name": "p1", "host": "p1", "port": 30000, "bootstrap_port": 12335},
+            {"name": "p2", "host": "p2", "port": 30000, "bootstrap_port": 12336},
         ],
         "decode": [
             {"name": "d1", "host": "d1", "port": 31000},
@@ -88,7 +88,6 @@ def test_sglang_pd_commands_render_worker_and_router_flags(tmp_path):
     topology["router_image"] = "sglang-router:offline"
     topology["network"] = "pd-net"
     topology["transfer_backend"] = "nixl"
-    topology["prefill"][0]["bootstrap_port"] = 12335
 
     config = ab.load_config(write_config(tmp_path, data))
     case = ab.expand_cases(config, run_id="run123")[0]
@@ -102,15 +101,20 @@ def test_sglang_pd_commands_render_worker_and_router_flags(tmp_path):
     pd_flag_index = router.index("--pd-disaggregation")
     assert router[pd_flag_index + 1] == "--prefill"
     assert "repeated" not in router
-    assert values_after(router, "--prefill") == [
-        "http://10.0.0.11:30000",
-        "http://10.0.0.12:30000",
+    prefill_positions = [
+        index for index, value in enumerate(router) if value == "--prefill"
+    ]
+    assert [
+        router[position + 1:position + 3]
+        for position in prefill_positions
+    ] == [
+        ["http://10.0.0.11:30000", "12335"],
+        ["http://10.0.0.12:30000", "12336"],
     ]
     assert values_after(router, "--decode") == [
         "http://10.0.0.21:31000",
         "http://10.0.0.22:31000",
     ]
-    assert "12335" not in values_after(router, "--prefill")
     assert (
         commands["p1"].container_name
         == "bench-pd-run123-qwen2_5_1_5b-sglang_pd_2p2d-p1"
@@ -140,6 +144,14 @@ def test_sglang_pd_commands_include_expected_labels_and_masked_argv(tmp_path):
     assert labels["vllm_auto_bench.role_name"] == "p1"
 
 
+def test_sglang_pd_rejects_prefill_without_bootstrap_port(tmp_path):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["prefill"][0].pop("bootstrap_port")
+
+    with pytest.raises(ab.ConfigError, match="prefill.*bootstrap_port"):
+        ab.load_config(write_config(tmp_path, data))
+
+
 def test_sglang_pd_commands_render_disaggregation_ib_device(tmp_path):
     data = pd_topology_config(tmp_path)
     topology = data["topology_profiles"][0]
@@ -156,6 +168,46 @@ def test_sglang_pd_commands_render_disaggregation_ib_device(tmp_path):
     assert value_after(p1, "--disaggregation-ib-device") == "mlx5_0"
     assert value_after(d1, "--disaggregation-ib-device") == "mlx5_0"
     assert "--disaggregation-ib-device" not in router
+
+
+def test_vllm_pd_p2p_rejects_missing_kv_port(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "p2p_nccl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+
+    with pytest.raises(ab.ConfigError, match="kv_port"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_vllm_pd_nixl_rejects_missing_side_channel_port(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "nixl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+
+    with pytest.raises(ab.ConfigError, match="side_channel_port"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_vllm_pd_rejects_unknown_structured_key(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {
+        "connector": "p2p_nccl",
+        "proxy": {"kind": "builtin"},
+        "unknown": True,
+    }
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+
+    with pytest.raises(ab.ConfigError, match="unknown"):
+        ab.load_config(write_config(tmp_path, data))
 
 
 def test_vllm_pd_worker_command_renders_kv_template(tmp_path):
