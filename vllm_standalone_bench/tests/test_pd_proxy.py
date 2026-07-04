@@ -10,6 +10,7 @@ from vllm_bench.pd_proxy import (
     build_nixl_prefill_body,
     build_p2p_prefill_body,
     build_p2p_request_id,
+    create_app,
     inject_kv_transfer_params,
     parse_endpoint,
 )
@@ -189,6 +190,38 @@ class FakeSession:
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
         return self.responses.pop(0)
+
+
+def test_proxy_app_accepts_large_request_body():
+    # 回归：aiohttp 默认 client_max_size=1MB 会把长 prompt 请求体以 HTTP 413 拒掉
+    # （实测 PD 在 131072/172032 长 prompt 下全军覆没）。create_app 必须放大上限，
+    # 2MB 请求体应被正常转发、返回 200 而非 413。
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def run_case():
+        session = FakeSession([
+            FakeResponse({"choices": []}),
+            FakeResponse({"choices": [{"text": "ok"}]}),
+        ])
+        proxy = PdProxy(
+            connector="p2p_nccl",
+            prefill=[Endpoint("p1", "http://p1:30000", "p1:21001")],
+            decode=[Endpoint("d1", "http://d1:31000", "d1:22001")],
+            session=session,
+        )
+        client = TestClient(TestServer(create_app(proxy)))
+        await client.start_server()
+        try:
+            big_prompt = "x" * (2 * 1024 * 1024)  # 2MB > aiohttp 默认 1MB
+            resp = await client.post(
+                "/v1/completions",
+                json={"model": "m", "prompt": big_prompt, "max_tokens": 8},
+            )
+            return resp.status
+        finally:
+            await client.close()
+
+    assert asyncio.run(run_case()) == 200
 
 
 def test_p2p_proxy_sends_prefill_then_decode():

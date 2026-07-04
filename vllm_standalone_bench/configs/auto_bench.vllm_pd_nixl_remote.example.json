@@ -386,7 +386,7 @@
     "output_lens": [1024],
     "parallel_nums": [1, 4, 8, 16, 24, 32, 48, 64, 96, 128],
     "epochs": 3,
-    "prefix_ratio": 0.65,
+    "prefix_ratio": 0.1,
     "warmup_requests": 4,
     "warmup_concurrency": 8,
     "cross_product": true,

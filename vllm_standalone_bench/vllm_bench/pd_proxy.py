@@ -26,6 +26,9 @@ HOP_BY_HOP_HEADERS = {
 
 MAX_PREFILL_ERROR_CHARS = 2048
 REQUEST_ID_HEADER = "X-Request-Id"
+# vLLM 长 prompt（数十万 token）请求体远超 aiohttp 默认的 1MB 上限，
+# 放大 server 端可接收的请求体大小，避免长上下文请求被 HTTP 413 拒掉。
+MAX_CLIENT_REQUEST_BYTES = 512 * 1024 * 1024  # 512 MB
 
 
 @dataclass(frozen=True)
@@ -258,7 +261,7 @@ async def root_v1(_request: web.Request) -> web.Response:
 
 
 def create_app(proxy: PdProxy) -> web.Application:
-    app = web.Application()
+    app = web.Application(client_max_size=MAX_CLIENT_REQUEST_BYTES)
     app["proxy"] = proxy
     app.router.add_get("/health", health)
     app.router.add_get("/v1", root_v1)
