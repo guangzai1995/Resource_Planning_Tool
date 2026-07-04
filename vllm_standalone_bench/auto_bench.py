@@ -1623,34 +1623,31 @@ def cleanup_network(config: AutoBenchConfig, runner: Runner,
     stop_requested = False
     if not dry_run:
         if run_id is None:
-            print("warning: network cleanup skipped because run_id is unknown", file=sys.stderr)
+            logger.warning("network cleanup skipped because run_id is unknown")
             return False
         try:
             if not network_has_run_labels(runner, config.run.network, run_id):
-                print(
-                    f"warning: network cleanup skipped because labels do not match: {config.run.network}",
-                    file=sys.stderr,
+                logger.warning(
+                    "network cleanup skipped because labels do not match: %s",
+                    config.run.network,
                 )
                 return False
         except StopRequested:
             return True
         except Exception as exc:
-            print(
-                f"warning: network cleanup skipped after label inspect failed: {exc}",
-                file=sys.stderr,
-            )
+            logger.warning("network cleanup skipped after label inspect failed: %s", exc)
             return False
     try:
         connected = [] if dry_run else connected_network_containers(runner, config.run.network)
     except StopRequested:
         return True
     except Exception as exc:
-        print(f"warning: network cleanup skipped after inspect failed: {exc}", file=sys.stderr)
+        logger.warning("network cleanup skipped after inspect failed: %s", exc)
         return False
     if connected:
-        print(
-            f"warning: network cleanup skipped because containers are still connected: {connected}",
-            file=sys.stderr,
+        logger.warning(
+            "network cleanup skipped because containers are still connected: %s",
+            connected,
         )
         return False
     if should_cleanup_network(
@@ -1665,14 +1662,15 @@ def cleanup_network(config: AutoBenchConfig, runner: Runner,
             try:
                 result = runner.run(cmd, check=False)
                 if result.returncode != 0:
-                    print(
-                        f"warning: network cleanup failed ({result.returncode}): {result.stderr}",
-                        file=sys.stderr,
+                    logger.warning(
+                        "network cleanup failed (%d): %s",
+                        result.returncode,
+                        result.stderr,
                     )
             except StopRequested:
                 stop_requested = True
             except Exception as exc:
-                print(f"warning: network cleanup failed: {exc}", file=sys.stderr)
+                logger.warning("network cleanup failed: %s", exc)
     return stop_requested
 
 
@@ -2220,10 +2218,10 @@ def cleanup_topology_roles_best_effort(remote_runner: RemoteDockerRunner,
             stop_requested = stop_requested or exc
             continue
         except Exception as exc:
-            print(
-                "warning: topology cleanup skipped after label inspect failed "
-                f"for {role_command.container_name}: {exc}",
-                file=sys.stderr,
+            logger.warning(
+                "topology cleanup skipped after label inspect failed for %s: %s",
+                role_command.container_name,
+                exc,
             )
             continue
         if labels is None:
@@ -2239,10 +2237,10 @@ def cleanup_topology_roles_best_effort(remote_runner: RemoteDockerRunner,
             except StopRequested as exc:
                 stop_requested = stop_requested or exc
             except Exception as exc:
-                print(
-                    "warning: topology cleanup failed for "
-                    f"{role_command.container_name}: {exc}",
-                    file=sys.stderr,
+                logger.warning(
+                    "topology cleanup failed for %s: %s",
+                    role_command.container_name,
+                    exc,
                 )
     return stop_requested
 
@@ -2598,18 +2596,18 @@ def active_state_blocks_start(run_dir: Path, *, allow_pid: int | None = None,
     try:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
     except (OSError, UnicodeDecodeError, ValueError):
-        print(
-            f"run is already active but controller pid is unavailable: {run_dir}",
-            file=sys.stderr,
+        logger.warning(
+            "run is already active but controller pid is unavailable: %s",
+            run_dir,
         )
         return True
     if allow_pid is not None and pid == allow_pid:
         return False
     if pid <= 1:
-        print(f"run is already active with invalid controller pid: {run_dir}", file=sys.stderr)
+        logger.warning("run is already active with invalid controller pid: %s", run_dir)
         return True
     if is_process_running(pid):
-        print(f"run is already active: {run_dir} (pid {pid})", file=sys.stderr)
+        logger.warning("run is already active: %s (pid %s)", run_dir, pid)
         return True
     return False
 
@@ -2640,12 +2638,12 @@ def reject_active_run(run_dir: Path, *, allow_pid: int | None = None,
     if run_lock_path(run_dir).exists() and not run_lock_token_matches(run_dir, lock_token):
         if cleanup_stale_terminal_run_lock(run_dir, lock_token=lock_token):
             return False
-        print(f"run is already active: {run_dir}", file=sys.stderr)
+        logger.warning("run is already active: %s", run_dir)
         return True
     pid = active_run_pid(run_dir)
     if pid is None or pid == allow_pid:
         return False
-    print(f"run is already active: {run_dir} (pid {pid})", file=sys.stderr)
+    logger.warning("run is already active: %s (pid %s)", run_dir, pid)
     return True
 
 
@@ -3368,7 +3366,7 @@ def run_topology_group(config: AutoBenchConfig, run_id: str,
     try:
         with bench_log.case_scope(total=total, phase="serve",
                                   label=serve_case.serving_name):
-            logger.info("serve topology roles for %s", serve_case.serving_name)
+            logger.info("starting serve")
             role_commands = require_topology_case(serve_case).build_commands(
                 config,
                 serve_case,
@@ -3421,7 +3419,7 @@ def run_topology_group(config: AutoBenchConfig, run_id: str,
         for case in group_cases:
             with bench_log.case_scope(total=total, phase="bench",
                                       idx=case_index[_case_key(case)]):
-                logger.info("bench topology case")
+                logger.info("running bench")
                 layout = build_layout(config, run_id, case)
                 layout.bench_dir.mkdir(parents=True, exist_ok=True)
                 write_state(
@@ -3542,7 +3540,7 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
             serve_layout = build_layout(config, run_id, serve_case)
             with bench_log.case_scope(total=total, phase="serve",
                                       label=serve_case.serving_name):
-                logger.info("serve commands for %s", serve_case.serving_name)
+                logger.info("starting serve")
                 if serve_case.topology_profile is not None:
                     commands = serve_case.topology_profile.build_commands(
                         config,
@@ -3559,8 +3557,9 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
                 layout = build_layout(config, run_id, case)
                 with bench_log.case_scope(total=total, phase="bench",
                                           idx=case_index[_case_key(case)]):
-                    logger.info("bench command")
+                    logger.info("running bench")
                     print_cmd(build_bench_run_command(config, case, layout.bench_dir))
+        logger.info("run finished: run_id=%s cases=%d (dry-run)", run_id, total)
         return 0
     finally:
         if should_cleanup_network(
@@ -3595,7 +3594,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
     try:
         run_lock = acquire_run_lock(run_dir, token=lock_token)
     except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+        logger.error("acquire run lock failed: %s", exc)
         return 1
     if reject_active_run(run_dir, allow_pid=os.getpid(), lock_token=run_lock.token):
         release_run_lock(run_lock)
@@ -3633,6 +3632,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         grouped = _group_cases_by_serve(cases)
         remote_runner: RemoteDockerRunner | None = None
 
+        logger.info("run started: run_id=%s cases=%d", run_id, total)
         for group_cases in grouped.values():
             serve_case = group_cases[0]
             serve_layout = build_layout(config, run_id, serve_case)
@@ -3669,7 +3669,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
             try:
                 with bench_log.case_scope(total=total, phase="serve",
                                           label=serve_case.serving_name):
-                    logger.info("serve commands for %s", serve_case.serving_name)
+                    logger.info("starting serve")
                     if dry_run:
                         print_cmd(serve_cmd)
                         ready = True
@@ -3713,7 +3713,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                 for case in group_cases:
                     with bench_log.case_scope(total=total, phase="bench",
                                               idx=case_index[_case_key(case)]):
-                        logger.info("bench command")
+                        logger.info("running bench")
                         layout = build_layout(config, run_id, case)
                         layout.bench_dir.mkdir(parents=True, exist_ok=True)
                         write_state(
@@ -3849,6 +3849,10 @@ def run_controller(config: AutoBenchConfig, run_id: str,
         finally:
             if run_lock is not None:
                 release_run_lock(run_lock)
+    logger.info(
+        "run finished: %s",
+        _format_counts(_case_status_counts(manifest.cases, manifest.total)),
+    )
     return exit_code
 
 

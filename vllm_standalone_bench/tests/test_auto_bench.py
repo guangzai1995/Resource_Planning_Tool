@@ -3470,7 +3470,7 @@ def test_controller_dry_run_prints_commands_without_result_files(tmp_path, capsy
     assert runner.commands == []
 
 
-def test_cleanup_network_warns_when_external_containers_connected(tmp_path, capsys):
+def test_cleanup_network_warns_when_external_containers_connected(tmp_path, caplog):
     class ConnectedNetworkRunner(FakeRunner):
         def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
             if args[:4] == ["docker", "inspect", "--format", "{{json .Containers}}"]:
@@ -3483,14 +3483,13 @@ def test_cleanup_network_warns_when_external_containers_connected(tmp_path, caps
 
     stop_requested = ab.cleanup_network(config, runner, owned=True, dry_run=False, run_id="run123")
 
-    captured = capsys.readouterr()
     assert stop_requested is False
     assert not any(command[:3] == ["docker", "network", "rm"] for command in runner.commands)
-    assert "warning" in captured.err.lower()
-    assert "external" in captured.err.lower()
+    assert "network cleanup skipped" in caplog.text.lower()
+    assert "external" in caplog.text.lower()
 
 
-def test_cleanup_network_warns_when_network_rm_fails(tmp_path, capsys):
+def test_cleanup_network_warns_when_network_rm_fails(tmp_path, caplog):
     class FailingNetworkRmRunner(FakeRunner):
         def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
             if args[:3] == ["docker", "network", "rm"]:
@@ -3503,11 +3502,10 @@ def test_cleanup_network_warns_when_network_rm_fails(tmp_path, capsys):
 
     stop_requested = ab.cleanup_network(config, runner, owned=True, dry_run=False, run_id="run123")
 
-    captured = capsys.readouterr()
     assert stop_requested is False
     assert any(command[:3] == ["docker", "network", "rm"] for command in runner.commands)
-    assert "warning" in captured.err.lower()
-    assert "network busy" in captured.err
+    assert "network cleanup failed" in caplog.text.lower()
+    assert "network busy" in caplog.text
 
 
 def test_controller_group_exception_skips_only_unrecorded_cases(tmp_path, monkeypatch):
@@ -4767,7 +4765,7 @@ def test_start_detached_uses_devnull_stdin(tmp_path, monkeypatch):
     assert calls[0][1]["stdin"] is ab.subprocess.DEVNULL
 
 
-def test_start_detached_rejects_existing_active_run_dir(tmp_path, monkeypatch, capsys):
+def test_start_detached_rejects_existing_active_run_dir(tmp_path, monkeypatch, caplog):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     config = ab.load_config(config_path)
     run_dir = tmp_path / "results" / "run123"
@@ -4787,14 +4785,13 @@ def test_start_detached_rejects_existing_active_run_dir(tmp_path, monkeypatch, c
 
     exit_code = ab.start_detached(config_path, config, "run123")
 
-    captured = capsys.readouterr()
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     assert exit_code == 1
     assert state["status"] == "running"
-    assert "active" in captured.err
+    assert "active" in caplog.text
 
 
-def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, capsys):
+def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -4809,15 +4806,14 @@ def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, c
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     assert result == 1
     assert state["status"] == "running"
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
-def test_run_controller_rejects_active_state_without_pid_file(tmp_path, capsys):
+def test_run_controller_rejects_active_state_without_pid_file(tmp_path, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -4830,16 +4826,15 @@ def test_run_controller_rejects_active_state_without_pid_file(tmp_path, capsys):
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     assert result == 1
     assert state["status"] == "running"
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert not (run_dir / "config.resolved.json").exists()
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
-def test_run_controller_rejects_active_state_with_invalid_pid_file(tmp_path, capsys):
+def test_run_controller_rejects_active_state_with_invalid_pid_file(tmp_path, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -4853,15 +4848,14 @@ def test_run_controller_rejects_active_state_with_invalid_pid_file(tmp_path, cap
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     assert result == 1
     assert state["status"] == "starting"
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
-def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, capsys):
+def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, caplog):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     config = ab.load_config(config_path)
     run_dir = tmp_path / "results" / "run123"
@@ -4875,9 +4869,8 @@ def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, capsys)
 
     exit_code = ab.start_detached(config_path, config, "run123")
 
-    captured = capsys.readouterr()
     assert exit_code == 1
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert (run_dir / ".run.lock").exists()
 
 
@@ -4928,7 +4921,7 @@ def test_run_controller_reclaims_terminal_stale_lock(tmp_path, monkeypatch):
 def test_run_controller_does_not_delete_new_lock_after_stale_recheck(
     tmp_path,
     monkeypatch,
-    capsys,
+    caplog,
 ):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
@@ -4958,9 +4951,8 @@ def test_run_controller_does_not_delete_new_lock_after_stale_recheck(
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     assert result == 1
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert json.loads((run_dir / ".run.lock").read_text(encoding="utf-8")) == new_payload
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
@@ -4990,7 +4982,7 @@ def test_release_run_lock_does_not_delete_replaced_lock(tmp_path, monkeypatch):
     assert json.loads(lock_path.read_text(encoding="utf-8")) == new_payload
 
 
-def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeypatch, capsys):
+def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeypatch, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -5009,14 +5001,13 @@ def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeyp
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     assert result == 1
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert (run_dir / ".run.lock").exists()
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
-def test_run_controller_corrupt_lock_fail_closed(tmp_path, capsys):
+def test_run_controller_corrupt_lock_fail_closed(tmp_path, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -5030,9 +5021,8 @@ def test_run_controller_corrupt_lock_fail_closed(tmp_path, capsys):
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     assert result == 1
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert (run_dir / ".run.lock").exists()
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
@@ -6098,3 +6088,13 @@ def test_controller_log_contains_case_prefix(tmp_path):
     assert rc == 0
     text = (config.run.results_dir / run_id / "controller.log").read_text(encoding="utf-8")
     assert ("[case " in text) or ("[serve]" in text), text
+
+
+def test_controller_log_has_run_finished_node(tmp_path):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_id = "log_progress_001"
+    rc = ab.run_controller(config, run_id, runner=FakeRunner(), dry_run=True)
+    assert rc == 0
+    text = (config.run.results_dir / run_id / "controller.log").read_text(encoding="utf-8")
+    assert "run finished" in text
