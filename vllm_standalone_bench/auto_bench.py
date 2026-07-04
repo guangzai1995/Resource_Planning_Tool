@@ -4034,15 +4034,37 @@ def _format_current(current: Any) -> str:
     ])
 
 
+_STATUS_COUNT_COLOR = {
+    "passed": bench_log._Color.GREEN,
+    "failed": bench_log._Color.RED,
+    "running": bench_log._Color.YELLOW,
+    "skipped": bench_log._Color.GREY,
+}
+
+
+def _stdout_supports_color() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except (OSError, ValueError):
+        return False
+
+
 def _format_counts(counts: Any) -> str:
     if not isinstance(counts, dict):
         return "-"
     keys = ["passed", "failed", "skipped", "running", "completed", "total"]
-    return " ".join(
-        f"{key}={counts[key]}"
-        for key in keys
-        if key in counts
-    )
+    color = _stdout_supports_color()
+    parts: list[str] = []
+    for key in keys:
+        if key not in counts:
+            continue
+        text = f"{key}={counts[key]}"
+        if color:
+            c = _STATUS_COUNT_COLOR.get(key)
+            if c:
+                text = f"{c}{text}{bench_log._Color.RESET}"
+        parts.append(text)
+    return " ".join(parts)
 
 
 def print_status(run_dir: Path) -> int:
@@ -4095,16 +4117,37 @@ def print_status(run_dir: Path) -> int:
     return exit_code
 
 
-def follow_file(path: Path) -> int:
+_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+
+def _line_matches_level(line: str, level_upper: str) -> bool:
+    """行级别 >= 指定级别则保留（如 level=WARNING 会包含 ERROR/CRITICAL）。
+
+    仅匹配带级别字段的单行；无级别前缀的行（第三方/docker 回显、traceback 续行）不命中。
+    FileFormatter 输出 ``%(levelname)-5s``（见 bench_log._LINE_FMT），级别字段前后
+    各有一个空格（短级别如 INFO 右侧补齐到 5 列再加 fmt 空格），故 ``f" {name} "``
+    能精确匹配各级别，不会误命中 message 中的同名子串。
+    """
+    threshold = _LEVEL_ORDER.get(level_upper, 0)
+    for name, val in _LEVEL_ORDER.items():
+        if val >= threshold and f" {name} " in line:
+            return True
+    return False
+
+
+def follow_file(path: Path, level: str | None = None) -> int:
     if not path.exists():
         print(f"log file not found: {path}", file=sys.stderr)
         return 1
+    level_upper = level.upper() if level else None
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             handle.seek(0, os.SEEK_END)
             while True:
                 line = handle.readline()
                 if line:
+                    if level_upper and not _line_matches_level(line, level_upper):
+                        continue
                     sys.stdout.write(line)
                     sys.stdout.flush()
                 else:
@@ -4116,12 +4159,17 @@ def follow_file(path: Path) -> int:
         return 0
 
 
-def print_log(path: Path) -> int:
+def print_log(path: Path, level: str | None = None) -> int:
     if not path.exists():
         print(f"log file not found: {path}", file=sys.stderr)
         return 1
+    level_upper = level.upper() if level else None
     try:
-        sys.stdout.write(path.read_text(encoding="utf-8", errors="replace"))
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if level_upper and not _line_matches_level(line, level_upper):
+                    continue
+                sys.stdout.write(line)
     except (OSError, UnicodeDecodeError) as exc:
         print(f"failed to read log file: {exc}", file=sys.stderr)
         return 1
@@ -4526,6 +4574,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     logs_parser.add_argument("--run-id", required=True)
     logs_parser.add_argument("-f", "--follow", action="store_true")
     logs_parser.add_argument("--controller", action="store_true")
+    logs_parser.add_argument(
+        "--level",
+        help="only show lines at or above this level "
+        "(DEBUG/INFO/WARNING/ERROR/CRITICAL); unmatched non-level lines are hidden",
+    )
 
     postprocess_parser = subparsers.add_parser("postprocess", help="merge resource metrics and compare results")
     postprocess_parser.add_argument("--config", required=True, type=Path)
@@ -4634,7 +4687,11 @@ def main(argv: list[str] | None = None) -> int:
             args.results_dir / args.run_id,
             controller=args.controller,
         )
-        return follow_file(log_path) if args.follow else print_log(log_path)
+        return (
+            follow_file(log_path, level=args.level)
+            if args.follow
+            else print_log(log_path, level=args.level)
+        )
     if args.command == "postprocess":
         config = load_config(args.config)
         if args.results_dir is not None:

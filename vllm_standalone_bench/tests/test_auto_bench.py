@@ -3928,6 +3928,47 @@ def test_follow_file_handles_open_error(tmp_path, monkeypatch, capsys):
     assert "cannot read" in captured.err
 
 
+def test_print_status_renders_counts_summary(tmp_path, capsys, monkeypatch):
+    run_dir = tmp_path / "rd"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text(json.dumps({
+        "run_id": "rd", "status": "running",
+        "current": {"model": "m", "serve_profile": "sp", "bench_profile": "bp"},
+        "counts": {"passed": 2, "failed": 1, "running": 1, "total": 4},
+    }), encoding="utf-8")
+    monkeypatch.setattr("sys.stderr.isatty", lambda: False)
+    rc = ab.print_status(run_dir)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "passed=2" in out
+    assert "failed=1" in out
+
+
+def test_follow_file_level_filter(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "controller.log"
+    log.write_text("", encoding="utf-8")
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    "2026-07-04 12:00:00 INFO  [case 1/2][bench] ok\n"
+                    "2026-07-04 12:00:01 ERROR [case 1/2][bench] boom\n"
+                )
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ab.time, "sleep", fake_sleep)
+
+    rc = ab.follow_file(log, level="ERROR")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "boom" in out
+    assert "ok" not in out  # INFO 行被 level 过滤
+
+
 def write_stop_state(run_dir, status="running"):
     ab.write_state(run_dir, {
         "run_id": run_dir.name,
