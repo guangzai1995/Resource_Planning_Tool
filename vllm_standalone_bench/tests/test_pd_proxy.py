@@ -82,6 +82,32 @@ def test_build_p2p_prefill_body_forces_one_token_non_streaming():
     assert body["max_tokens"] == 32
 
 
+@pytest.mark.parametrize("builder", [
+    build_p2p_prefill_body,
+    build_nixl_prefill_body,
+])
+def test_prefill_body_strips_stream_options(builder):
+    # prefill 强制 stream=False，必须移除 stream_options，否则 vLLM 会以
+    # "Stream options can only be defined when `stream=True`" 拒绝（400）。
+    body = {
+        "model": "m",
+        "messages": [],
+        "max_tokens": 32,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    prefill_body = (
+        builder(body, request_id="rid")
+        if builder is build_p2p_prefill_body
+        else builder(body)
+    )
+
+    assert prefill_body["stream"] is False
+    assert "stream_options" not in prefill_body
+    # 原始请求体不应被修改
+    assert body["stream_options"] == {"include_usage": True}
+
+
 def test_build_nixl_prefill_body_injects_remote_decode_marker():
     body = {"model": "m", "messages": [], "max_tokens": 32, "stream": True}
     prefill_body = build_nixl_prefill_body(body)

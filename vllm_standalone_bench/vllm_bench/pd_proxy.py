@@ -73,6 +73,9 @@ def _one_token_body(body: dict[str, Any]) -> dict[str, Any]:
     copied = copy.deepcopy(body)
     copied["max_tokens"] = 1
     copied["stream"] = False
+    # prefill 强制非流式，必须移除 stream_options，否则 vLLM 会以 400 拒绝：
+    # "Stream options can only be defined when `stream=True`."
+    copied.pop("stream_options", None)
     return copied
 
 
