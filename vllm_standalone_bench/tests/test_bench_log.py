@@ -77,3 +77,56 @@ def test_case_scope_resets_on_exception():
         with bench_log.case_scope(total=8, phase="bench", idx=1):
             raise RuntimeError("boom")
     assert "[case" not in bench_log.FileFormatter().format(rec)
+
+
+@pytest.fixture
+def clean_root():
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    saved_level = root.level
+    saved_re = logging.raiseExceptions
+    root.handlers.clear()
+    yield root
+    root.handlers.clear()
+    for h in saved:
+        root.addHandler(h)
+    root.setLevel(saved_level)
+    logging.raiseExceptions = saved_re
+
+
+def test_setup_logging_file_handler_always_attached(tmp_path, clean_root):
+    bench_log.setup_logging(tmp_path, color=False)
+    kinds = {type(h).__name__ for h in clean_root.handlers}
+    assert "FileHandler" in kinds
+    assert "StreamHandler" not in kinds  # color=False（detach 模拟）不挂彩色 console
+
+
+def test_setup_logging_color_true_attaches_console(tmp_path, clean_root):
+    bench_log.setup_logging(tmp_path, color=True)
+    sh = [h for h in clean_root.handlers if type(h).__name__ == "StreamHandler"]
+    assert sh and sh[0].formatter.color is True
+    kinds = {type(h).__name__ for h in clean_root.handlers}
+    assert "FileHandler" in kinds
+
+
+def test_setup_logging_level_applied(tmp_path, clean_root):
+    bench_log.setup_logging(tmp_path, level="WARNING", color=False)
+    assert clean_root.level == logging.WARNING
+
+
+def test_setup_logging_writes_to_controller_log(tmp_path, clean_root):
+    bench_log.setup_logging(tmp_path, color=False)
+    logging.getLogger("auto_bench").warning("boom-city")
+    for h in clean_root.handlers:
+        h.flush()
+    log_text = (tmp_path / "controller.log").read_text(encoding="utf-8")
+    assert "boom-city" in log_text
+    assert "WARNING" in log_text
+
+
+def test_setup_logging_is_idempotent(tmp_path, clean_root):
+    bench_log.setup_logging(tmp_path, color=False)
+    n1 = len(clean_root.handlers)
+    bench_log.setup_logging(tmp_path, color=False)
+    n2 = len(clean_root.handlers)
+    assert n2 == n1  # 连续调两次 handler 数不翻倍

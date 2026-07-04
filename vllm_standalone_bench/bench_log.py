@@ -5,14 +5,16 @@
 - ConsoleHandler 仅 sys.stderr.isatty() 时挂（彩色）
 - case_scope 注入 [case idx/total][phase] 或 [phase][label] 前缀（contextvars）
 
-本模块已实现颜色常量、_CTX ContextVar、File/Console Formatter 与 case_scope；
-setup_logging / get_logger 由后续任务追加。
+本模块已完整实现：颜色常量、`_CTX` ContextVar、File/Console Formatter、
+`case_scope`、`setup_logging`、`get_logger`。
 """
 from __future__ import annotations
 
 import contextlib
 import contextvars
 import logging
+import sys
+from pathlib import Path
 
 
 # case 上下文：case_scope 运行时 set 为 (idx, total, phase, label)。
@@ -111,3 +113,44 @@ class ConsoleFormatter(_BaseFormatter):
             return msg
         c = LEVEL_COLOR.get(record.levelname, "")
         return f"{c}{msg}{_Color.RESET}" if c else msg
+
+
+def setup_logging(run_dir: Path, level: str = "INFO", *, color: bool | None = None,
+                  log_file: Path | None = None) -> None:
+    """初始化 root logger：FileHandler（始终）+ ConsoleHandler（仅 color=True）。
+
+    color=None 时按 sys.stderr.isatty() 自动决定；isatty 检测失败回退 False。
+    detach 模式 stderr 被重定向（非 tty）→ color=False → 不挂彩色 ConsoleHandler，
+    避免与 FileHandler 双写 controller.log。幂等：先清 root 旧 handler 再挂。
+    """
+    logging.raiseExceptions = False
+    if color is None:
+        try:
+            color = sys.stderr.isatty()
+        except (OSError, ValueError):
+            color = False
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+        h.close()
+    root.setLevel(level)
+    target = Path(log_file) if log_file else (Path(run_dir) / "controller.log")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(target, mode="a", encoding="utf-8")
+        fh.setFormatter(FileFormatter())
+        fh.setLevel(level)
+        root.addHandler(fh)
+    except OSError:
+        # FileHandler 创建失败（磁盘满/权限）→ 静默降级；color=True 时下面仍挂 ConsoleHandler
+        pass
+    if color:
+        ch = logging.StreamHandler(sys.stderr)
+        ch.setFormatter(ConsoleFormatter(color=True))
+        ch.setLevel(level)
+        root.addHandler(ch)
+
+
+def get_logger(name: str) -> logging.Logger:
+    """返回已配置好的 logger，调用方直接 .info/.warning/.error。"""
+    return logging.getLogger(name)
