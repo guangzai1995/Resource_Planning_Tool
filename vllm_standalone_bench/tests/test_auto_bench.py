@@ -6087,4 +6087,4 @@ def test_run_controller_dry_run_logs_to_controller_log(tmp_path):
     log_path = config.run.results_dir / run_id / "controller.log"
     assert log_path.exists(), "controller.log should be created"
     text = log_path.read_text(encoding="utf-8")
-    assert "INFO" in text or "WARNING" in text
+    assert "controller started" in text

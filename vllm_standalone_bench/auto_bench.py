@@ -3551,15 +3551,14 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                    cases_to_run: tuple[BenchmarkCase, ...] | None = None,
                    config_path: Path | None = None) -> int:
     active_runner: Runner = runner or DockerRunner()
-    run_dir_preview = config.run.results_dir / run_id
-    bench_log.setup_logging(run_dir_preview)
+    run_dir = config.run.results_dir / run_id
+    bench_log.setup_logging(run_dir)
     logger.info("controller started: run_id=%s dry_run=%s", run_id, dry_run)
     if dry_run:
         return _run_controller_dry_run(config, run_id)
 
     all_cases = expand_cases(config, run_id=run_id)
     cases = all_cases if cases_to_run is None else cases_to_run
-    run_dir = config.run.results_dir / run_id
     if reject_active_run(run_dir, allow_pid=os.getpid(), lock_token=lock_token):
         return 1
     run_lock: RunLock | None = None
