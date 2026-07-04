@@ -72,6 +72,11 @@ def build_p2p_request_id(
 def _one_token_body(body: dict[str, Any]) -> dict[str, Any]:
     copied = copy.deepcopy(body)
     copied["max_tokens"] = 1
+    # chat completions 用 max_completion_tokens，且 vLLM 里它优先于 max_tokens；
+    # 若不一并钳到 1，prefill 节点会按原值继续 decode，触发
+    # p2p_nccl_connector 的 `assert req_id in self.chunked_prefill` 崩溃。
+    if "max_completion_tokens" in copied:
+        copied["max_completion_tokens"] = 1
     copied["stream"] = False
     # prefill 强制非流式，必须移除 stream_options，否则 vLLM 会以 400 拒绝：
     # "Stream options can only be defined when `stream=True`."
