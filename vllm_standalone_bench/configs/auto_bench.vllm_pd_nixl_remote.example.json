@@ -362,7 +362,7 @@
   "serve_profiles": [{
     "name": "vllm_baseline_4gpu_tp4",
     "engine": "vllm",
-    "gpus": "0,1,2,3",
+    "gpus": "all",
     "args": [
       "--tensor-parallel-size", "4",
       "--trust-remote-code",
