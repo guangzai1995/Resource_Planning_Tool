@@ -29,8 +29,7 @@
         "proxy": {"kind": "builtin"}
       },
       "env": {
-        "UCX_TLS": "all",
-        "UCX_NET_DEVICES": "all"
+        "UCX_TLS": "rc,cuda_copy,tcp"
       },
       "hosts": {
         "p1": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
@@ -145,8 +144,7 @@
         "proxy": {"kind": "builtin"}
       },
       "env": {
-        "UCX_TLS": "all",
-        "UCX_NET_DEVICES": "all"
+        "UCX_TLS": "rc,cuda_copy,tcp"
       },
       "hosts": {
         "p1": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
@@ -259,8 +257,7 @@
         "proxy": {"kind": "builtin"}
       },
       "env": {
-        "UCX_TLS": "all",
-        "UCX_NET_DEVICES": "all"
+        "UCX_TLS": "rc,cuda_copy,tcp"
       },
       "hosts": {
         "p1": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
