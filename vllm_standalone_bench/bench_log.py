@@ -121,7 +121,8 @@ def setup_logging(run_dir: Path, level: str = "INFO", *, color: bool | None = No
 
     color=None 时按 sys.stderr.isatty() 自动决定；isatty 检测失败回退 False。
     detach 模式 stderr 被重定向（非 tty）→ color=False → 不挂彩色 ConsoleHandler，
-    避免与 FileHandler 双写 controller.log。幂等：先清 root 旧 handler 再挂。
+    避免与 FileHandler 双写 controller.log。幂等：只清本门面挂过的 handler
+    （打 ``_bench_log`` 标记），不清第三方/pytest caplog handler。
     """
     logging.raiseExceptions = False
     if color is None:
@@ -130,9 +131,12 @@ def setup_logging(run_dir: Path, level: str = "INFO", *, color: bool | None = No
         except (OSError, ValueError):
             color = False
     root = logging.getLogger()
+    # 只清本门面之前挂的 handler，不清第三方/pytest caplog handler
+    # （幂等：重复调用不累积自己的 handler）
     for h in list(root.handlers):
-        root.removeHandler(h)
-        h.close()
+        if getattr(h, "_bench_log", False):
+            root.removeHandler(h)
+            h.close()
     root.setLevel(level)
     target = Path(log_file) if log_file else (Path(run_dir) / "controller.log")
     try:
@@ -140,6 +144,7 @@ def setup_logging(run_dir: Path, level: str = "INFO", *, color: bool | None = No
         fh = logging.FileHandler(target, mode="a", encoding="utf-8")
         fh.setFormatter(FileFormatter())
         fh.setLevel(level)
+        fh._bench_log = True
         root.addHandler(fh)
     except OSError:
         # FileHandler 创建失败（磁盘满/权限）→ 静默降级；color=True 时下面仍挂 ConsoleHandler
@@ -148,6 +153,7 @@ def setup_logging(run_dir: Path, level: str = "INFO", *, color: bool | None = No
         ch = logging.StreamHandler(sys.stderr)
         ch.setFormatter(ConsoleFormatter(color=True))
         ch.setLevel(level)
+        ch._bench_log = True
         root.addHandler(ch)
 
 

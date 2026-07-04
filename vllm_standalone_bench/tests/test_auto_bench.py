@@ -2312,9 +2312,6 @@ def test_topology_prefixed_resource_merge_failed_does_not_fail_bench(
     monkeypatch.setattr(ab, "RemoteDockerRunner", lambda: remote, raising=False)
     monkeypatch.setattr(ab, "wait_for_remote_ready", lambda *a, **k: True, raising=False)
     monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
-    # setup_logging reconfigures the root logger and would strip caplog's handler;
-    # these tests assert on warning text via caplog, so keep pytest's logging intact.
-    monkeypatch.setattr(ab.bench_log, "setup_logging", lambda *a, **k: None)
 
     def fail_merge(*args, **kwargs):
         raise RuntimeError("prefixed merge failed")
@@ -2699,9 +2696,6 @@ def test_run_controller_resource_monitor_start_failed_does_not_fail_bench(
     monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
     monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
     monkeypatch.setattr(ab, "ResourceMonitor", StartFailingResourceMonitor)
-    # setup_logging reconfigures the root logger and would strip caplog's handler;
-    # these tests assert on warning text via caplog, so keep pytest's logging intact.
-    monkeypatch.setattr(ab.bench_log, "setup_logging", lambda *a, **k: None)
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
@@ -2720,9 +2714,6 @@ def test_run_controller_resource_monitor_stop_failed_does_not_fail_bench(
     monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
     monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
     monkeypatch.setattr(ab, "ResourceMonitor", StopFailingResourceMonitor)
-    # setup_logging reconfigures the root logger and would strip caplog's handler;
-    # these tests assert on warning text via caplog, so keep pytest's logging intact.
-    monkeypatch.setattr(ab.bench_log, "setup_logging", lambda *a, **k: None)
 
     result = ab.run_controller(config, run_id="run123", runner=FakeRunner(), dry_run=False)
 
@@ -2740,9 +2731,6 @@ def test_run_controller_resource_monitor_result_merge_failed_does_not_fail_bench
     monkeypatch.setattr(ab, "wait_for_ready", lambda *args, **kwargs: True)
     monkeypatch.setattr(ab, "wait_for_container_ready", lambda *args, **kwargs: True)
     monkeypatch.setattr(ab, "ResourceMonitor", FakeResourceMonitor)
-    # setup_logging reconfigures the root logger and would strip caplog's handler;
-    # these tests assert on warning text via caplog, so keep pytest's logging intact.
-    monkeypatch.setattr(ab.bench_log, "setup_logging", lambda *a, **k: None)
 
     def fail_merge(*args, **kwargs):
         raise RuntimeError("merge failed")
