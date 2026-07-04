@@ -22,7 +22,13 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from bench_compare import aggregate_compare
 from remote_docker import RemoteDockerRunner, RemoteResourceReaders, mask_command
-from remote_topology import RemoteAuth, RoleCommand, TopologyProfile, parse_topology_profiles
+from remote_topology import (
+    RemoteAuth,
+    RoleCommand,
+    TopologyProfile,
+    _docker_gpus,
+    parse_topology_profiles,
+)
 from resource_monitor import (
     ResourceMonitor,
     append_prefixed_summaries_to_result_files,
@@ -997,7 +1003,7 @@ def build_vllm_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
         "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
-        "--gpus", serve_profile.gpus,
+        "--gpus", _docker_gpus(serve_profile.gpus),
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
     ]
@@ -1050,7 +1056,7 @@ def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{CONTAINER_RUN_DIR_LABEL}={resolved_run_dir}",
         "--label", f"{CONTAINER_MODEL_LABEL}={case.model.name}",
         "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
-        "--gpus", serve_profile.gpus,
+        "--gpus", _docker_gpus(serve_profile.gpus),
         "--network", config.run.network,
         "-v", f"{config.mounts.models}:/models:ro",
         "--entrypoint", "python3",

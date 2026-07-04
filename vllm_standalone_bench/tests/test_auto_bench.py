@@ -5442,6 +5442,28 @@ def test_build_serve_command_dispatches_vllm(tmp_path):
     assert "serve" in cmd
 
 
+def test_build_vllm_serve_command_wraps_specific_gpus(tmp_path):
+    # serve 路径也要用 _docker_gpus 包装：指定卡时 docker 需要 '"device=..."' 形式，
+    # 否则 docker 解析异常、容器看到的卡数不对（实测 TP=4 报 available GPUs=3）。
+    data = minimal_config(tmp_path)
+    data["serve_profiles"][0]["gpus"] = "0,1,2,3"
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_serve_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert value_after(cmd, "--gpus") == '"device=0,1,2,3"'
+
+
+def test_build_vllm_serve_command_keeps_gpus_all(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    cmd = ab.build_serve_run_command(config, case, tmp_path / "results" / "run123")
+
+    assert value_after(cmd, "--gpus") == "all"
+
+
 def test_build_postprocess_container_command_uses_bench_image_and_host_user(
     tmp_path,
     monkeypatch,
