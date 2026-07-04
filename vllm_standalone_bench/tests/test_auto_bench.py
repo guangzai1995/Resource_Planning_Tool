@@ -3470,7 +3470,7 @@ def test_controller_dry_run_prints_commands_without_result_files(tmp_path, capsy
     assert runner.commands == []
 
 
-def test_cleanup_network_warns_when_external_containers_connected(tmp_path, capsys):
+def test_cleanup_network_warns_when_external_containers_connected(tmp_path, caplog):
     class ConnectedNetworkRunner(FakeRunner):
         def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
             if args[:4] == ["docker", "inspect", "--format", "{{json .Containers}}"]:
@@ -3483,14 +3483,13 @@ def test_cleanup_network_warns_when_external_containers_connected(tmp_path, caps
 
     stop_requested = ab.cleanup_network(config, runner, owned=True, dry_run=False, run_id="run123")
 
-    captured = capsys.readouterr()
     assert stop_requested is False
     assert not any(command[:3] == ["docker", "network", "rm"] for command in runner.commands)
-    assert "warning" in captured.err.lower()
-    assert "external" in captured.err.lower()
+    assert "network cleanup skipped" in caplog.text.lower()
+    assert "external" in caplog.text.lower()
 
 
-def test_cleanup_network_warns_when_network_rm_fails(tmp_path, capsys):
+def test_cleanup_network_warns_when_network_rm_fails(tmp_path, caplog):
     class FailingNetworkRmRunner(FakeRunner):
         def run(self, args, *, check=False, capture=True, text=True, stdout=None, stderr=None):
             if args[:3] == ["docker", "network", "rm"]:
@@ -3503,11 +3502,10 @@ def test_cleanup_network_warns_when_network_rm_fails(tmp_path, capsys):
 
     stop_requested = ab.cleanup_network(config, runner, owned=True, dry_run=False, run_id="run123")
 
-    captured = capsys.readouterr()
     assert stop_requested is False
     assert any(command[:3] == ["docker", "network", "rm"] for command in runner.commands)
-    assert "warning" in captured.err.lower()
-    assert "network busy" in captured.err
+    assert "network cleanup failed" in caplog.text.lower()
+    assert "network busy" in caplog.text
 
 
 def test_controller_group_exception_skips_only_unrecorded_cases(tmp_path, monkeypatch):
@@ -3928,6 +3926,80 @@ def test_follow_file_handles_open_error(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "cannot read" in captured.err
+
+
+def test_print_status_renders_counts_summary(tmp_path, capsys, monkeypatch):
+    run_dir = tmp_path / "rd"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text(json.dumps({
+        "run_id": "rd", "status": "running",
+        "current": {"model": "m", "serve_profile": "sp", "bench_profile": "bp"},
+        "counts": {"passed": 2, "failed": 1, "running": 1, "total": 4},
+    }), encoding="utf-8")
+    # _stdout_supports_color() checks stdout (not stderr); force no-color path.
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    rc = ab.print_status(run_dir)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "passed=2" in out
+    assert "failed=1" in out
+    assert "\x1b[" not in out  # no-color path emits plain text
+
+
+def test_print_status_renders_colored_counts_when_tty(tmp_path, capsys, monkeypatch):
+    run_dir = tmp_path / "rd"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text(json.dumps({
+        "run_id": "rd", "status": "running",
+        "counts": {"passed": 2, "failed": 1, "total": 4},
+    }), encoding="utf-8")
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    ab.print_status(run_dir)
+    out = capsys.readouterr().out
+    assert "\033[32m" in out and "passed=2" in out  # 绿色 ANSI + 文本
+
+
+def test_format_counts_default_is_plain_text_even_when_tty(monkeypatch):
+    """logger.info("run finished: %s", _format_counts(...)) 走默认调用，
+    即便前台 stdout 是 tty 也必须返回纯文本，避免 ANSI 经 FileFormatter 污染
+    controller.log。"""
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    text = ab._format_counts({"passed": 2, "failed": 1, "running": 1, "total": 4})
+    assert "\x1b[" not in text
+    assert "passed=2" in text
+    assert "failed=1" in text
+
+
+def test_format_counts_color_true_emits_ansi():
+    text = ab._format_counts({"passed": 2, "failed": 1}, color=True)
+    assert "\x1b[32m" in text  # GREEN for passed
+    assert "\x1b[31m" in text  # RED for failed
+    assert "passed=2" in text and "failed=1" in text
+
+
+def test_follow_file_level_filter(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "controller.log"
+    log.write_text("", encoding="utf-8")
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    "2026-07-04 12:00:00 INFO  [case 1/2][bench] ok\n"
+                    "2026-07-04 12:00:01 ERROR [case 1/2][bench] boom\n"
+                )
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ab.time, "sleep", fake_sleep)
+
+    rc = ab.follow_file(log, level="ERROR")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "boom" in out
+    assert "ok" not in out  # INFO 行被 level 过滤
 
 
 def write_stop_state(run_dir, status="running"):
@@ -4767,7 +4839,7 @@ def test_start_detached_uses_devnull_stdin(tmp_path, monkeypatch):
     assert calls[0][1]["stdin"] is ab.subprocess.DEVNULL
 
 
-def test_start_detached_rejects_existing_active_run_dir(tmp_path, monkeypatch, capsys):
+def test_start_detached_rejects_existing_active_run_dir(tmp_path, monkeypatch, caplog):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     config = ab.load_config(config_path)
     run_dir = tmp_path / "results" / "run123"
@@ -4787,14 +4859,13 @@ def test_start_detached_rejects_existing_active_run_dir(tmp_path, monkeypatch, c
 
     exit_code = ab.start_detached(config_path, config, "run123")
 
-    captured = capsys.readouterr()
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     assert exit_code == 1
     assert state["status"] == "running"
-    assert "active" in captured.err
+    assert "active" in caplog.text
 
 
-def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, capsys):
+def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -4809,15 +4880,14 @@ def test_run_controller_rejects_existing_active_run_dir(tmp_path, monkeypatch, c
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     assert result == 1
     assert state["status"] == "running"
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
-def test_run_controller_rejects_active_state_without_pid_file(tmp_path, capsys):
+def test_run_controller_rejects_active_state_without_pid_file(tmp_path, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -4830,16 +4900,15 @@ def test_run_controller_rejects_active_state_without_pid_file(tmp_path, capsys):
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     assert result == 1
     assert state["status"] == "running"
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert not (run_dir / "config.resolved.json").exists()
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
-def test_run_controller_rejects_active_state_with_invalid_pid_file(tmp_path, capsys):
+def test_run_controller_rejects_active_state_with_invalid_pid_file(tmp_path, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -4853,15 +4922,14 @@ def test_run_controller_rejects_active_state_with_invalid_pid_file(tmp_path, cap
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
     assert result == 1
     assert state["status"] == "starting"
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
-def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, capsys):
+def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, caplog):
     config_path = write_config(tmp_path, minimal_config(tmp_path))
     config = ab.load_config(config_path)
     run_dir = tmp_path / "results" / "run123"
@@ -4875,9 +4943,8 @@ def test_start_detached_rejects_existing_run_lock(tmp_path, monkeypatch, capsys)
 
     exit_code = ab.start_detached(config_path, config, "run123")
 
-    captured = capsys.readouterr()
     assert exit_code == 1
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert (run_dir / ".run.lock").exists()
 
 
@@ -4928,7 +4995,7 @@ def test_run_controller_reclaims_terminal_stale_lock(tmp_path, monkeypatch):
 def test_run_controller_does_not_delete_new_lock_after_stale_recheck(
     tmp_path,
     monkeypatch,
-    capsys,
+    caplog,
 ):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
@@ -4958,9 +5025,8 @@ def test_run_controller_does_not_delete_new_lock_after_stale_recheck(
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     assert result == 1
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert json.loads((run_dir / ".run.lock").read_text(encoding="utf-8")) == new_payload
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
@@ -4990,7 +5056,7 @@ def test_release_run_lock_does_not_delete_replaced_lock(tmp_path, monkeypatch):
     assert json.loads(lock_path.read_text(encoding="utf-8")) == new_payload
 
 
-def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeypatch, capsys):
+def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeypatch, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -5009,14 +5075,13 @@ def test_run_controller_keeps_active_dead_pid_lock_fail_closed(tmp_path, monkeyp
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     assert result == 1
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert (run_dir / ".run.lock").exists()
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
 
-def test_run_controller_corrupt_lock_fail_closed(tmp_path, capsys):
+def test_run_controller_corrupt_lock_fail_closed(tmp_path, caplog):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
     run_dir = tmp_path / "results" / "run123"
     ab.write_state(run_dir, {
@@ -5030,9 +5095,8 @@ def test_run_controller_corrupt_lock_fail_closed(tmp_path, capsys):
 
     result = ab.run_controller(config, run_id="run123", runner=runner, dry_run=False)
 
-    captured = capsys.readouterr()
     assert result == 1
-    assert "active" in captured.err
+    assert "active" in caplog.text
     assert (run_dir / ".run.lock").exists()
     assert not any(command[:2] == ["docker", "run"] for command in runner.commands)
 
@@ -6098,3 +6162,48 @@ def test_example_config_includes_resource_monitor():
         "backend": "nvidia-smi",
         "interval_sec": 1.0,
     }
+
+
+def test_run_controller_dry_run_logs_to_controller_log(tmp_path):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_id = "log_dry_run_001"
+    rc = ab.run_controller(config, run_id, runner=FakeRunner(), dry_run=True)
+    assert rc == 0
+    log_path = config.run.results_dir / run_id / "controller.log"
+    assert log_path.exists(), "controller.log should be created"
+    text = log_path.read_text(encoding="utf-8")
+    assert "controller started" in text
+
+
+def test_controller_log_contains_case_prefix(tmp_path):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_id = "log_prefix_001"
+    rc = ab.run_controller(config, run_id, runner=FakeRunner(), dry_run=True)
+    assert rc == 0
+    text = (config.run.results_dir / run_id / "controller.log").read_text(encoding="utf-8")
+    assert ("[case " in text) or ("[serve]" in text), text
+
+
+def test_controller_log_has_run_finished_node(tmp_path):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_id = "log_progress_001"
+    rc = ab.run_controller(config, run_id, runner=FakeRunner(), dry_run=True)
+    assert rc == 0
+    text = (config.run.results_dir / run_id / "controller.log").read_text(encoding="utf-8")
+    assert "run finished" in text
+
+
+def test_controller_log_has_run_finished_node_non_dry_run(tmp_path):
+    """非 dry-run 路径同样在 controller.log 落 run finished 节点，
+    并携带 passed=N 等计数摘要。"""
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_id = "log_progress_real_001"
+    rc = ab.run_controller(config, run_id, runner=FakeRunner(), dry_run=False)
+    assert rc == 0
+    text = (config.run.results_dir / run_id / "controller.log").read_text(encoding="utf-8")
+    assert "run finished" in text
+    assert "passed=" in text
