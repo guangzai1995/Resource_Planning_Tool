@@ -6172,3 +6172,16 @@ def test_controller_log_has_run_finished_node(tmp_path):
     assert rc == 0
     text = (config.run.results_dir / run_id / "controller.log").read_text(encoding="utf-8")
     assert "run finished" in text
+
+
+def test_controller_log_has_run_finished_node_non_dry_run(tmp_path):
+    """非 dry-run 路径同样在 controller.log 落 run finished 节点，
+    并携带 passed=N 等计数摘要。"""
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_id = "log_progress_real_001"
+    rc = ab.run_controller(config, run_id, runner=FakeRunner(), dry_run=False)
+    assert rc == 0
+    text = (config.run.results_dir / run_id / "controller.log").read_text(encoding="utf-8")
+    assert "run finished" in text
+    assert "passed=" in text

@@ -3533,6 +3533,7 @@ def _run_controller_dry_run(config: AutoBenchConfig, run_id: str) -> int:
         dry_run_config_to_dict(config),
     )
     try:
+        logger.info("run started: run_id=%s cases=%d (dry-run)", run_id, total)
         if network_owned:
             print_cmd(build_network_create_command(config, run_id))
         for group_cases in _group_cases_by_serve(cases).values():
