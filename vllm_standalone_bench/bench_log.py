@@ -5,16 +5,17 @@
 - ConsoleHandler 仅 sys.stderr.isatty() 时挂（彩色）
 - case_scope 注入 [case idx/total][phase] 或 [phase][label] 前缀（contextvars）
 
-本模块只实现颜色常量、_CTX ContextVar 占位、File/Console Formatter。
-case_scope / setup_logging / get_logger 由后续任务追加。
+本模块已实现颜色常量、_CTX ContextVar、File/Console Formatter 与 case_scope；
+setup_logging / get_logger 由后续任务追加。
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 
 
-# case 上下文占位：case_scope（后续任务）会 set 为 (idx, total, phase, label)。
+# case 上下文：case_scope 运行时 set 为 (idx, total, phase, label)。
 # idx 为 None 时表示无 case 序号、仅 phase+label。默认 None 表示无上下文。
 _CTX: contextvars.ContextVar[tuple | None] = contextvars.ContextVar(
     "bench_log_case_ctx", default=None,
@@ -57,6 +58,23 @@ def _current_prefix() -> str:
     if idx is not None:
         return f"[case {idx}/{total}][{phase}] "
     return f"[{phase}][{label}] "
+
+
+@contextlib.contextmanager
+def case_scope(*, total: int, phase: str, idx: int | None = None,
+               label: str | None = None):
+    """with 块内所有日志自动带前缀。
+
+    idx 非 None（bench per-case 阶段）→ ``[case idx/total][phase]``；
+    idx 为 None（serve per-group 阶段）→ ``[phase][label]``。
+    调用方需保证 idx 与 label 至少一个非 None（idx 非 None 走 bench 前缀，否则走 serve 前缀）。
+    基于 contextvars，同线程内跨函数自动传播；with 块退出后前缀复位。
+    """
+    token = _CTX.set((idx, total, phase, label))
+    try:
+        yield
+    finally:
+        _CTX.reset(token)
 
 
 class _BaseFormatter(logging.Formatter):
