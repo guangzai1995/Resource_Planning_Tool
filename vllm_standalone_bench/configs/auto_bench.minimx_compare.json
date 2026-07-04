@@ -39,82 +39,86 @@
   ],
   "serve_profiles": [
     {
-      "name": "tp8_prefix_chunked_kv_fp8",
+      "name": "tp8_full",
       "gpus": "all",
       "args": [
         "--tensor-parallel-size", "8",
-        "--max-model-len", "199999",
-        "--max-num-seqs", "128",
-        "--enable-prefix-caching",
-        "--enable-chunked-prefill",
         "--trust-remote-code",
+        "--quantization", "compressed-tensors",
+        "--kv-cache-dtype", "fp8",
+        "--gpu-memory-utilization", "0.92",
+        "--max-num-seqs", "128",
+        "--enable-chunked-prefill",
+        "--enable-prefix-caching",
+        "--enable-expert-parallel",
         "--enable-auto-tool-choice",
         "--tool-call-parser", "minimax_m2",
         "--reasoning-parser", "minimax_m2",
         "--enable-force-include-usage",
         "--enable-prompt-tokens-details",
-        "--enable-log-requests",
-        "--quantization", "compressed-tensors",
-        "--kv-cache-dtype", "fp8"
+        "--enable-log-requests"
       ]
     },
     {
-      "name": "tp8_prefix_chunked_kv_auto",
+      "name": "tp8_no_prefix",
       "gpus": "all",
       "args": [
         "--tensor-parallel-size", "8",
-        "--max-model-len", "199999",
-        "--max-num-seqs", "128",
-        "--enable-prefix-caching",
-        "--enable-chunked-prefill",
         "--trust-remote-code",
-        "--enable-auto-tool-choice",
-        "--tool-call-parser", "minimax_m2",
-        "--reasoning-parser", "minimax_m2",
-        "--enable-force-include-usage",
-        "--enable-prompt-tokens-details",
-        "--enable-log-requests",
         "--quantization", "compressed-tensors",
-        "--kv-cache-dtype", "auto"
-      ]
-    },
-    {
-      "name": "tp8_no_prefix_chunked_kv_fp8",
-      "gpus": "all",
-      "args": [
-        "--tensor-parallel-size", "8",
-        "--max-model-len", "199999",
+        "--kv-cache-dtype", "fp8",
+        "--gpu-memory-utilization", "0.92",
         "--max-num-seqs", "128",
+        "--enable-chunked-prefill",
         "--no-enable-prefix-caching",
-        "--enable-chunked-prefill",
-        "--trust-remote-code",
+        "--enable-expert-parallel",
         "--enable-auto-tool-choice",
         "--tool-call-parser", "minimax_m2",
         "--reasoning-parser", "minimax_m2",
         "--enable-force-include-usage",
         "--enable-prompt-tokens-details",
-        "--enable-log-requests",
-        "--quantization", "compressed-tensors",
-        "--kv-cache-dtype", "fp8"
+        "--enable-log-requests"
       ]
     },
     {
-      "name": "tp8_prefix_no_chunked_kv_fp8",
+      "name": "tp8_no_expert_parallel",
       "gpus": "all",
       "args": [
         "--tensor-parallel-size", "8",
-        "--max-model-len", "199999",
-        "--max-num-seqs", "128",
-        "--enable-prefix-caching",
         "--trust-remote-code",
+        "--quantization", "compressed-tensors",
+        "--kv-cache-dtype", "fp8",
+        "--gpu-memory-utilization", "0.92",
+        "--max-num-seqs", "128",
+        "--enable-chunked-prefill",
+        "--enable-prefix-caching",
         "--enable-auto-tool-choice",
         "--tool-call-parser", "minimax_m2",
         "--reasoning-parser", "minimax_m2",
         "--enable-force-include-usage",
         "--enable-prompt-tokens-details",
-        "--enable-log-requests",
+        "--enable-log-requests"
+      ]
+    },
+    {
+      "name": "tp8_kv_auto",
+      "gpus": "all",
+      "args": [
+        "--tensor-parallel-size", "8",
+        "--trust-remote-code",
         "--quantization", "compressed-tensors",
-        "--kv-cache-dtype", "fp8"
+        "--kv-cache-dtype", "auto",
+        "--gpu-memory-utilization", "0.92",
+        "--max-num-seqs", "128",
+        "--enable-chunked-prefill",
+        "--enable-prefix-caching",
+        "--enable-expert-parallel",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", "minimax_m2",
+        "--reasoning-parser", "minimax_m2",
+        "--enable-force-include-usage",
+        "--enable-prompt-tokens-details",
+        "--enable-log-requests"
       ]
     }
   ],
@@ -122,9 +126,9 @@
     {
       "name": "latency_prefix_25",
       "backend": "openai-chat",
-      "input_lens": [4096, 16384, 65536, 131072],
+      "input_lens": [4096, 8192, 16384, 32768, 65536, 131072, 172032],
       "output_lens": [1024],
-      "parallel_nums": [1, 8, 16, 32],
+      "parallel_nums": [1, 4, 8, 16, 24, 32, 48, 64, 96, 128],
       "epochs": 3,
       "prefix_ratio": 0.25,
       "warmup_requests": 4,
@@ -135,13 +139,13 @@
       "min_output_compliance": 0.95
     },
     {
-      "name": "latency_prefix_65",
+      "name": "latency_prefix_60",
       "backend": "openai-chat",
-      "input_lens": [4096, 16384, 65536, 131072],
+      "input_lens": [4096, 8192, 16384, 32768, 65536, 131072, 172032],
       "output_lens": [1024],
-      "parallel_nums": [1, 8, 16, 32],
+      "parallel_nums": [1, 4, 8, 16, 24, 32, 48, 64, 96, 128],
       "epochs": 3,
-      "prefix_ratio": 0.65,
+      "prefix_ratio": 0.6,
       "warmup_requests": 4,
       "warmup_concurrency": 8,
       "cross_product": true,
@@ -150,13 +154,13 @@
       "min_output_compliance": 0.95
     },
     {
-      "name": "latency_prefix_90",
+      "name": "latency_prefix_80",
       "backend": "openai-chat",
-      "input_lens": [4096, 16384, 65536, 131072],
+      "input_lens": [4096, 8192, 16384, 32768, 65536, 131072, 172032],
       "output_lens": [1024],
-      "parallel_nums": [1, 8, 16, 32],
+      "parallel_nums": [1, 4, 8, 16, 24, 32, 48, 64, 96, 128],
       "epochs": 3,
-      "prefix_ratio": 0.9,
+      "prefix_ratio": 0.8,
       "warmup_requests": 4,
       "warmup_concurrency": 8,
       "cross_product": true,
