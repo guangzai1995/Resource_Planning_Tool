@@ -3936,12 +3936,45 @@ def test_print_status_renders_counts_summary(tmp_path, capsys, monkeypatch):
         "current": {"model": "m", "serve_profile": "sp", "bench_profile": "bp"},
         "counts": {"passed": 2, "failed": 1, "running": 1, "total": 4},
     }), encoding="utf-8")
-    monkeypatch.setattr("sys.stderr.isatty", lambda: False)
+    # _stdout_supports_color() checks stdout (not stderr); force no-color path.
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
     rc = ab.print_status(run_dir)
     out = capsys.readouterr().out
     assert rc == 0
     assert "passed=2" in out
     assert "failed=1" in out
+    assert "\x1b[" not in out  # no-color path emits plain text
+
+
+def test_print_status_renders_colored_counts_when_tty(tmp_path, capsys, monkeypatch):
+    run_dir = tmp_path / "rd"
+    run_dir.mkdir()
+    (run_dir / "state.json").write_text(json.dumps({
+        "run_id": "rd", "status": "running",
+        "counts": {"passed": 2, "failed": 1, "total": 4},
+    }), encoding="utf-8")
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    ab.print_status(run_dir)
+    out = capsys.readouterr().out
+    assert "\033[32m" in out and "passed=2" in out  # 绿色 ANSI + 文本
+
+
+def test_format_counts_default_is_plain_text_even_when_tty(monkeypatch):
+    """logger.info("run finished: %s", _format_counts(...)) 走默认调用，
+    即便前台 stdout 是 tty 也必须返回纯文本，避免 ANSI 经 FileFormatter 污染
+    controller.log。"""
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    text = ab._format_counts({"passed": 2, "failed": 1, "running": 1, "total": 4})
+    assert "\x1b[" not in text
+    assert "passed=2" in text
+    assert "failed=1" in text
+
+
+def test_format_counts_color_true_emits_ansi():
+    text = ab._format_counts({"passed": 2, "failed": 1}, color=True)
+    assert "\x1b[32m" in text  # GREEN for passed
+    assert "\x1b[31m" in text  # RED for failed
+    assert "passed=2" in text and "failed=1" in text
 
 
 def test_follow_file_level_filter(tmp_path, monkeypatch, capsys):

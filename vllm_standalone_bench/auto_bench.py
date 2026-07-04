@@ -4049,17 +4049,23 @@ def _stdout_supports_color() -> bool:
         return False
 
 
-def _format_counts(counts: Any) -> str:
+def _format_counts(counts: Any, *, color: bool = False) -> str:
+    """格式化 counts 摘要。
+
+    ``color`` 默认 False → 返回纯文本，供 ``logger.info("run finished: ...")`` 等
+    日志路径安全使用（FileFormatter 写 controller.log 不会被 ANSI 字节污染）。
+    仅终端呈现层（``print_status``）显式传 ``color=True`` 才上色。
+    """
     if not isinstance(counts, dict):
         return "-"
     keys = ["passed", "failed", "skipped", "running", "completed", "total"]
-    color = _stdout_supports_color()
+    use_color = bool(color)
     parts: list[str] = []
     for key in keys:
         if key not in counts:
             continue
         text = f"{key}={counts[key]}"
-        if color:
+        if use_color:
             c = _STATUS_COUNT_COLOR.get(key)
             if c:
                 text = f"{c}{text}{bench_log._Color.RESET}"
@@ -4083,7 +4089,7 @@ def print_status(run_dir: Path) -> int:
     print(f"run_id: {state.get('run_id', run_dir.name)}")
     print(f"status: {state.get('status', 'unknown')}")
     print(f"current: {_format_current(state.get('current'))}")
-    print(f"counts: {_format_counts(state.get('counts'))}")
+    print(f"counts: {_format_counts(state.get('counts'), color=_stdout_supports_color())}")
     exit_code = 0
     pid_path = run_dir / "controller.pid"
     if pid_path.exists():
@@ -4123,10 +4129,14 @@ _LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL":
 def _line_matches_level(line: str, level_upper: str) -> bool:
     """行级别 >= 指定级别则保留（如 level=WARNING 会包含 ERROR/CRITICAL）。
 
-    仅匹配带级别字段的单行；无级别前缀的行（第三方/docker 回显、traceback 续行）不命中。
-    FileFormatter 输出 ``%(levelname)-5s``（见 bench_log._LINE_FMT），级别字段前后
-    各有一个空格（短级别如 INFO 右侧补齐到 5 列再加 fmt 空格），故 ``f" {name} "``
-    能精确匹配各级别，不会误命中 message 中的同名子串。
+    靠 ``f" {name} "``（前后各一空格）匹配级别字段：FileFormatter 输出
+    ``%(levelname)-5s``（见 bench_log._LINE_FMT），级别字段前后各有空格（短级别如
+    INFO 右侧补齐到 5 列再加 fmt 空格），故带级别前缀的行能稳定命中。
+
+    局限：这是子串匹配而非解析，若一行无级别前缀但其 message 正文恰好含
+    `` <大写级别名> `` 子串（如 ``... failed: ERROR ...``），也会被误判命中——
+    即过滤时会多保留这类行。实际影响极小（日志正文中此类子串罕见），属可接受的
+    多包含。无级别前缀的第三方/docker 回显、traceback 续行一般不命中。
     """
     threshold = _LEVEL_ORDER.get(level_upper, 0)
     for name, val in _LEVEL_ORDER.items():
