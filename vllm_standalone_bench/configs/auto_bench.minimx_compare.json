@@ -44,7 +44,6 @@
       "args": [
         "--tensor-parallel-size", "8",
         "--trust-remote-code",
-        "--quantization", "compressed-tensors",
         "--kv-cache-dtype", "fp8",
         "--gpu-memory-utilization", "0.92",
         "--max-num-seqs", "128",
@@ -65,7 +64,6 @@
       "args": [
         "--tensor-parallel-size", "8",
         "--trust-remote-code",
-        "--quantization", "compressed-tensors",
         "--kv-cache-dtype", "fp8",
         "--gpu-memory-utilization", "0.92",
         "--max-num-seqs", "128",
@@ -86,7 +84,6 @@
       "args": [
         "--tensor-parallel-size", "8",
         "--trust-remote-code",
-        "--quantization", "compressed-tensors",
         "--kv-cache-dtype", "fp8",
         "--gpu-memory-utilization", "0.92",
         "--max-num-seqs", "128",
@@ -106,7 +103,6 @@
       "args": [
         "--tensor-parallel-size", "8",
         "--trust-remote-code",
-        "--quantization", "compressed-tensors",
         "--kv-cache-dtype", "auto",
         "--gpu-memory-utilization", "0.92",
         "--max-num-seqs", "128",
