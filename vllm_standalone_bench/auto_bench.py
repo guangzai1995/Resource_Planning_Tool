@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Protocol, Sequence
 
+import bench_log
 from bench_compare import aggregate_compare
 from remote_docker import RemoteDockerRunner, RemoteResourceReaders, mask_command
 from remote_topology import RemoteAuth, RoleCommand, TopologyProfile, parse_topology_profiles
@@ -29,7 +30,7 @@ from resource_monitor import (
     append_summary_to_result_files,
 )
 
-logger = logging.getLogger("auto_bench")
+logger = bench_log.get_logger("auto_bench")
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -3550,6 +3551,9 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                    cases_to_run: tuple[BenchmarkCase, ...] | None = None,
                    config_path: Path | None = None) -> int:
     active_runner: Runner = runner or DockerRunner()
+    run_dir_preview = config.run.results_dir / run_id
+    bench_log.setup_logging(run_dir_preview)
+    logger.info("controller started: run_id=%s dry_run=%s", run_id, dry_run)
     if dry_run:
         return _run_controller_dry_run(config, run_id)
 
