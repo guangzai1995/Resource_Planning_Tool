@@ -108,6 +108,31 @@ def test_prefill_body_strips_stream_options(builder):
     assert body["stream_options"] == {"include_usage": True}
 
 
+@pytest.mark.parametrize("builder", [
+    build_p2p_prefill_body,
+    build_nixl_prefill_body,
+])
+def test_prefill_body_clamps_max_completion_tokens(builder):
+    # chat completions 用 max_completion_tokens，vLLM 里它优先于 max_tokens。
+    # prefill 只应产出 1 个 token，否则 producer 会继续 decode 进而触发
+    # p2p_nccl_connector 的 `assert req_id in self.chunked_prefill` 崩溃。
+    body = {
+        "model": "m",
+        "messages": [],
+        "max_completion_tokens": 1024,
+        "stream": True,
+    }
+    prefill_body = (
+        builder(body, request_id="rid")
+        if builder is build_p2p_prefill_body
+        else builder(body)
+    )
+
+    assert prefill_body["max_tokens"] == 1
+    assert prefill_body["max_completion_tokens"] == 1
+    assert body["max_completion_tokens"] == 1024
+
+
 def test_build_nixl_prefill_body_injects_remote_decode_marker():
     body = {"model": "m", "messages": [], "max_tokens": 32, "stream": True}
     prefill_body = build_nixl_prefill_body(body)
