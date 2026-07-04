@@ -6088,3 +6088,13 @@ def test_run_controller_dry_run_logs_to_controller_log(tmp_path):
     assert log_path.exists(), "controller.log should be created"
     text = log_path.read_text(encoding="utf-8")
     assert "controller started" in text
+
+
+def test_controller_log_contains_case_prefix(tmp_path):
+    config_path = write_config(tmp_path, minimal_config(tmp_path))
+    config = ab.load_config(config_path)
+    run_id = "log_prefix_001"
+    rc = ab.run_controller(config, run_id, runner=FakeRunner(), dry_run=True)
+    assert rc == 0
+    text = (config.run.results_dir / run_id / "controller.log").read_text(encoding="utf-8")
+    assert ("[case " in text) or ("[serve]" in text), text
