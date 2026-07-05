@@ -73,7 +73,7 @@ FOLLOW="${FOLLOW:-false}"
 # ── Mooncake (sglang PD HiCache L3 KV 后端) ──
 # sglang PD + hicache(mooncake) 需要 mooncake_master(内嵌 metadata) 在控制机本地跑。
 # worker 自带 store（设了 MOONCAKE_GLOBAL_SEGMENT_SIZE），所以只起 master 即可。
-MOONCAKE_IMAGE="${MOONCAKE_IMAGE:-lmsysorg/sglang:latest}"
+MOONCAKE_IMAGE="${MOONCAKE_IMAGE:-lmsysorg/sglang:latest-0705}"
 MOONCAKE_MASTER_NAME="${MOONCAKE_MASTER_NAME:-mooncake-master}"
 MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-50051}"
 MOONCAKE_META_PORT="${MOONCAKE_META_PORT:-8080}"
