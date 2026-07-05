@@ -166,6 +166,7 @@ def test_extract_row_includes_spec_decode_metrics():
     result = {
         **_result(),
         "spec_decode_acceptance_rate": 75.0,
+        "spec_decode_acceptance_length": 2.25,
         "spec_decode_system_efficiency": 0.82,
         "spec_decode_num_drafts": 12,
         "spec_decode_num_accepted_tokens": 9,
@@ -179,6 +180,7 @@ def test_extract_row_includes_spec_decode_metrics():
         model="m", backend="openai-chat", has_tokenizer=True)
 
     assert row["spec_decode_acceptance_rate"] == 75.0
+    assert row["spec_decode_acceptance_length"] == 2.25
     assert row["spec_decode_system_efficiency"] == 0.82
     assert row["spec_decode_num_drafts"] == 12
     assert row["spec_decode_num_accepted_tokens"] == 9
@@ -193,6 +195,7 @@ def test_extract_row_spec_decode_defaults_when_metrics_missing():
         model="m", backend="openai-chat", has_tokenizer=True)
 
     assert row["spec_decode_acceptance_rate"] == 0.0
+    assert row["spec_decode_acceptance_length"] == 0.0
     assert row["spec_decode_system_efficiency"] == 0.0
     assert row["spec_decode_num_drafts"] == 0
     assert row["spec_decode_num_accepted_tokens"] == 0
@@ -348,6 +351,7 @@ def test_csv_headers_match_row_keys():
                      "cache_hit_tokens_storage_mooncake",
                      "avg_gpu_kv_cache_usage", "peak_gpu_kv_cache_usage",
                      "spec_decode_acceptance_rate",
+                     "spec_decode_acceptance_length",
                      "spec_decode_system_efficiency",
                      "spec_decode_num_drafts",
                      "spec_decode_num_accepted_tokens",

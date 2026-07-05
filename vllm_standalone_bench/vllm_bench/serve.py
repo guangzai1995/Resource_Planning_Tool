@@ -103,6 +103,16 @@ class SpecDecodeMetrics:
 
 
 @dataclass
+class SGLangSpecDecodeMetrics:
+    """SGLang speculative decoding metrics from the Prometheus endpoint."""
+
+    acceptance_rate: float | None = None
+    acceptance_length: float | None = None
+    num_draft_tokens: int = 0
+    verify_calls: int = 0
+
+
+@dataclass
 class CacheSourceMetrics:
     """SGLang cached-token counters from the server's Prometheus endpoint."""
 
@@ -115,6 +125,7 @@ class RuntimeMetrics:
     """Runtime metrics parsed from the server's Prometheus endpoint."""
 
     spec_decode: SpecDecodeMetrics | None = None
+    sglang_spec_decode: SGLangSpecDecodeMetrics | None = None
     gpu_kv_cache_usage: float | None = None
     cache_source: CacheSourceMetrics | None = None
 
@@ -148,6 +159,13 @@ GPU_KV_CACHE_USAGE_METRICS = {
     "vllm:gpu_cache_usage_perc",
     "vllm:kv_cache_usage_perc",
     "ray_vllm_kv_cache_usage_perc",
+}
+
+SGLANG_TOKEN_USAGE_METRICS = {
+    "sglang:token_usage",
+    "sglang:full_token_usage",
+    "sglang:swa_token_usage",
+    "sglang:mamba_usage",
 }
 
 
@@ -185,12 +203,23 @@ def _normalize_gpu_kv_cache_usage(value: float) -> float:
     return value
 
 
+def _normalize_percent_metric(value: float) -> float:
+    if 0.0 <= value <= 1.0:
+        return value * 100.0
+    return value
+
+
 def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
     num_drafts = 0
     num_draft_tokens = 0
     num_accepted_tokens = 0
     accepted_per_pos: dict[int, int] = {}
     found_spec_decode = False
+    found_sglang_spec_decode = False
+    sglang_spec_acceptance_rate: float | None = None
+    sglang_spec_acceptance_length: float | None = None
+    sglang_spec_num_draft_tokens = 0
+    sglang_spec_verify_calls = 0
     gpu_kv_cache_usage_samples: list[float] = []
     prompt_tokens_total = 0
     cached_tokens_by_source: dict[str, int] = {}
@@ -207,6 +236,30 @@ def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
 
         if metric_name in GPU_KV_CACHE_USAGE_METRICS:
             gpu_kv_cache_usage_samples.append(_normalize_gpu_kv_cache_usage(value))
+            continue
+
+        if metric_name in SGLANG_TOKEN_USAGE_METRICS:
+            gpu_kv_cache_usage_samples.append(_normalize_gpu_kv_cache_usage(value))
+            continue
+
+        if metric_name == "sglang:spec_accept_rate":
+            found_sglang_spec_decode = True
+            sglang_spec_acceptance_rate = _normalize_percent_metric(value)
+            continue
+
+        if metric_name == "sglang:spec_accept_length":
+            found_sglang_spec_decode = True
+            sglang_spec_acceptance_length = value
+            continue
+
+        if metric_name == "sglang:spec_num_draft_tokens":
+            found_sglang_spec_decode = True
+            sglang_spec_num_draft_tokens = int(value)
+            continue
+
+        if metric_name == "sglang:spec_verify_calls_total":
+            found_sglang_spec_decode = True
+            sglang_spec_verify_calls += int(value)
             continue
 
         if metric_name == "sglang:prompt_tokens_total":
@@ -252,6 +305,15 @@ def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
             accepted_per_pos=accepted_per_pos,
         )
 
+    sglang_spec_decode = None
+    if found_sglang_spec_decode:
+        sglang_spec_decode = SGLangSpecDecodeMetrics(
+            acceptance_rate=sglang_spec_acceptance_rate,
+            acceptance_length=sglang_spec_acceptance_length,
+            num_draft_tokens=sglang_spec_num_draft_tokens,
+            verify_calls=sglang_spec_verify_calls,
+        )
+
     gpu_kv_cache_usage = (
         max(gpu_kv_cache_usage_samples) if gpu_kv_cache_usage_samples else None
     )
@@ -263,6 +325,7 @@ def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
         )
     return RuntimeMetrics(
         spec_decode=spec_decode,
+        sglang_spec_decode=sglang_spec_decode,
         gpu_kv_cache_usage=gpu_kv_cache_usage,
         cache_source=cache_source,
     )
@@ -297,6 +360,29 @@ async def fetch_spec_decode_metrics(
     if metrics is None:
         return None
     return metrics.spec_decode
+
+
+def calculate_sglang_spec_decode_stats(
+    before: SGLangSpecDecodeMetrics,
+    after: SGLangSpecDecodeMetrics,
+) -> dict[str, Any]:
+    verify_calls_delta = max(after.verify_calls - before.verify_calls, 0)
+    num_draft_tokens = verify_calls_delta * max(after.num_draft_tokens, 0)
+    acceptance_rate = after.acceptance_rate or 0.0
+    acceptance_length = after.acceptance_length or 0.0
+    num_accepted_tokens = (
+        int(round(num_draft_tokens * acceptance_rate / 100.0))
+        if num_draft_tokens > 0
+        else 0
+    )
+
+    return {
+        "spec_decode_acceptance_rate": round(float(acceptance_rate), 4),
+        "spec_decode_acceptance_length": round(float(acceptance_length), 4),
+        "spec_decode_num_drafts": verify_calls_delta,
+        "spec_decode_num_accepted_tokens": num_accepted_tokens,
+        "spec_decode_num_draft_tokens": num_draft_tokens,
+    }
 
 
 def calculate_cache_source_stats(
@@ -1117,6 +1203,11 @@ async def benchmark(
         if runtime_metrics_before is not None
         else None
     )
+    sglang_spec_decode_metrics_before = (
+        runtime_metrics_before.sglang_spec_decode
+        if runtime_metrics_before is not None
+        else None
+    )
     cache_source_metrics_before = (
         runtime_metrics_before.cache_source
         if runtime_metrics_before is not None
@@ -1225,6 +1316,11 @@ async def benchmark(
         if runtime_metrics_after is not None
         else None
     )
+    sglang_spec_decode_metrics_after = (
+        runtime_metrics_after.sglang_spec_decode
+        if runtime_metrics_after is not None
+        else None
+    )
     cache_source_metrics_after = (
         runtime_metrics_after.cache_source
         if runtime_metrics_after is not None
@@ -1270,6 +1366,17 @@ async def benchmark(
                 "acceptance_length": acceptance_length,
                 "per_position_acceptance_rates": per_pos_rates,
             }
+
+    sglang_spec_decode_stats: dict[str, Any] | None = None
+    if (
+        spec_decode_stats is None
+        and sglang_spec_decode_metrics_before is not None
+        and sglang_spec_decode_metrics_after is not None
+    ):
+        sglang_spec_decode_stats = calculate_sglang_spec_decode_stats(
+            sglang_spec_decode_metrics_before,
+            sglang_spec_decode_metrics_after,
+        )
 
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
@@ -1406,6 +1513,8 @@ async def benchmark(
         result["spec_decode_per_position_acceptance_rates"] = spec_decode_stats.get(
             "per_position_acceptance_rates", []
         )
+    elif sglang_spec_decode_stats is not None:
+        result.update(sglang_spec_decode_stats)
 
     def process_one_metric(
         # E.g., "ttft"
