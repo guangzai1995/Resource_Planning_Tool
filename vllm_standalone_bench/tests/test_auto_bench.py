@@ -5836,6 +5836,38 @@ def test_shipped_sglang_pd_hicache_minimax_config_parses(tmp_path):
     assert "--enable-cache-report" in d1
 
 
+def test_shipped_sglang_pd_hicache_minimax_nobase_disables_router_health_check(tmp_path):
+    path = CONFIG_DIR / "auto_bench.sglang_pd_hicache_remote_minimax_nobase.json"
+    config = ab.load_config(path)
+    assert config.serve_profiles == ()
+    assert all(
+        profile.sglang_hicache is not None
+        and profile.sglang_hicache.mode == "prefill_only"
+        for profile in config.topology_profiles
+    )
+    assert all(
+        profile.env["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] == "false"
+        for profile in config.topology_profiles
+    )
+
+    for case in ab.expand_cases(config, run_id="dryrun"):
+        assert case.topology_profile is not None
+        commands = case.topology_profile.build_commands(
+            config,
+            case,
+            tmp_path / "dryrun",
+        )
+        router = commands["router"].argv
+        assert "--disable-health-check" in router
+        for role_name, command in commands.items():
+            if role_name == "router":
+                continue
+            assert (
+                "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false"
+                in values_after(command.argv, "-e")
+            )
+
+
 def test_controller_dry_run_prints_sglang_command(tmp_path, capsys):
     data = minimal_config(tmp_path)
     data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}
