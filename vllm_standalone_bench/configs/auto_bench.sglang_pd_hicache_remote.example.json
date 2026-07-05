@@ -33,6 +33,8 @@
       "sglang_hicache": {
         "mode": "full_async_offload",
         "page_size": 64,
+        "io_backend": "direct",
+        "mem_layout": "page_first_direct",
         "storage_backend": "mooncake",
         "storage_backend_extra_config": {
           "tp_lcm_size": 4

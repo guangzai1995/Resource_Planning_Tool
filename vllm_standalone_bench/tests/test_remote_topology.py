@@ -241,6 +241,27 @@ def test_sglang_pd_hicache_full_async_renders_decode_offload(tmp_path):
     assert value_after(d1, "--hicache-storage-prefetch-policy") == "timeout"
 
 
+def test_sglang_pd_hicache_defaults_follow_sglang_server_args(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["sglang_hicache"] = {
+        "mode": "full_async_offload",
+        "storage_backend": "mooncake",
+    }
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1 = commands["p1"].argv
+    d1 = commands["d1"].argv
+    assert value_after(p1, "--hicache-io-backend") == "kernel"
+    assert value_after(p1, "--hicache-mem-layout") == "layer_first"
+    assert value_after(d1, "--hicache-io-backend") == "kernel"
+    assert value_after(d1, "--hicache-mem-layout") == "layer_first"
+
+
 def test_sglang_pd_mount_infiniband_adds_worker_flags(tmp_path):
     data = pd_topology_config(tmp_path)
     topology = data["topology_profiles"][0]

@@ -492,7 +492,7 @@ python3 vllm_standalone_bench/run_bench_serve.py \
 > 取自响应 `usage.cached_tokens`。该值非零需要服务端开启前缀缓存
 > （vLLM `--enable-prefix-caching`；SGLang 对应缓存开关）；未开启时命中率为 0。
 > SGLang HiCache 的 device/host/storage 分层命中来自 `/metrics` 差分，
-> 需要服务端开启 `--enable-hicache-metrics`。这些字段用于观察 KV 复用落在哪一层，
+> 需要服务端开启 `--enable-metrics`。这些字段用于观察 KV 复用落在哪一层，
 > 和响应 `usage.cached_tokens` 口径相互补充。
 
 ## 与 benchmark_tools 的关键差异

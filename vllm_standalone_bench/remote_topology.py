@@ -66,8 +66,8 @@ class SglangHiCacheConfig:
     ratio: float | None = 2.0
     size: int | None = 0
     write_policy: str | None = "write_through"
-    io_backend: str | None = "direct"
-    mem_layout: str | None = "page_first_direct"
+    io_backend: str | None = "kernel"
+    mem_layout: str | None = "layer_first"
     storage_backend: str | None = None
     storage_prefetch_policy: str | None = "timeout"
     storage_backend_extra_config: Mapping[str, Any] | str | None = None
@@ -1176,11 +1176,11 @@ def _parse_sglang_hicache_config(
         ),
         io_backend=(
             enum_value("io_backend", SGLANG_HICACHE_IO_BACKENDS)
-            or "direct"
+            or "kernel"
         ),
         mem_layout=(
             enum_value("mem_layout", SGLANG_HICACHE_MEM_LAYOUTS)
-            or "page_first_direct"
+            or "layer_first"
         ),
         storage_backend=storage_backend,
         storage_prefetch_policy=(
