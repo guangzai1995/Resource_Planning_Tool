@@ -32,6 +32,8 @@ The design is based on local source, not inferred from external examples:
   `--disaggregation-transfer-backend`, `--disaggregation-bootstrap-port`,
   `--disaggregation-ib-device`, and
   `--disaggregation-decode-enable-offload-kvcache`.
+- `DISAGG_TRANSFER_BACKEND_CHOICES` in that source includes `mooncake`,
+  `nixl`, `ascend`, `fake`, `mori`, and `mooncake_tcp`.
 - `--disaggregation-decode-enable-offload-kvcache` is only valid on decode
   workers and requires `--hicache-storage-backend`.
 - SGLang normalizes incompatible HiCache layout and I/O combinations. In
@@ -68,6 +70,9 @@ The design is based on local source, not inferred from external examples:
   memlock. The router does not need IB devices.
 - Add validation that catches invalid SGLang HiCache combinations before
   remote containers are started.
+- Reuse the existing structured `vllm_pd` parser pattern for unknown-key checks
+  and enum validation, so `sglang_hicache` behaves like a first-class typed
+  config object rather than an unchecked dict.
 - Preserve the current escape hatch: users can still append arbitrary SGLang
   flags through node `args`.
 - Add example configs for SGLang PD + HiCache + Mooncake that follow the
@@ -138,7 +143,10 @@ Example:
   - `full_async_offload`: render HiCache/storage flags on prefill workers and
     decode workers; add `--disaggregation-decode-enable-offload-kvcache` only
     on decode workers.
-- `page_size`: optional positive integer. Renders `--page-size`.
+- `page_size`: optional positive integer. Renders `--page-size`. This is a
+  SGLang worker-wide KV cache page-size setting, not a HiCache-only setting.
+  If configured, render it on both prefill and decode workers in all
+  `sglang_hicache` modes to avoid P/D page-size divergence.
 - `ratio`: optional positive float. Renders `--hicache-ratio`.
 - `size`: optional non-negative integer. Renders `--hicache-size`.
 - `write_policy`: optional string. Allowed SGLang choices are `write_back`,
@@ -158,7 +166,8 @@ Example:
 - `enable_cache_report`: optional boolean. If true, render
   `--enable-cache-report`.
 
-Defaults are chosen to be explicit for Mooncake benchmarking:
+Defaults are chosen to be explicit for Mooncake benchmarking, not to mirror all
+SGLang CLI defaults:
 
 ```text
 page_size = 64
@@ -197,7 +206,9 @@ SGLang worker rendering stays in `remote_topology.py`:
    - `--disaggregation-transfer-backend` when configured
    - `--disaggregation-bootstrap-port` when configured
    - `--disaggregation-ib-device` when configured
-5. Append structured HiCache flags before node `args`, so node-specific
+5. If `sglang_hicache.page_size` is configured, append `--page-size` on every
+   SGLang PD worker, including decode workers in `prefill_only` mode.
+6. Append structured HiCache flags before node `args`, so node-specific
    `args` can intentionally override or extend behavior.
 
 For `prefill_only`:
@@ -205,6 +216,8 @@ For `prefill_only`:
 - Prefill workers get `--enable-hierarchical-cache` and the configured
   `--hicache-*` flags.
 - Decode workers do not get HiCache/offload flags from `sglang_hicache`.
+  They still get `--page-size` if configured, because that flag is a
+  worker-wide KV cache setting.
 
 For `full_async_offload`:
 
@@ -231,6 +244,7 @@ The config parser should fail early for:
 - Unknown keys inside `sglang_hicache`.
 - Invalid enum values for write policy, I/O backend, memory layout, storage
   backend, or storage prefetch policy.
+- Invalid SGLang `transfer_backend` values when `engine == "sglang"`.
 - `full_async_offload` without `storage_backend`.
 - `full_async_offload` when no decode workers exist.
 - `storage_backend_extra_config` that is neither a mapping nor a string.
@@ -262,8 +276,21 @@ is available:
 
 Implementation detail: this can extend the existing runtime metrics parser to
 sum `sglang:cached_tokens_total{cache_source=...}` and
-`sglang:prompt_tokens_total`. If metrics are unavailable, these fields should
-remain empty or zero using the existing result-row conventions.
+`sglang:prompt_tokens_total`. The counter-derived fields should use
+before/after `/metrics` snapshots around the benchmark, following the existing
+spec-decode counter-delta pattern. If metrics are unavailable, these fields
+should remain empty or zero using the existing result-row conventions.
+
+The implementation must also carry these values through the current result
+pipeline:
+
+- `vllm_bench/serve.py` result JSON.
+- `run_bench_multi._extract_row`.
+- `run_bench_multi.CSV_HEADERS` and `CSV_HEADERS_ZH`.
+- `tests/test_result_csv_headers.py` and `tests/test_extract_row.py`.
+
+This is required because CSV and XLSX writing use fixed headers and ignore
+unknown result keys.
 
 The example configs should enable both `--enable-metrics` and
 `--enable-cache-report` by default so response usage and Prometheus metrics can
@@ -299,10 +326,13 @@ test when validating HiCache, for example `prefix_ratio` around `0.6` or
 Add or update tests in `vllm_standalone_bench/tests/test_remote_topology.py`:
 
 - SGLang HiCache `prefill_only` renders HiCache flags only on prefill workers.
+- `sglang_hicache.page_size` renders on both prefill and decode workers,
+  including in `prefill_only` mode.
 - SGLang HiCache `full_async_offload` renders decode offload only on decode
   workers and renders `storage_backend`.
 - `mount_infiniband` adds IB Docker flags for SGLang workers and not router.
 - Invalid enum values raise `ConfigError`.
+- Invalid SGLang `transfer_backend` values raise `ConfigError`.
 - `full_async_offload` without `storage_backend` raises `ConfigError`.
 - Existing SGLang PD and vLLM PD tests continue to pass.
 
@@ -312,6 +342,8 @@ implemented:
 - Parser sums `sglang:cached_tokens_total` by `cache_source`.
 - Metrics-derived cache hit rate uses before/after deltas.
 - Missing metrics remain backward compatible.
+- Result extraction and fixed CSV/XLSX headers include the new cache-source
+  columns.
 
 Add config-load tests:
 
