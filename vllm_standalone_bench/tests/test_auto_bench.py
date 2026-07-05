@@ -5693,18 +5693,66 @@ def test_shipped_sglang_pd_hicache_remote_config_parses(tmp_path):
     assert "--device" not in router
 
 
-def test_shipped_sglang_pd_hicache_minimax_config_parses():
+def test_shipped_sglang_pd_hicache_minimax_config_parses(tmp_path):
     path = CONFIG_DIR / "auto_bench.sglang_pd_hicache_remote_minimax.json"
     config = ab.load_config(path)
+    assert [profile.name for profile in config.serve_profiles] == [
+        "sglang_tp4_minimax_m27_baseline_14_4gpu",
+    ]
     assert [profile.name for profile in config.topology_profiles] == [
         "sglang_pd_hicache_minimax_m27_2p2d",
         "sglang_pd_hicache_minimax_m27_prefill_only_2p2d",
     ]
+    assert config.serve_profiles[0].engine == "sglang"
+    assert config.serve_profiles[0].gpus == "0,1,2,3"
     assert all(profile.engine == "sglang" for profile in config.topology_profiles)
     assert all(
         profile.sglang_hicache is not None
         for profile in config.topology_profiles
     )
+    bench = config.bench_profiles[0]
+    assert bench.name == "latency_matrix"
+    assert bench.input_lens == (4096, 8192, 16384, 32768, 65536, 131072, 172032)
+    assert bench.parallel_nums == (1, 4, 8, 16, 24, 32, 48, 64, 96, 128)
+    assert bench.prefix_ratio == 0.1
+
+    baseline_case = next(
+        case for case in ab.expand_cases(config, run_id="dryrun")
+        if case.serve_profile is not None
+    )
+    baseline_cmd = ab.build_serve_run_command(config, baseline_case, tmp_path / "dryrun")
+    assert value_after(baseline_cmd, "--gpus") == '"device=0,1,2,3"'
+    assert value_after(baseline_cmd, "--quantization") == "compressed-tensors"
+    assert value_after(baseline_cmd, "--kv-cache-dtype") == "fp8_e4m3"
+    assert value_after(baseline_cmd, "--mem-fraction-static") == "0.92"
+    assert value_after(baseline_cmd, "--max-running-requests") == "128"
+    assert value_after(baseline_cmd, "--context-length") == "172032"
+    assert "--enable-metrics" in baseline_cmd
+    assert "--enable-cache-report" in baseline_cmd
+    assert "--stream-response-default-include-usage" in baseline_cmd
+    assert "--log-requests" in baseline_cmd
+    assert value_after(baseline_cmd, "--log-requests-level") == "2"
+    assert value_after(baseline_cmd, "--log-requests-format") == "json"
+    assert value_after(baseline_cmd, "--log-requests-target") == "stdout"
+    assert value_after(baseline_cmd, "--tool-call-parser") == "minimax-m2"
+    assert value_after(baseline_cmd, "--reasoning-parser") == "minimax"
+
+    pd_case = next(
+        case for case in ab.expand_cases(config, run_id="dryrun")
+        if (
+            case.topology_profile is not None
+            and case.topology_profile.name == "sglang_pd_hicache_minimax_m27_2p2d"
+        )
+    )
+    commands = pd_case.topology_profile.build_commands(config, pd_case, tmp_path / "dryrun")
+    p1 = commands["p1"].argv
+    d1 = commands["d1"].argv
+    assert value_after(p1, "--quantization") == "compressed-tensors"
+    assert value_after(d1, "--kv-cache-dtype") == "fp8_e4m3"
+    assert "--log-requests" in p1
+    assert "--log-requests" in d1
+    assert "--enable-metrics" in p1
+    assert "--enable-cache-report" in d1
 
 
 def test_controller_dry_run_prints_sglang_command(tmp_path, capsys):

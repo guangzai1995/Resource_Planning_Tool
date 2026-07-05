@@ -3,6 +3,9 @@
     "name": "sglang_minimax_m27_pd_hicache_compare",
     "results_dir": "vllm_standalone_bench/results",
     "bench_image": "vllm-bench-runner:offline",
+    "images": {
+      "sglang": "lmsysorg/sglang:latest"
+    },
     "api_key": "local-bench-key",
     "ready_timeout_sec": 3600,
     "cooldown_sec": 20
@@ -16,6 +19,31 @@
       "model_path": "/models/MiniMax-M2.7-NVFP4",
       "tokenizer_path": "/models/MiniMax-M2.7-NVFP4",
       "served_model_name": "minimax-m2.7"
+    }
+  ],
+  "serve_profiles": [
+    {
+      "name": "sglang_tp4_minimax_m27_baseline_14_4gpu",
+      "engine": "sglang",
+      "gpus": "0,1,2,3",
+      "args": [
+        "--tensor-parallel-size", "4",
+        "--trust-remote-code",
+        "--quantization", "compressed-tensors",
+        "--kv-cache-dtype", "fp8_e4m3",
+        "--mem-fraction-static", "0.92",
+        "--max-running-requests", "128",
+        "--context-length", "172032",
+        "--stream-response-default-include-usage",
+        "--enable-metrics",
+        "--enable-cache-report",
+        "--log-requests",
+        "--log-requests-level", "2",
+        "--log-requests-format", "json",
+        "--log-requests-target", "stdout",
+        "--tool-call-parser", "minimax-m2",
+        "--reasoning-parser", "minimax"
+      ]
     }
   ],
   "topology_profiles": [
@@ -64,10 +92,18 @@
           "args": [
             "--tensor-parallel-size", "4",
             "--trust-remote-code",
-            "--mem-fraction-static", "0.85",
+            "--quantization", "compressed-tensors",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--mem-fraction-static", "0.92",
             "--max-running-requests", "128",
             "--context-length", "172032",
-            "--stream-response-default-include-usage"
+            "--stream-response-default-include-usage",
+            "--log-requests",
+            "--log-requests-level", "2",
+            "--log-requests-format", "json",
+            "--log-requests-target", "stdout",
+            "--tool-call-parser", "minimax-m2",
+            "--reasoning-parser", "minimax"
           ]
         },
         {
@@ -79,10 +115,18 @@
           "args": [
             "--tensor-parallel-size", "4",
             "--trust-remote-code",
-            "--mem-fraction-static", "0.85",
+            "--quantization", "compressed-tensors",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--mem-fraction-static", "0.92",
             "--max-running-requests", "128",
             "--context-length", "172032",
-            "--stream-response-default-include-usage"
+            "--stream-response-default-include-usage",
+            "--log-requests",
+            "--log-requests-level", "2",
+            "--log-requests-format", "json",
+            "--log-requests-target", "stdout",
+            "--tool-call-parser", "minimax-m2",
+            "--reasoning-parser", "minimax"
           ]
         }
       ],
@@ -95,10 +139,18 @@
           "args": [
             "--tensor-parallel-size", "4",
             "--trust-remote-code",
-            "--mem-fraction-static", "0.85",
+            "--quantization", "compressed-tensors",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--mem-fraction-static", "0.92",
             "--max-running-requests", "128",
             "--context-length", "172032",
-            "--stream-response-default-include-usage"
+            "--stream-response-default-include-usage",
+            "--log-requests",
+            "--log-requests-level", "2",
+            "--log-requests-format", "json",
+            "--log-requests-target", "stdout",
+            "--tool-call-parser", "minimax-m2",
+            "--reasoning-parser", "minimax"
           ]
         },
         {
@@ -109,10 +161,18 @@
           "args": [
             "--tensor-parallel-size", "4",
             "--trust-remote-code",
-            "--mem-fraction-static", "0.85",
+            "--quantization", "compressed-tensors",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--mem-fraction-static", "0.92",
             "--max-running-requests", "128",
             "--context-length", "172032",
-            "--stream-response-default-include-usage"
+            "--stream-response-default-include-usage",
+            "--log-requests",
+            "--log-requests-level", "2",
+            "--log-requests-format", "json",
+            "--log-requests-target", "stdout",
+            "--tool-call-parser", "minimax-m2",
+            "--reasoning-parser", "minimax"
           ]
         }
       ],
@@ -171,10 +231,18 @@
           "args": [
             "--tensor-parallel-size", "4",
             "--trust-remote-code",
-            "--mem-fraction-static", "0.85",
+            "--quantization", "compressed-tensors",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--mem-fraction-static", "0.92",
             "--max-running-requests", "128",
             "--context-length", "172032",
-            "--stream-response-default-include-usage"
+            "--stream-response-default-include-usage",
+            "--log-requests",
+            "--log-requests-level", "2",
+            "--log-requests-format", "json",
+            "--log-requests-target", "stdout",
+            "--tool-call-parser", "minimax-m2",
+            "--reasoning-parser", "minimax"
           ]
         },
         {
@@ -186,10 +254,18 @@
           "args": [
             "--tensor-parallel-size", "4",
             "--trust-remote-code",
-            "--mem-fraction-static", "0.85",
+            "--quantization", "compressed-tensors",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--mem-fraction-static", "0.92",
             "--max-running-requests", "128",
             "--context-length", "172032",
-            "--stream-response-default-include-usage"
+            "--stream-response-default-include-usage",
+            "--log-requests",
+            "--log-requests-level", "2",
+            "--log-requests-format", "json",
+            "--log-requests-target", "stdout",
+            "--tool-call-parser", "minimax-m2",
+            "--reasoning-parser", "minimax"
           ]
         }
       ],
@@ -202,10 +278,18 @@
           "args": [
             "--tensor-parallel-size", "4",
             "--trust-remote-code",
-            "--mem-fraction-static", "0.85",
+            "--quantization", "compressed-tensors",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--mem-fraction-static", "0.92",
             "--max-running-requests", "128",
             "--context-length", "172032",
-            "--stream-response-default-include-usage"
+            "--stream-response-default-include-usage",
+            "--log-requests",
+            "--log-requests-level", "2",
+            "--log-requests-format", "json",
+            "--log-requests-target", "stdout",
+            "--tool-call-parser", "minimax-m2",
+            "--reasoning-parser", "minimax"
           ]
         },
         {
@@ -216,10 +300,18 @@
           "args": [
             "--tensor-parallel-size", "4",
             "--trust-remote-code",
-            "--mem-fraction-static", "0.85",
+            "--quantization", "compressed-tensors",
+            "--kv-cache-dtype", "fp8_e4m3",
+            "--mem-fraction-static", "0.92",
             "--max-running-requests", "128",
             "--context-length", "172032",
-            "--stream-response-default-include-usage"
+            "--stream-response-default-include-usage",
+            "--log-requests",
+            "--log-requests-level", "2",
+            "--log-requests-format", "json",
+            "--log-requests-target", "stdout",
+            "--tool-call-parser", "minimax-m2",
+            "--reasoning-parser", "minimax"
           ]
         }
       ],
@@ -236,13 +328,13 @@
   ],
   "bench_profiles": [
     {
-      "name": "hicache_long_prompt_reuse",
+      "name": "latency_matrix",
       "backend": "openai-chat",
-      "input_lens": [4096, 8192, 16384],
+      "input_lens": [4096, 8192, 16384, 32768, 65536, 131072, 172032],
       "output_lens": [1024],
-      "parallel_nums": [16, 32, 64],
+      "parallel_nums": [1, 4, 8, 16, 24, 32, 48, 64, 96, 128],
       "epochs": 3,
-      "prefix_ratio": 0.8,
+      "prefix_ratio": 0.1,
       "warmup_requests": 4,
       "warmup_concurrency": 8,
       "cross_product": true,
