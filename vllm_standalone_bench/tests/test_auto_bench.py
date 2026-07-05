@@ -5671,6 +5671,42 @@ def test_shipped_sglang_pd_remote_config_parses(tmp_path):
     assert "http://192.0.2.21:30001" in values_after(router, "--decode")
 
 
+def test_shipped_sglang_pd_hicache_remote_config_parses(tmp_path):
+    path = CONFIG_DIR / "auto_bench.sglang_pd_hicache_remote.example.json"
+    config = ab.load_config(path)
+    assert config.serve_profiles == ()
+    profile = config.topology_profiles[0]
+    assert profile.engine == "sglang"
+    assert profile.sglang_hicache is not None
+    assert profile.sglang_hicache.mode == "full_async_offload"
+
+    case = ab.expand_cases(config, run_id="dryrun")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "dryrun")
+    p1 = commands["p1"].argv
+    d1 = commands["d1"].argv
+    router = commands["router"].argv
+    assert "--enable-hierarchical-cache" in p1
+    assert "--disaggregation-decode-enable-offload-kvcache" in d1
+    assert value_after(p1, "--hicache-storage-backend") == "mooncake"
+    assert value_after(d1, "--hicache-storage-backend") == "mooncake"
+    assert value_after(p1, "--device") == "/dev/infiniband"
+    assert "--device" not in router
+
+
+def test_shipped_sglang_pd_hicache_minimax_config_parses():
+    path = CONFIG_DIR / "auto_bench.sglang_pd_hicache_remote_minimax.json"
+    config = ab.load_config(path)
+    assert [profile.name for profile in config.topology_profiles] == [
+        "sglang_pd_hicache_minimax_m27_2p2d",
+        "sglang_pd_hicache_minimax_m27_prefill_only_2p2d",
+    ]
+    assert all(profile.engine == "sglang" for profile in config.topology_profiles)
+    assert all(
+        profile.sglang_hicache is not None
+        for profile in config.topology_profiles
+    )
+
+
 def test_controller_dry_run_prints_sglang_command(tmp_path, capsys):
     data = minimal_config(tmp_path)
     data["run"]["images"] = {"vllm": data["run"]["vllm_image"], "sglang": "sglang:latest"}

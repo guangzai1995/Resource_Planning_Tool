@@ -175,6 +175,169 @@ def test_sglang_pd_commands_render_disaggregation_ib_device(tmp_path):
     assert "--disaggregation-ib-device" not in router
 
 
+def test_sglang_pd_hicache_prefill_only_renders_prefill_flags(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["sglang_hicache"] = {
+        "mode": "prefill_only",
+        "page_size": 64,
+        "ratio": 2.0,
+        "size": 0,
+        "write_policy": "write_through",
+        "io_backend": "direct",
+        "mem_layout": "page_first_direct",
+        "storage_backend": "mooncake",
+        "storage_prefetch_policy": "timeout",
+        "storage_backend_extra_config": {"tp_lcm_size": 4},
+        "enable_metrics": True,
+        "enable_cache_report": True,
+    }
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1 = commands["p1"].argv
+    d1 = commands["d1"].argv
+    assert value_after(p1, "--page-size") == "64"
+    assert value_after(d1, "--page-size") == "64"
+    assert "--enable-hierarchical-cache" in p1
+    assert "--enable-hierarchical-cache" not in d1
+    assert value_after(p1, "--hicache-storage-backend") == "mooncake"
+    assert "--hicache-storage-backend" not in d1
+    assert (
+        value_after(p1, "--hicache-storage-backend-extra-config")
+        == '{"tp_lcm_size":4}'
+    )
+    assert "--enable-metrics" in p1
+    assert "--enable-cache-report" in p1
+    assert "--enable-metrics" not in d1
+    assert "--enable-cache-report" not in d1
+
+
+def test_sglang_pd_hicache_full_async_renders_decode_offload(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["sglang_hicache"] = {
+        "mode": "full_async_offload",
+        "page_size": 64,
+        "storage_backend": "mooncake",
+    }
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1 = commands["p1"].argv
+    d1 = commands["d1"].argv
+    assert "--enable-hierarchical-cache" in p1
+    assert "--disaggregation-decode-enable-offload-kvcache" not in p1
+    assert "--enable-hierarchical-cache" not in d1
+    assert "--disaggregation-decode-enable-offload-kvcache" in d1
+    assert value_after(p1, "--hicache-storage-backend") == "mooncake"
+    assert value_after(d1, "--hicache-storage-backend") == "mooncake"
+    assert value_after(d1, "--hicache-storage-prefetch-policy") == "timeout"
+
+
+def test_sglang_pd_hicache_defaults_follow_sglang_server_args(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["sglang_hicache"] = {
+        "mode": "full_async_offload",
+        "storage_backend": "mooncake",
+    }
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1 = commands["p1"].argv
+    d1 = commands["d1"].argv
+    assert value_after(p1, "--hicache-io-backend") == "kernel"
+    assert value_after(p1, "--hicache-mem-layout") == "layer_first"
+    assert value_after(d1, "--hicache-io-backend") == "kernel"
+    assert value_after(d1, "--hicache-mem-layout") == "layer_first"
+
+
+def test_sglang_pd_mount_infiniband_adds_worker_flags(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["image"] = "sglang:pd"
+    topology["mount_infiniband"] = True
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(config, case, tmp_path / "run123")
+
+    p1 = commands["p1"].argv
+    router = commands["router"].argv
+    assert value_after(p1, "--device") == "/dev/infiniband"
+    assert "IPC_LOCK" in p1
+    assert "memlock=-1:-1" in p1
+    assert "--device" not in router
+
+
+@pytest.mark.parametrize("patch, match", [
+    ({"mode": "bad"}, "mode"),
+    ({"mode": "prefill_only", "write_policy": "bad"}, "write_policy"),
+    ({"mode": "prefill_only", "io_backend": "bad"}, "io_backend"),
+    ({"mode": "prefill_only", "mem_layout": "bad"}, "mem_layout"),
+    ({"mode": "prefill_only", "storage_backend": "bad"}, "storage_backend"),
+    (
+        {"mode": "prefill_only", "storage_prefetch_policy": "bad"},
+        "storage_prefetch_policy",
+    ),
+    ({"mode": "prefill_only", "page_size": 0}, "page_size"),
+    ({"mode": "prefill_only", "ratio": 0}, "ratio"),
+    ({"mode": "prefill_only", "size": -1}, "size"),
+    (
+        {"mode": "prefill_only", "storage_backend_extra_config": []},
+        "storage_backend_extra_config",
+    ),
+    ({"mode": "prefill_only", "unknown": True}, "unsupported keys"),
+])
+def test_sglang_pd_hicache_rejects_invalid_config(tmp_path, patch, match):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["sglang_hicache"] = patch
+
+    with pytest.raises(ab.ConfigError, match=match):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_sglang_pd_hicache_full_async_requires_storage_backend(tmp_path):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["sglang_hicache"] = {"mode": "full_async_offload"}
+
+    with pytest.raises(ab.ConfigError, match="storage_backend"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_sglang_pd_rejects_invalid_transfer_backend(tmp_path):
+    data = pd_topology_config(tmp_path)
+    data["topology_profiles"][0]["transfer_backend"] = "bad"
+
+    with pytest.raises(ab.ConfigError, match="transfer_backend"):
+        ab.load_config(write_config(tmp_path, data))
+
+
+def test_vllm_pd_rejects_sglang_hicache_config(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "nixl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+    for i, node in enumerate(topology["prefill"] + topology["decode"]):
+        node["side_channel_port"] = 5600 + i
+    topology["sglang_hicache"] = {"mode": "prefill_only"}
+
+    with pytest.raises(ab.ConfigError, match="sglang_hicache"):
+        ab.load_config(write_config(tmp_path, data))
+
+
 def test_vllm_pd_p2p_rejects_missing_kv_port(tmp_path):
     data = pd_topology_config(tmp_path)
     topology = data["topology_profiles"][0]

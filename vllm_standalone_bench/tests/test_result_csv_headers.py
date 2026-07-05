@@ -10,7 +10,7 @@ import bench_compare as bc
 import run_bench_multi as m
 
 
-# 期望的新顺序（52 列）：基本信息(17) → 吞吐(5) → TTFT(4) → 其他(26)
+# 期望的新顺序（57 列）：基本信息(17) → 吞吐(5) → TTFT(4) → 其他(31)
 EXPECTED_HEADERS = [
     # 基本信息
     "model", "backend", "dataset_name", "language",
@@ -27,6 +27,9 @@ EXPECTED_HEADERS = [
     "input_compliance", "output_compliance",
     "finish_reason_length_pct", "token_source",
     "avg_cached_tokens", "cache_hit_rate",
+    "cache_hit_rate_metrics",
+    "cache_hit_tokens_device", "cache_hit_tokens_host",
+    "cache_hit_tokens_storage", "cache_hit_tokens_storage_mooncake",
     "avg_gpu_kv_cache_usage", "peak_gpu_kv_cache_usage",
     "spec_decode_acceptance_rate", "spec_decode_system_efficiency",
     "spec_decode_num_drafts", "spec_decode_num_accepted_tokens",
@@ -53,6 +56,9 @@ EXPECTED_HEADERS_ZH = [
     "输入长度合规(%)", "输出长度合规(%)",
     "length停止占比(%)", "token来源",
     "平均缓存命中tokens", "缓存命中率(%)",
+    "Metrics缓存命中率(%)",
+    "Device缓存命中tokens", "Host缓存命中tokens",
+    "Storage缓存命中tokens", "Mooncake缓存命中tokens",
     "平均GPU KV缓存占用率(%)", "峰值GPU KV缓存占用率(%)",
     "SpecDecode接受率(%)", "SpecDecode系统效率",
     "SpecDecode草稿轮数", "SpecDecode接受tokens数",
@@ -78,9 +84,9 @@ def test_csv_headers_zh_exact_order():
     assert m.CSV_HEADERS_ZH == EXPECTED_HEADERS_ZH
 
 
-def test_csv_headers_count_is_52():
-    assert len(m.CSV_HEADERS) == 52
-    assert len(m.CSV_HEADERS_ZH) == 52
+def test_csv_headers_count_is_57():
+    assert len(m.CSV_HEADERS) == 57
+    assert len(m.CSV_HEADERS_ZH) == 57
 
 
 def test_zh_pairs_one_to_one():

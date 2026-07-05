@@ -31,7 +31,7 @@ import time
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -103,11 +103,20 @@ class SpecDecodeMetrics:
 
 
 @dataclass
+class CacheSourceMetrics:
+    """SGLang cached-token counters from the server's Prometheus endpoint."""
+
+    prompt_tokens: int = 0
+    cached_tokens_by_source: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
 class RuntimeMetrics:
     """Runtime metrics parsed from the server's Prometheus endpoint."""
 
     spec_decode: SpecDecodeMetrics | None = None
     gpu_kv_cache_usage: float | None = None
+    cache_source: CacheSourceMetrics | None = None
 
 
 @dataclass
@@ -157,6 +166,19 @@ def _metric_value_from_prometheus_line(line: str) -> float | None:
     return None
 
 
+def _metric_labels_from_prometheus_line(line: str) -> dict[str, str]:
+    if "{" not in line or "}" not in line:
+        return {}
+    label_text = line.split("{", 1)[1].split("}", 1)[0]
+    labels: dict[str, str] = {}
+    for item in label_text.split(","):
+        key, separator, raw_value = item.partition("=")
+        if not separator:
+            continue
+        labels[key.strip()] = raw_value.strip().strip('"')
+    return labels
+
+
 def _normalize_gpu_kv_cache_usage(value: float) -> float:
     if 0.0 <= value <= 1.0:
         return value * 100.0
@@ -170,6 +192,8 @@ def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
     accepted_per_pos: dict[int, int] = {}
     found_spec_decode = False
     gpu_kv_cache_usage_samples: list[float] = []
+    prompt_tokens_total = 0
+    cached_tokens_by_source: dict[str, int] = {}
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -183,6 +207,19 @@ def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
 
         if metric_name in GPU_KV_CACHE_USAGE_METRICS:
             gpu_kv_cache_usage_samples.append(_normalize_gpu_kv_cache_usage(value))
+            continue
+
+        if metric_name == "sglang:prompt_tokens_total":
+            prompt_tokens_total += int(value)
+            continue
+
+        if metric_name == "sglang:cached_tokens_total":
+            labels = _metric_labels_from_prometheus_line(line)
+            source = labels.get("cache_source")
+            if source:
+                cached_tokens_by_source[source] = (
+                    cached_tokens_by_source.get(source, 0) + int(value)
+                )
             continue
 
         if not metric_name.startswith("vllm:spec_decode"):
@@ -218,9 +255,16 @@ def parse_runtime_metrics_text(text: str) -> RuntimeMetrics:
     gpu_kv_cache_usage = (
         max(gpu_kv_cache_usage_samples) if gpu_kv_cache_usage_samples else None
     )
+    cache_source = None
+    if prompt_tokens_total > 0 or cached_tokens_by_source:
+        cache_source = CacheSourceMetrics(
+            prompt_tokens=prompt_tokens_total,
+            cached_tokens_by_source=cached_tokens_by_source,
+        )
     return RuntimeMetrics(
         spec_decode=spec_decode,
         gpu_kv_cache_usage=gpu_kv_cache_usage,
+        cache_source=cache_source,
     )
 
 
@@ -253,6 +297,46 @@ async def fetch_spec_decode_metrics(
     if metrics is None:
         return None
     return metrics.spec_decode
+
+
+def calculate_cache_source_stats(
+    before: CacheSourceMetrics,
+    after: CacheSourceMetrics,
+) -> dict[str, Any]:
+    prompt_delta = max(after.prompt_tokens - before.prompt_tokens, 0)
+    source_deltas: dict[str, int] = {}
+    sources = set(before.cached_tokens_by_source) | set(after.cached_tokens_by_source)
+    for source in sources:
+        delta = (
+            after.cached_tokens_by_source.get(source, 0)
+            - before.cached_tokens_by_source.get(source, 0)
+        )
+        source_deltas[source] = max(delta, 0)
+
+    device = source_deltas.get("device", 0)
+    host = source_deltas.get("host", 0)
+    storage = sum(
+        value
+        for source, value in source_deltas.items()
+        if source.startswith("storage_")
+    )
+    total_cached = sum(source_deltas.values())
+    hit_rate = (
+        round(total_cached / prompt_delta * 100, 4)
+        if prompt_delta > 0
+        else 0.0
+    )
+
+    stats: dict[str, Any] = {
+        "cache_hit_rate_metrics": hit_rate,
+        "cache_hit_tokens_device": device,
+        "cache_hit_tokens_host": host,
+        "cache_hit_tokens_storage": storage,
+    }
+    for source, value in sorted(source_deltas.items()):
+        if source.startswith("storage_"):
+            stats[f"cache_hit_tokens_{source}"] = value
+    return stats
 
 
 class RuntimeMetricsSampler:
@@ -1025,8 +1109,18 @@ async def benchmark(
     else:
         print("Self timing is set, using the timestamps from the trace file.")
 
-    spec_decode_metrics_before = await fetch_spec_decode_metrics(
+    runtime_metrics_before = await fetch_runtime_metrics(
         base_url, session, extra_headers
+    )
+    spec_decode_metrics_before = (
+        runtime_metrics_before.spec_decode
+        if runtime_metrics_before is not None
+        else None
+    )
+    cache_source_metrics_before = (
+        runtime_metrics_before.cache_source
+        if runtime_metrics_before is not None
+        else None
     )
     runtime_sampler = RuntimeMetricsSampler(
         base_url=base_url,
@@ -1123,8 +1217,18 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    spec_decode_metrics_after = await fetch_spec_decode_metrics(
+    runtime_metrics_after = await fetch_runtime_metrics(
         base_url, session, extra_headers
+    )
+    spec_decode_metrics_after = (
+        runtime_metrics_after.spec_decode
+        if runtime_metrics_after is not None
+        else None
+    )
+    cache_source_metrics_after = (
+        runtime_metrics_after.cache_source
+        if runtime_metrics_after is not None
+        else None
     )
     spec_decode_stats: dict[str, Any] | None = None
     if spec_decode_metrics_before is not None and spec_decode_metrics_after is not None:
@@ -1279,6 +1383,17 @@ async def benchmark(
         result["rps_change_events"] = rps_change_events
 
     add_runtime_metrics_to_result(result, runtime_metrics_summary)
+
+    if (
+        cache_source_metrics_before is not None
+        and cache_source_metrics_after is not None
+    ):
+        result.update(
+            calculate_cache_source_stats(
+                cache_source_metrics_before,
+                cache_source_metrics_after,
+            )
+        )
 
     if spec_decode_stats is not None:
         result["spec_decode_acceptance_rate"] = spec_decode_stats["acceptance_rate"]

@@ -196,6 +196,30 @@ python3 vllm_standalone_bench/auto_bench.py run \
   --dry-run
 ```
 
+SGLang PD + HiCache 示例配置：
+
+```bash
+python3 vllm_standalone_bench/auto_bench.py run \
+  --config vllm_standalone_bench/configs/auto_bench.sglang_pd_hicache_remote.example.json \
+  --run-id sglang_pd_hicache_dry_run_001 \
+  --dry-run
+```
+
+`topology_profiles[].sglang_hicache` 只对 `engine: "sglang"` 生效，用来生成
+SGLang 原生 PD + HiCache 参数。当前支持两种模式：
+
+- `prefill_only`：只在 prefill worker 上开启 `--enable-hierarchical-cache`，
+  decode worker 仅接收 PD 传来的 KV。
+- `full_async_offload`：prefill worker 开启 HiCache，decode worker 额外开启
+  `--disaggregation-decode-enable-offload-kvcache`，用于 decode 侧异步 offload。
+
+`page_size` 是 SGLang worker 级参数，配置后会同时下发到 prefill/decode worker；
+`write_policy`、`io_backend`、`mem_layout`、`storage_backend`、
+`storage_prefetch_policy` 和 `storage_backend_extra_config` 会转成对应的
+HiCache CLI 参数。Mooncake 模式需要外部先准备好 master、metadata server 和
+store server，auto bench 只负责把配置中的 `MOONCAKE_*` 环境变量传给容器，不会
+自动拉起 Mooncake 控制面。
+
 示例中的 `192.0.2.x` 是 RFC 5737 文档地址，只适合 dry-run/示例；实际运行前需要替换 host 地址、镜像名、远程模型路径和 SSH auth。
 
 准备好 vLLM 镜像、bench-runner 镜像和完整模型后，运行真实 smoke：
@@ -458,10 +482,18 @@ python3 vllm_standalone_bench/run_bench_serve.py \
 | **decode_effective_tok_s** | Decode 有效速率 | `1 / mean_TPOT_s`，基于 TPOT 的 next-token decode 近似速率 |
 | **cache_hit_rate** | 缓存命中率 | `avg_cached_tokens / avg_input_tokens`，统计输入 tokens 中从缓存命中的比例 |
 | **avg_cached_tokens** | 平均缓存 Token 数 | 每个请求平均从 prefix cache 命中的 token 数 |
+| **cache_hit_rate_metrics** | Metrics 缓存命中率 | SGLang `/metrics` 中 `cached_tokens_total` 差分 / `prompt_tokens_total` 差分 |
+| **cache_hit_tokens_device** | Device 缓存命中 Token 数 | SGLang `/metrics` 中 `cache_source="device"` 的 `cached_tokens_total` 差分 |
+| **cache_hit_tokens_host** | Host 缓存命中 Token 数 | SGLang `/metrics` 中 `cache_source="host"` 的 `cached_tokens_total` 差分 |
+| **cache_hit_tokens_storage** | Storage 缓存命中 Token 数 | SGLang `/metrics` 中所有 `cache_source="storage_*"` 的 `cached_tokens_total` 差分之和 |
+| **cache_hit_tokens_storage_mooncake** | Mooncake 缓存命中 Token 数 | SGLang `/metrics` 中 `cache_source="storage_mooncake"` 的 `cached_tokens_total` 差分 |
 
 > **缓存命中率（`cache_hit_rate`）**：统计结果中的 `cache_hit_rate` / `avg_cached_tokens`
 > 取自响应 `usage.cached_tokens`。该值非零需要服务端开启前缀缓存
 > （vLLM `--enable-prefix-caching`；SGLang 对应缓存开关）；未开启时命中率为 0。
+> SGLang HiCache 的 device/host/storage 分层命中来自 `/metrics` 差分，
+> 需要服务端开启 `--enable-metrics`。这些字段用于观察 KV 复用落在哪一层，
+> 和响应 `usage.cached_tokens` 口径相互补充。
 
 ## 与 benchmark_tools 的关键差异
 
