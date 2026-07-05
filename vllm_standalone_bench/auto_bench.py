@@ -1821,6 +1821,25 @@ def _build_ready_probe_url(config: AutoBenchConfig, case: BenchmarkCase,
     return f"http://{case.container_name}:{config.run.container_port}/v1/models"
 
 
+def _build_bench_base_url(config: AutoBenchConfig, case: BenchmarkCase,
+                          runner: Runner) -> str:
+    """Build benchmark base URL, preferring container IP for legacy bridge runs."""
+    if case.topology_profile is not None:
+        return case_endpoint_base_url(config, case)
+    require_legacy_case(case)
+    serve_container = case.container_name
+    ip = _get_container_ip(runner, serve_container, config.run.network)
+    if ip:
+        return f"http://{ip}:{config.run.container_port}/v1"
+    logger.warning(
+        "failed to get IP for container %s on network %s; "
+        "falling back to container name as benchmark hostname",
+        serve_container,
+        config.run.network,
+    )
+    return case_endpoint_base_url(config, case)
+
+
 def build_ready_probe_run_command(config: AutoBenchConfig, case: BenchmarkCase,
                                   run_dir: Path,
                                   ready_url: str | None = None) -> list[str]:
@@ -1907,6 +1926,12 @@ def _run_bench_case(config: AutoBenchConfig, runner: Runner,
                     dry_run: bool,
                     monitor_resources: bool = True) -> tuple[str, str | None]:
     bench_cmd = build_bench_run_command(config, case, layout.bench_dir)
+    if not dry_run:
+        bench_cmd[bench_cmd.index("--base-url") + 1] = _build_bench_base_url(
+            config,
+            case,
+            runner,
+        )
     if dry_run:
         print_cmd(bench_cmd)
         return "passed", None

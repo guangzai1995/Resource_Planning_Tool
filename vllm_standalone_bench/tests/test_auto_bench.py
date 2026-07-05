@@ -674,6 +674,51 @@ def test_build_bench_command_targets_container_dns(tmp_path):
     assert value_after(cmd, "--output-xlsx") == "/results/result.xlsx"
 
 
+def test_run_bench_case_uses_container_ip_base_url_when_available(tmp_path):
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    layout = ab.build_layout(config, "run123", case)
+    layout.bench_dir.mkdir(parents=True)
+
+    class IPInspectRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True,
+                stdout=None, stderr=None):
+            if (
+                args[:3] == ["docker", "inspect", "--format"]
+                and "NetworkSettings.Networks" in args[3]
+            ):
+                return ab.Completed(list(args), 0, "172.18.0.5\n", "")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    runner = IPInspectRunner()
+
+    status, error = ab._run_bench_case(
+        config,
+        runner,
+        case,
+        layout,
+        dry_run=False,
+        monitor_resources=False,
+    )
+
+    bench_runs = [
+        command for command in runner.commands
+        if command[:3] == ["docker", "run", "--rm"]
+        and any("run_bench_multi.py" in str(arg) for arg in command)
+    ]
+    assert status == "passed"
+    assert error is None
+    assert len(bench_runs) == 1
+    assert value_after(bench_runs[0], "--base-url") == "http://172.18.0.5:8000/v1"
+
+
 def test_build_bench_command_passes_builtin_dataset(tmp_path):
     data = minimal_config(tmp_path)
     data["bench_profiles"][0]["dataset"] = {
