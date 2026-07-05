@@ -1792,7 +1792,8 @@ def remove_existing_ready_probe_container_if_owned(runner: Runner, case: Benchma
 
 def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
                              runner: Runner) -> bool:
-    run_dir = build_layout(config, case.run_id, case).run_dir
+    layout = build_layout(config, case.run_id, case)
+    run_dir = layout.run_dir
     interrupted: BaseException | None = None
     try:
         if not remove_existing_ready_probe_container_if_owned(runner, case, run_dir):
@@ -1806,6 +1807,13 @@ def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
         interrupted = exc
         raise
     finally:
+        try:
+            save_ready_probe_artifacts(config, runner, case, layout)
+        except (StopRequested, KeyboardInterrupt):
+            if interrupted is None:
+                raise
+        except Exception:
+            pass
         try:
             cleanup_ready_probe_container_if_owned(runner, case, run_dir)
         except (StopRequested, KeyboardInterrupt):
@@ -1911,6 +1919,27 @@ def _run_bench_case(config: AutoBenchConfig, runner: Runner,
     status = "passed" if result.returncode == 0 else "failed"
     error = None if result.returncode == 0 else f"benchmark exited {result.returncode}"
     return status, error
+
+
+def save_ready_probe_artifacts(config: AutoBenchConfig, runner: Runner,
+                               case: BenchmarkCase, layout: CaseLayout) -> None:
+    """保存 ready probe 容器的日志和 inspect，便于诊断 ready check 失败原因。"""
+    require_legacy_case(case)
+    probe_name = make_ready_probe_container_name(case)
+    secrets_to_redact = set()
+    if config.run.api_key:
+        secrets_to_redact.add(config.run.api_key)
+    layout.serve_dir.mkdir(parents=True, exist_ok=True)
+    logs = runner.run(["docker", "logs", "--timestamps", probe_name], check=False)
+    (layout.serve_dir / "ready_probe.log").write_text(
+        logs.stdout + logs.stderr,
+        encoding="utf-8",
+    )
+    inspect = runner.run(["docker", "inspect", probe_name], check=False)
+    (layout.serve_dir / "ready_probe.inspect.json").write_text(
+        redact_inspect_stdout(inspect.stdout, secrets_to_redact),
+        encoding="utf-8",
+    )
 
 
 def save_vllm_artifacts(config: AutoBenchConfig, runner: Runner,
