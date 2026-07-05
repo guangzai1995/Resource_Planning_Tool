@@ -3109,6 +3109,9 @@ def test_ready_probe_uses_container_ip_when_available(tmp_path):
                 args[:3] == ["docker", "inspect", "--format"]
                 and "NetworkSettings.Networks" in args[3]
             ):
+                assert args[3] == (
+                    '{{(index .NetworkSettings.Networks "vllm-bench-net").IPAddress}}'
+                )
                 return ab.Completed(list(args), 0, "172.18.0.5\n", "")
             return super().run(
                 args,

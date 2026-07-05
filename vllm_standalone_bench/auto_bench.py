@@ -1784,7 +1784,7 @@ def _get_container_ip(runner: Runner, container_name: str, network: str) -> str 
             "docker",
             "inspect",
             "--format",
-            f'{{(index .NetworkSettings.Networks "{network}").IPAddress}}',
+            f'{{{{(index .NetworkSettings.Networks "{network}").IPAddress}}}}',
             container_name,
         ],
         check=False,
