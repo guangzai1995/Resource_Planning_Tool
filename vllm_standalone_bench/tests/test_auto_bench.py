@@ -5701,7 +5701,11 @@ def test_shipped_sglang_pd_hicache_minimax_config_parses(tmp_path):
     ]
     assert [profile.name for profile in config.topology_profiles] == [
         "sglang_pd_hicache_minimax_m27_2p2d",
+        "sglang_pd_hicache_minimax_m27_3p1d",
+        "sglang_pd_hicache_minimax_m27_1p3d",
         "sglang_pd_hicache_minimax_m27_prefill_only_2p2d",
+        "sglang_pd_hicache_minimax_m27_prefill_only_3p1d",
+        "sglang_pd_hicache_minimax_m27_prefill_only_1p3d",
     ]
     assert config.serve_profiles[0].engine == "sglang"
     assert config.serve_profiles[0].gpus == "0,1,2,3"
