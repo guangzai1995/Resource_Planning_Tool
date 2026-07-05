@@ -1,0 +1,135 @@
+{
+  "run": {
+    "name": "sglang_pd_hicache_remote_bench",
+    "results_dir": "vllm_standalone_bench/results",
+    "bench_image": "vllm-bench-runner:offline",
+    "api_key": "local-bench-key",
+    "ready_timeout_sec": 1800
+  },
+  "mounts": {
+    "models": "/models",
+    "datasets": "/datasets"
+  },
+  "models": [
+    {
+      "name": "glm52",
+      "model_path": "/models/GLM-5.2-FP8",
+      "tokenizer_path": "/models/GLM-5.2-FP8",
+      "served_model_name": "GLM-5.2"
+    }
+  ],
+  "topology_profiles": [
+    {
+      "name": "sglang_pd_hicache_2p2d",
+      "engine": "sglang",
+      "mode": "pd",
+      "provider": "ssh_docker",
+      "transfer_backend": "mooncake",
+      "disaggregation_ib_device": "mlx5_0",
+      "mount_infiniband": true,
+      "network": "host",
+      "image": "lmsysorg/sglang:latest",
+      "router_image": "sglang-router:offline",
+      "sglang_hicache": {
+        "mode": "full_async_offload",
+        "page_size": 64,
+        "storage_backend": "mooncake",
+        "storage_backend_extra_config": {
+          "tp_lcm_size": 4
+        }
+      },
+      "env": {
+        "MOONCAKE_MASTER": "192.0.2.10:50051",
+        "MOONCAKE_TE_META_DATA_SERVER": "http://192.0.2.10:8080/metadata",
+        "MOONCAKE_PROTOCOL": "rdma",
+        "MOONCAKE_DEVICE": "mlx5_0",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "64gb"
+      },
+      "hosts": {
+        "p1": {
+          "address": "192.0.2.11",
+          "ssh_user": "root",
+          "auth": {"type": "key"}
+        },
+        "p2": {
+          "address": "192.0.2.12",
+          "ssh_user": "root",
+          "auth": {"type": "key"}
+        },
+        "d1": {
+          "address": "192.0.2.21",
+          "ssh_user": "root",
+          "auth": {"type": "key"}
+        },
+        "d2": {
+          "address": "192.0.2.22",
+          "ssh_user": "root",
+          "auth": {"type": "key"}
+        },
+        "router": {
+          "address": "192.0.2.30",
+          "ssh_user": "root",
+          "auth": {"type": "key"}
+        }
+      },
+      "prefill": [
+        {
+          "name": "p1",
+          "host": "p1",
+          "port": 30000,
+          "bootstrap_port": 12335,
+          "gpus": "0,1,2,3",
+          "args": ["--tp-size", "4"]
+        },
+        {
+          "name": "p2",
+          "host": "p2",
+          "port": 30000,
+          "bootstrap_port": 12336,
+          "gpus": "0,1,2,3",
+          "args": ["--tp-size", "4"]
+        }
+      ],
+      "decode": [
+        {
+          "name": "d1",
+          "host": "d1",
+          "port": 30001,
+          "gpus": "0,1,2,3",
+          "args": ["--tp-size", "4"]
+        },
+        {
+          "name": "d2",
+          "host": "d2",
+          "port": 30001,
+          "gpus": "0,1,2,3",
+          "args": ["--tp-size", "4"]
+        }
+      ],
+      "frontend": {
+        "kind": "sglang_router",
+        "host": "router",
+        "port": 8000,
+        "args": [
+          "--prefill-policy",
+          "cache_aware",
+          "--decode-policy",
+          "power_of_two"
+        ]
+      }
+    }
+  ],
+  "bench_profiles": [
+    {
+      "name": "hicache_reuse_matrix",
+      "backend": "openai-chat",
+      "input_lens": [4096],
+      "output_lens": [256],
+      "parallel_nums": [16],
+      "epochs": 2,
+      "prefix_ratio": 0.8,
+      "warmup_requests": 4,
+      "warmup_concurrency": 4
+    }
+  ]
+}
