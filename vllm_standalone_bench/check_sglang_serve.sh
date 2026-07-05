@@ -30,6 +30,14 @@ echo "--- sglang 版本 + 能否 import ---"
 docker run --rm --entrypoint python3 "$IMAGE" -c "import sglang; print('sglang', sglang.__version__)" 2>&1 | head -5
 echo "--- 容器内模型目录存在? ---"
 docker run --rm -v "$MOUNT" --entrypoint ls "$IMAGE" "$MODEL/config.json" 2>&1 | head -3
+echo
+echo "############ 1b) 残留容器 / GPU 占用检查 (NCCL 失败的常见原因) ############"
+echo "--- 还在跑的 sglang/vllm/bench 容器 (应为空, 否则占着 GPU) ---"
+docker ps --format '  {{.Names}}  {{.Image}}  {{.Status}}' | grep -iE "sglang|vllm|bench-pd|mooncake" || echo "  (无残留容器, OK)"
+echo "--- GPU 显存占用 (GPU ${GPUS} 应基本空闲) ---"
+nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader 2>/dev/null | head -8 || echo "  (nvidia-smi 不可用)"
+echo "  >>> 若上面有残留容器或 GPU 显存被占, 先清掉再跑本脚本:"
+echo "      docker rm -f \$(docker ps -q --filter 'label=vllm_auto_bench.managed=true') mooncake-master 2>/dev/null"
 
 echo
 echo "############ 2) 前台跑 sglang launch_server (真实参数, ${TIMEOUT}s 超时) ############"
@@ -40,6 +48,8 @@ echo "  - 被超时杀(退出码124)且一直在 loading = sglang 没问题, 是
 echo
 set +e
 timeout "${TIMEOUT}" docker run --rm --network host --gpus "\"device=${GPUS}\"" \
+  --ipc=host --shm-size=16g \
+  -e NCCL_DEBUG=INFO \
   -v "$MOUNT" --entrypoint python3 "$IMAGE" -m sglang.launch_server \
   --model-path "$MODEL" \
   --host 0.0.0.0 --port "$PORT" \
