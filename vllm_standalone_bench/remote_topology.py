@@ -60,6 +60,22 @@ class VllmPdConfig:
 
 
 @dataclass(frozen=True)
+class SglangHiCacheConfig:
+    mode: str
+    page_size: int | None = 64
+    ratio: float | None = 2.0
+    size: int | None = 0
+    write_policy: str | None = "write_through"
+    io_backend: str | None = "direct"
+    mem_layout: str | None = "page_first_direct"
+    storage_backend: str | None = None
+    storage_prefetch_policy: str | None = "timeout"
+    storage_backend_extra_config: Mapping[str, Any] | str | None = None
+    enable_metrics: bool = True
+    enable_cache_report: bool = True
+
+
+@dataclass(frozen=True)
 class RoleCommand:
     role_name: str
     host_name: str
@@ -87,6 +103,7 @@ class TopologyProfile:
     )
     disaggregation_ib_device: str | None = None
     mount_infiniband: bool = False
+    sglang_hicache: SglangHiCacheConfig | None = None
     vllm_pd: VllmPdConfig | None = None
     env: Mapping[str, str] = field(
         default_factory=lambda: types.MappingProxyType({})
@@ -145,6 +162,56 @@ class TopologyProfile:
         )
         return commands
 
+    def _sglang_hicache_args(self, role: str) -> list[str]:
+        config = self.sglang_hicache
+        if config is None:
+            return []
+
+        argv: list[str] = []
+        if config.page_size is not None:
+            argv.extend(["--page-size", str(config.page_size)])
+
+        active_hicache = role == "prefill" or config.mode == "full_async_offload"
+        if not active_hicache:
+            return argv
+
+        if role == "prefill":
+            argv.append("--enable-hierarchical-cache")
+        if config.enable_metrics:
+            argv.append("--enable-metrics")
+        if config.enable_cache_report:
+            argv.append("--enable-cache-report")
+        if config.ratio is not None:
+            argv.extend(["--hicache-ratio", _format_number(config.ratio)])
+        if config.size is not None:
+            argv.extend(["--hicache-size", str(config.size)])
+        if config.write_policy:
+            argv.extend(["--hicache-write-policy", config.write_policy])
+        if config.io_backend:
+            argv.extend(["--hicache-io-backend", config.io_backend])
+        if config.mem_layout:
+            argv.extend(["--hicache-mem-layout", config.mem_layout])
+        if config.storage_backend:
+            argv.extend(["--hicache-storage-backend", config.storage_backend])
+        if config.storage_prefetch_policy:
+            argv.extend([
+                "--hicache-storage-prefetch-policy",
+                config.storage_prefetch_policy,
+            ])
+        if config.storage_backend_extra_config is not None:
+            if isinstance(config.storage_backend_extra_config, str):
+                extra_config = config.storage_backend_extra_config
+            else:
+                extra_config = json.dumps(
+                    dict(config.storage_backend_extra_config),
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+            argv.extend(["--hicache-storage-backend-extra-config", extra_config])
+        if role == "decode" and config.mode == "full_async_offload":
+            argv.append("--disaggregation-decode-enable-offload-kvcache")
+        return argv
+
     def _build_sglang_worker_command(
         self,
         config: Any,
@@ -165,6 +232,12 @@ class TopologyProfile:
             f"{config.mounts.models}:/models:ro",
         ])
         self._append_env_and_volumes(argv, node)
+        if self.mount_infiniband:
+            argv.extend([
+                "--device", "/dev/infiniband",
+                "--cap-add", "IPC_LOCK",
+                "--ulimit", "memlock=-1:-1",
+            ])
         argv.extend([
             "--entrypoint",
             "python3",
@@ -194,6 +267,7 @@ class TopologyProfile:
                 "--disaggregation-ib-device",
                 self.disaggregation_ib_device,
             ])
+        argv.extend(self._sglang_hicache_args(role))
         argv.extend(node.args)
         return _role_command(
             role_name=node.name,
@@ -760,6 +834,22 @@ def parse_topology_profiles(
             hosts,
             error,
         )
+        transfer_backend = _optional_string(
+            profile.get("transfer_backend"),
+            f"{path}.transfer_backend",
+            error,
+        )
+        if engine == "sglang" and transfer_backend is not None:
+            if transfer_backend not in SGLANG_DISAGG_TRANSFER_BACKENDS:
+                raise error(
+                    f"{path}.transfer_backend must be one of "
+                    + ", ".join(sorted(SGLANG_DISAGG_TRANSFER_BACKENDS))
+                )
+        sglang_hicache = _parse_sglang_hicache_config(
+            profile.get("sglang_hicache"),
+            f"{path}.sglang_hicache",
+            error,
+        )
         vllm_pd = _parse_vllm_pd_config(
             profile.get("vllm_pd"),
             f"{path}.vllm_pd",
@@ -774,6 +864,7 @@ def parse_topology_profiles(
             prefill,
             decode,
             frontend,
+            sglang_hicache,
             vllm_pd,
             error,
         )
@@ -793,11 +884,7 @@ def parse_topology_profiles(
                 error,
             ),
             network=_string(profile.get("network", "host"), f"{path}.network", error),
-            transfer_backend=_optional_string(
-                profile.get("transfer_backend"),
-                f"{path}.transfer_backend",
-                error,
-            ),
+            transfer_backend=transfer_backend,
             kv_transfer_config_template=_json_template_mapping(
                 profile.get("kv_transfer_config_template"),
                 f"{path}.kv_transfer_config_template",
@@ -809,6 +896,7 @@ def parse_topology_profiles(
                 error,
             ),
             mount_infiniband=bool(profile.get("mount_infiniband", False)),
+            sglang_hicache=sglang_hicache,
             vllm_pd=vllm_pd,
             env=_string_mapping(profile.get("env"), f"{path}.env", error),
             volumes=_string_tuple(profile.get("volumes", []), f"{path}.volumes", error),
@@ -855,6 +943,49 @@ def _optional_positive_int(value: Any, path: str, error: ErrorFactory) -> int | 
     if value is None:
         return None
     return _positive_int(value, path, error)
+
+
+def _optional_positive_float(
+    value: Any,
+    path: str,
+    error: ErrorFactory,
+) -> float | None:
+    if value is None:
+        return None
+    if type(value) not in {int, float} or value <= 0:
+        raise error(f"{path} must be a positive number")
+    return float(value)
+
+
+def _optional_non_negative_int(
+    value: Any,
+    path: str,
+    error: ErrorFactory,
+) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise error(f"{path} must be a non-negative integer")
+    return value
+
+
+def _optional_bool(
+    value: Any,
+    path: str,
+    error: ErrorFactory,
+    default: bool,
+) -> bool:
+    if value is None:
+        return default
+    if type(value) is not bool:
+        raise error(f"{path} must be a boolean")
+    return value
+
+
+def _format_number(value: float) -> str:
+    if value.is_integer():
+        return str(int(value))
+    return str(value)
 
 
 def _string_tuple(value: Any, path: str, error: ErrorFactory) -> tuple[str, ...]:
@@ -907,6 +1038,172 @@ def _validate_json_template_value(
     if value is None or isinstance(value, (str, int, float, bool)):
         return
     raise error(f"{path} must contain JSON-compatible values")
+
+
+SGLANG_DISAGG_TRANSFER_BACKENDS = {
+    "mooncake",
+    "nixl",
+    "ascend",
+    "fake",
+    "mori",
+    "mooncake_tcp",
+}
+SGLANG_HICACHE_MODES = {"prefill_only", "full_async_offload"}
+SGLANG_HICACHE_WRITE_POLICIES = {
+    "write_back",
+    "write_through",
+    "write_through_selective",
+}
+SGLANG_HICACHE_IO_BACKENDS = {"direct", "kernel", "kernel_ascend"}
+SGLANG_HICACHE_MEM_LAYOUTS = {
+    "layer_first",
+    "page_first",
+    "page_first_direct",
+    "page_first_kv_split",
+    "page_head",
+}
+SGLANG_HICACHE_STORAGE_BACKENDS = {
+    "file",
+    "mooncake",
+    "hf3fs",
+    "nixl",
+    "aibrix",
+    "dynamic",
+    "eic",
+    "simm",
+}
+SGLANG_HICACHE_STORAGE_PREFETCH_POLICIES = {
+    "best_effort",
+    "wait_complete",
+    "timeout",
+}
+
+
+def _parse_sglang_hicache_config(
+    value: Any,
+    path: str,
+    error: ErrorFactory,
+) -> SglangHiCacheConfig | None:
+    if value is None:
+        return None
+
+    raw = _mapping(value, path, error)
+    allowed = {
+        "mode",
+        "page_size",
+        "ratio",
+        "size",
+        "write_policy",
+        "io_backend",
+        "mem_layout",
+        "storage_backend",
+        "storage_prefetch_policy",
+        "storage_backend_extra_config",
+        "enable_metrics",
+        "enable_cache_report",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise error(f"{path} contains unsupported keys: {', '.join(unknown)}")
+
+    mode = _string(
+        _required(raw, "mode", f"{path}.mode", error),
+        f"{path}.mode",
+        error,
+    )
+    if mode not in SGLANG_HICACHE_MODES:
+        raise error(
+            f"{path}.mode must be one of "
+            + ", ".join(sorted(SGLANG_HICACHE_MODES))
+        )
+
+    def enum_value(key: str, choices: set[str]) -> str | None:
+        parsed = _optional_string(raw.get(key), f"{path}.{key}", error)
+        if parsed is not None and parsed not in choices:
+            raise error(
+                f"{path}.{key} must be one of "
+                + ", ".join(sorted(choices))
+            )
+        return parsed
+
+    extra_config: Mapping[str, Any] | str | None
+    raw_extra_config = raw.get("storage_backend_extra_config")
+    if raw_extra_config is None:
+        extra_config = None
+    elif isinstance(raw_extra_config, dict):
+        _validate_json_template_value(
+            raw_extra_config,
+            f"{path}.storage_backend_extra_config",
+            error,
+        )
+        extra_config = types.MappingProxyType(dict(raw_extra_config))
+    elif isinstance(raw_extra_config, str):
+        extra_config = raw_extra_config
+    else:
+        raise error(
+            f"{path}.storage_backend_extra_config must be an object or string"
+        )
+
+    storage_backend = enum_value(
+        "storage_backend",
+        SGLANG_HICACHE_STORAGE_BACKENDS,
+    )
+    if mode == "full_async_offload" and storage_backend is None:
+        raise error(
+            f"{path}.storage_backend is required when mode is full_async_offload"
+        )
+
+    return SglangHiCacheConfig(
+        mode=mode,
+        page_size=_optional_positive_int(
+            raw.get("page_size", 64),
+            f"{path}.page_size",
+            error,
+        ),
+        ratio=_optional_positive_float(
+            raw.get("ratio", 2.0),
+            f"{path}.ratio",
+            error,
+        ),
+        size=_optional_non_negative_int(
+            raw.get("size", 0),
+            f"{path}.size",
+            error,
+        ),
+        write_policy=(
+            enum_value("write_policy", SGLANG_HICACHE_WRITE_POLICIES)
+            or "write_through"
+        ),
+        io_backend=(
+            enum_value("io_backend", SGLANG_HICACHE_IO_BACKENDS)
+            or "direct"
+        ),
+        mem_layout=(
+            enum_value("mem_layout", SGLANG_HICACHE_MEM_LAYOUTS)
+            or "page_first_direct"
+        ),
+        storage_backend=storage_backend,
+        storage_prefetch_policy=(
+            enum_value(
+                "storage_prefetch_policy",
+                SGLANG_HICACHE_STORAGE_PREFETCH_POLICIES,
+            )
+            or "timeout"
+        ),
+        storage_backend_extra_config=extra_config,
+        enable_metrics=_optional_bool(
+            raw.get("enable_metrics"),
+            f"{path}.enable_metrics",
+            error,
+            True,
+        ),
+        enable_cache_report=_optional_bool(
+            raw.get("enable_cache_report"),
+            f"{path}.enable_cache_report",
+            error,
+            True,
+        ),
+    )
 
 
 def _parse_vllm_pd_config(
@@ -1072,10 +1369,29 @@ def _validate_topology_profile(
     prefill: tuple[TopologyNode, ...],
     decode: tuple[TopologyNode, ...],
     frontend: TopologyFrontend,
+    sglang_hicache: SglangHiCacheConfig | None,
     vllm_pd: VllmPdConfig | None,
     error: ErrorFactory,
 ) -> None:
+    if engine != "sglang" and sglang_hicache is not None:
+        raise error(
+            f"{path} ({profile_name}) sglang_hicache is only valid for "
+            "sglang profiles"
+        )
     if engine == "sglang":
+        if vllm_pd is not None:
+            raise error(
+                f"{path} ({profile_name}) vllm_pd is only valid for vllm profiles"
+            )
+        if (
+            sglang_hicache is not None
+            and not decode
+            and sglang_hicache.mode == "full_async_offload"
+        ):
+            raise error(
+                f"{path} ({profile_name}) decode workers are required when "
+                "sglang_hicache.mode is full_async_offload"
+            )
         for node in prefill:
             if node.bootstrap_port is None:
                 raise error(
