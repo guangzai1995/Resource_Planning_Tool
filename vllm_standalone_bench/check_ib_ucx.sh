@@ -31,7 +31,7 @@ ibv_devinfo 2>/dev/null | head -30 || echo "  (ibv_devinfo / libibverbs 不可�
 
 echo
 echo "########## 2) 容器内 UCX/NIXL（PD 等同访问：--network host --gpus all）##########"
-docker run --rm --network host --gpus all --entrypoint bash "$IMAGE" -s <<'PROBE'
+docker run --rm -i --network host --gpus all --entrypoint bash "$IMAGE" -s <<'PROBE'
 echo "--- ucx 版本 ---"
 ucx_info -v 2>/dev/null | head -3 || echo "ucx_info 不在 PATH"
 echo
@@ -59,7 +59,7 @@ PROBE
 echo
 echo "########## 3) 对照：显式挂 /dev/infiniband + IPC_LOCK ##########"
 if ls /dev/infiniband/* >/dev/null 2>&1; then
-  docker run --rm --network host --gpus all \
+  docker run --rm -i --network host --gpus all \
     --device /dev/infiniband --cap-add=IPC_LOCK \
     --entrypoint bash "$IMAGE" -s <<'PROBE'
 if ucx_info -d 2>/dev/null | grep -qiE 'rc_verbs|rc_mlx5'; then
