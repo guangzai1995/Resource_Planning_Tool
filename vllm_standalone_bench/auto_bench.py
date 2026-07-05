@@ -1059,6 +1059,7 @@ def _build_sglang_run_command(config: AutoBenchConfig, case: BenchmarkCase,
         "--label", f"{CONTAINER_SERVE_PROFILE_LABEL}={serve_profile.name}",
         "--gpus", _docker_gpus(serve_profile.gpus),
         "--network", config.run.network,
+        "--ipc", "host",
         "-v", f"{config.mounts.models}:/models:ro",
         "--entrypoint", "python3",
     ]
