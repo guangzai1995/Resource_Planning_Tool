@@ -455,11 +455,18 @@ def _extract_row(
 # ─── 结果保存 ──────────────────────────────────────────────────────────────────
 
 CSV_HEADERS = [
+    # ── 基本信息 ──────────────────────────────────
     'model', 'backend', 'dataset_name', 'language',
     'input_len', 'output_len', 'total_input_len', 'prefix_ratio', 'prefix_tokens',
     'parallel_num', 'epochs', 'num_prompts', 'seed',
     'n_success', 'n_failed',
     'avg_input_tokens', 'avg_output_tokens',
+    # ── 吞吐量（前移）──────────────────────────────
+    'throughput_req_s', 'throughput_tok_s', 'input_throughput_tok_s',
+    'prefill_effective_tok_s', 'decode_effective_tok_s',
+    # ── TTFT（前移）────────────────────────────────
+    'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
+    # ── 其他 ──────────────────────────────────────
     'input_compliance', 'output_compliance',
     'finish_reason_length_pct', 'token_source',
     'avg_cached_tokens', 'cache_hit_rate',
@@ -467,9 +474,6 @@ CSV_HEADERS = [
     'spec_decode_acceptance_rate', 'spec_decode_system_efficiency',
     'spec_decode_num_drafts', 'spec_decode_num_accepted_tokens',
     'spec_decode_num_draft_tokens', 'spec_decode_per_position_acceptance_rates',
-    'throughput_req_s', 'throughput_tok_s', 'input_throughput_tok_s',
-    'prefill_effective_tok_s', 'decode_effective_tok_s',
-    'ttft_mean_ms', 'ttft_p50_ms', 'ttft_p90_ms', 'ttft_p99_ms',
     'tpot_mean_ms', 'tpot_p50_ms', 'tpot_p90_ms', 'tpot_p99_ms',
     'e2el_mean_ms', 'e2el_p50_ms', 'e2el_p90_ms', 'e2el_p99_ms',
     'audio_duration_s_total', 'audio_duration_s_avg', 'rtfx',
@@ -477,20 +481,25 @@ CSV_HEADERS = [
 ]
 
 CSV_HEADERS_ZH = [
+    # ── 基本信息 ──
     '模型', '接口类型', '数据集', '语言',
     '输入长度(token)', '输出长度(token)', '总输入长度(token)', '前缀比例', '前缀tokens数',
     '并发数', '测试轮数', '总请求数', '随机种子',
     '成功请求数', '失败请求数',
     '平均实际输入tokens', '平均实际输出tokens',
-    '输入长度合规(%)', '输出长度合规(%)', 'length停止占比(%)', 'token来源',
+    # ── 吞吐量（前移）──
+    '请求吞吐(req/s)', '输出Token系统吞吐(tok/s)', '输入Token系统吞吐(tok/s)',
+    'Prefill有效速率(tok/s)', 'Decode有效速率(tok/s)',
+    # ── TTFT（前移）──
+    'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
+    # ── 其他 ──
+    '输入长度合规(%)', '输出长度合规(%)',
+    'length停止占比(%)', 'token来源',
     '平均缓存命中tokens', '缓存命中率(%)',
     '平均GPU KV缓存占用率(%)', '峰值GPU KV缓存占用率(%)',
     'SpecDecode接受率(%)', 'SpecDecode系统效率',
     'SpecDecode草稿轮数', 'SpecDecode接受tokens数',
     'SpecDecode草稿tokens数', 'SpecDecode分位置接受率(%)',
-    '请求吞吐(req/s)', '输出Token系统吞吐(tok/s)', '输入Token系统吞吐(tok/s)',
-    'Prefill有效速率(tok/s)', 'Decode有效速率(tok/s)',
-    'TTFT均值(ms)', 'TTFT_P50(ms)', 'TTFT_P90(ms)', 'TTFT_P99(ms)',
     'TPOT均值(ms)', 'TPOT_P50(ms)', 'TPOT_P90(ms)', 'TPOT_P99(ms)',
     'E2EL均值(ms)', 'E2EL_P50(ms)', 'E2EL_P90(ms)', 'E2EL_P99(ms)',
     '音频总时长(s)', '平均音频时长(s)', 'RTFx',
