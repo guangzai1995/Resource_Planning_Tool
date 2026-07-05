@@ -10,7 +10,7 @@ import bench_compare as bc
 import run_bench_multi as m
 
 
-# 期望的新顺序（57 列）：基本信息(17) → 吞吐(5) → TTFT(4) → 其他(31)
+# 期望的新顺序（58 列）：基本信息(17) → 吞吐(5) → TTFT(4) → 其他(32)
 EXPECTED_HEADERS = [
     # 基本信息
     "model", "backend", "dataset_name", "language",
@@ -31,7 +31,8 @@ EXPECTED_HEADERS = [
     "cache_hit_tokens_device", "cache_hit_tokens_host",
     "cache_hit_tokens_storage", "cache_hit_tokens_storage_mooncake",
     "avg_gpu_kv_cache_usage", "peak_gpu_kv_cache_usage",
-    "spec_decode_acceptance_rate", "spec_decode_system_efficiency",
+    "spec_decode_acceptance_rate", "spec_decode_acceptance_length",
+    "spec_decode_system_efficiency",
     "spec_decode_num_drafts", "spec_decode_num_accepted_tokens",
     "spec_decode_num_draft_tokens", "spec_decode_per_position_acceptance_rates",
     "tpot_mean_ms", "tpot_p50_ms", "tpot_p90_ms", "tpot_p99_ms",
@@ -60,7 +61,7 @@ EXPECTED_HEADERS_ZH = [
     "Device缓存命中tokens", "Host缓存命中tokens",
     "Storage缓存命中tokens", "Mooncake缓存命中tokens",
     "平均GPU KV缓存占用率(%)", "峰值GPU KV缓存占用率(%)",
-    "SpecDecode接受率(%)", "SpecDecode系统效率",
+    "SpecDecode接受率(%)", "SpecDecode接受长度", "SpecDecode系统效率",
     "SpecDecode草稿轮数", "SpecDecode接受tokens数",
     "SpecDecode草稿tokens数", "SpecDecode分位置接受率(%)",
     "TPOT均值(ms)", "TPOT_P50(ms)", "TPOT_P90(ms)", "TPOT_P99(ms)",
@@ -84,9 +85,9 @@ def test_csv_headers_zh_exact_order():
     assert m.CSV_HEADERS_ZH == EXPECTED_HEADERS_ZH
 
 
-def test_csv_headers_count_is_57():
-    assert len(m.CSV_HEADERS) == 57
-    assert len(m.CSV_HEADERS_ZH) == 57
+def test_csv_headers_count_is_58():
+    assert len(m.CSV_HEADERS) == 58
+    assert len(m.CSV_HEADERS_ZH) == 58
 
 
 def test_zh_pairs_one_to_one():
@@ -109,7 +110,8 @@ def test_throughput_and_ttft_block_after_basic_info():
     # 所有'其他'列都在 TTFT 块之后
     other_cols = [
         "input_compliance", "avg_cached_tokens", "cache_hit_rate",
-        "spec_decode_acceptance_rate", "tpot_mean_ms", "e2el_mean_ms",
+        "spec_decode_acceptance_rate", "spec_decode_acceptance_length",
+        "tpot_mean_ms", "e2el_mean_ms",
         "audio_duration_s_total", "duration_s",
     ]
     for c in other_cols:

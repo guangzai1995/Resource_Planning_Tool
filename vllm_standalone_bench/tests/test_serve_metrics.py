@@ -232,6 +232,19 @@ def test_parse_runtime_metrics_normalizes_fraction_gpu_kv_cache_usage():
     assert metrics.gpu_kv_cache_usage == 9.8
 
 
+def test_parse_runtime_metrics_reads_sglang_token_usage_as_gpu_kv_usage():
+    metrics = serve.parse_runtime_metrics_text(
+        "\n".join(
+            [
+                'sglang:token_usage{model_name="m"} 0.42',
+                'sglang:full_token_usage{model_name="m"} 0.37',
+            ]
+        )
+    )
+
+    assert metrics.gpu_kv_cache_usage == 42.0
+
+
 def test_parse_runtime_metrics_keeps_spec_decode_metrics():
     metrics = serve.parse_runtime_metrics_text(
         "\n".join(
@@ -249,6 +262,50 @@ def test_parse_runtime_metrics_keeps_spec_decode_metrics():
     assert metrics.spec_decode.num_accepted_tokens == 3
     assert metrics.spec_decode.num_draft_tokens == 8
     assert metrics.spec_decode.accepted_per_pos == {0: 3}
+
+
+def test_parse_runtime_metrics_reads_sglang_spec_decode_gauges():
+    metrics = serve.parse_runtime_metrics_text(
+        "\n".join(
+            [
+                'sglang:spec_accept_rate{model_name="m"} 0.625',
+                'sglang:spec_accept_length{model_name="m"} 1.75',
+                'sglang:spec_num_draft_tokens{model_name="m"} 4',
+                'sglang:spec_verify_calls_total{model_name="m"} 115',
+            ]
+        )
+    )
+
+    assert metrics.sglang_spec_decode is not None
+    assert metrics.sglang_spec_decode.acceptance_rate == 62.5
+    assert metrics.sglang_spec_decode.acceptance_length == 1.75
+    assert metrics.sglang_spec_decode.num_draft_tokens == 4
+    assert metrics.sglang_spec_decode.verify_calls == 115
+
+
+def test_sglang_spec_decode_stats_uses_counter_delta_and_after_gauges():
+    before = serve.SGLangSpecDecodeMetrics(
+        acceptance_rate=50.0,
+        acceptance_length=1.5,
+        num_draft_tokens=4,
+        verify_calls=100,
+    )
+    after = serve.SGLangSpecDecodeMetrics(
+        acceptance_rate=62.5,
+        acceptance_length=1.75,
+        num_draft_tokens=4,
+        verify_calls=115,
+    )
+
+    stats = serve.calculate_sglang_spec_decode_stats(before, after)
+
+    assert stats == {
+        "spec_decode_acceptance_rate": 62.5,
+        "spec_decode_acceptance_length": 1.75,
+        "spec_decode_num_drafts": 15,
+        "spec_decode_num_accepted_tokens": 38,
+        "spec_decode_num_draft_tokens": 60,
+    }
 
 
 def test_parse_runtime_metrics_reads_sglang_cache_source_counters():
