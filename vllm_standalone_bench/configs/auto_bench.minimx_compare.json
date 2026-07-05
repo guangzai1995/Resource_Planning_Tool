@@ -25,16 +25,16 @@
   },
   "models": [
     {
-      "name": "minimax_m27_nvfp4",
-      "model_path": "/models/MiniMax-M2.7-NVFP4",
-      "tokenizer_path": "/models/MiniMax-M2.7-NVFP4",
-      "served_model_name": "minimax-m2.7-nvfp4"
-    },
-    {
       "name": "minimax_m27",
       "model_path": "/models/MiniMax-M2.7",
       "tokenizer_path": "/models/MiniMax-M2.7",
       "served_model_name": "minimax-m2.7"
+    },
+    {
+      "name": "minimax_m27_nvfp4",
+      "model_path": "/models/MiniMax-M2.7-NVFP4",
+      "tokenizer_path": "/models/MiniMax-M2.7-NVFP4",
+      "served_model_name": "minimax-m2.7-nvfp4"
     }
   ],
   "serve_profiles": [
@@ -141,7 +141,7 @@
       "output_lens": [1024],
       "parallel_nums": [1, 4, 8, 16, 24, 32, 48, 64, 96, 128],
       "epochs": 3,
-      "prefix_ratio": 0.6,
+      "prefix_ratio": 0.5,
       "warmup_requests": 4,
       "warmup_concurrency": 8,
       "cross_product": true,
@@ -156,7 +156,7 @@
       "output_lens": [1024],
       "parallel_nums": [1, 4, 8, 16, 24, 32, 48, 64, 96, 128],
       "epochs": 3,
-      "prefix_ratio": 0.8,
+      "prefix_ratio": 0.75,
       "warmup_requests": 4,
       "warmup_concurrency": 8,
       "cross_product": true,
