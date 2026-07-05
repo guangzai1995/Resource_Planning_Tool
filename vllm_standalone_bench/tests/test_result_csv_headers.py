@@ -4,6 +4,9 @@ Part 1：CSV_HEADERS / CSV_HEADERS_ZH 的顺序——基本信息在前，吞吐
 其余在后；列集合与中英表头一一对应。
 Part 2：bench_compare 的 CJK 字体 fallback 配置（见文件末尾，任务 2 追加）。
 """
+import pytest
+
+import bench_compare as bc
 import run_bench_multi as m
 
 
@@ -110,3 +113,19 @@ def test_throughput_and_ttft_block_after_basic_info():
 def test_column_set_unchanged():
     """重排不增不减列：集合与期望完全相同。"""
     assert set(m.CSV_HEADERS) == set(EXPECTED_HEADERS)
+
+
+# ── Part 2：绘图中文（CJK 字体配置）──────────────────────────────
+
+def test_cjk_font_first_choice_is_wqy_microhei():
+    """bench-runner 镜像装的是 fonts-wqy-microhei，应作为首选字体。"""
+    assert bc._CJK_FONT_SANS_SERIF[0] == "WenQuanYi Micro Hei"
+    assert "DejaVu Sans" in bc._CJK_FONT_SANS_SERIF  # 兜底，保证不崩
+
+
+def test_apply_cjk_font_sets_rcparams():
+    """_apply_cjk_font 应把首选 CJK 字体写进 matplotlib rcParams。"""
+    matplotlib = pytest.importorskip("matplotlib")  # 无 matplotlib 的环境跳过
+    bc._apply_cjk_font()
+    assert matplotlib.rcParams["font.sans-serif"][0] == "WenQuanYi Micro Hei"
+    assert not matplotlib.rcParams["axes.unicode_minus"]

@@ -23,6 +23,29 @@ _PLOT_YLABEL = {
     "ttft_p50_ms": "TTFT p50 (ms)",
 }
 
+# CJK 字体 fallback：bench-runner 镜像装 fonts-wqy-microhei 命中首个；
+# 兼容装了 Noto Sans CJK 的环境；都没有则退回 DejaVu Sans（不崩，但中文仍为方框）
+_CJK_FONT_SANS_SERIF = ['WenQuanYi Micro Hei', 'Noto Sans CJK SC', 'DejaVu Sans']
+
+
+def _apply_cjk_font():
+    """配置 matplotlib 中文字体，避免中文标签（如"并发数""输出吞吐"）渲染成方框。
+
+    bench-runner 镜像装了 fonts-wqy-microhei，命中 fallback 首项，正常渲染且无告警。
+    若运行环境没有任何 CJK 字体（如未装该包的开发机），会退回 DejaVu Sans，
+    中文为方框——此时静默已知 Glyph missing 告警，避免刷屏；装了字体的环境不触发。
+    """
+    import matplotlib
+    from matplotlib import font_manager
+    matplotlib.rcParams['font.sans-serif'] = _CJK_FONT_SANS_SERIF
+    matplotlib.rcParams['axes.unicode_minus'] = False
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    if not any(name in available for name in _CJK_FONT_SANS_SERIF[:-1]):
+        import warnings
+        warnings.filterwarnings(
+            "ignore", message="Glyph .* missing from font", category=UserWarning
+        )
+
 
 class ServingDimension(NamedTuple):
     name: str
@@ -191,11 +214,9 @@ def _plot(
     except ImportError:
         logger.warning("matplotlib 不可用，跳过绘图")
         return
-    # 默认 DejaVu Sans 缺中文字形会刷屏 UserWarning，静默该已知告警
-    import warnings
-    warnings.filterwarnings(
-        "ignore", message="Glyph .* missing from font", category=UserWarning
-    )
+    # 设中文字体（镜像内 fonts-wqy-microhei 命中），不再压制缺字告警——
+    # 设了真字体后 Glyph missing 本就不会触发；保留压制反而掩盖真实缺字问题
+    _apply_cjk_font()
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     include_model = len({key[0] for key in aligned}) > 1
