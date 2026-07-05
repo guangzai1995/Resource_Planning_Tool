@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -1747,11 +1748,58 @@ def make_ready_probe_container_name(case: BenchmarkCase) -> str:
     return f"bench-ready-{case.model.name}-{serve_profile.name}-{case.run_id}"
 
 
+def _get_container_ip(runner: Runner, container_name: str, network: str) -> str | None:
+    """Return the container IP on the given docker network, or None."""
+    result = runner.run(
+        [
+            "docker",
+            "inspect",
+            "--format",
+            f'{{(index .NetworkSettings.Networks "{network}").IPAddress}}',
+            container_name,
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    ip = result.stdout.strip()
+    if not ip:
+        return None
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    return ip
+
+
+def _build_ready_probe_url(config: AutoBenchConfig, case: BenchmarkCase,
+                           runner: Runner) -> str:
+    """Build the ready probe URL, preferring the container IP to avoid IDNA limits.
+
+    Long container names exceed urllib's IDNA label length limit (63 bytes) when
+    used as a hostname. Use the container's docker-network IP when available.
+    """
+    serve_container = case.container_name
+    ip = _get_container_ip(runner, serve_container, config.run.network)
+    if ip:
+        return f"http://{ip}:{config.run.container_port}/v1/models"
+    logger.warning(
+        "failed to get IP for container %s on network %s; "
+        "falling back to container name as ready-probe hostname",
+        serve_container,
+        config.run.network,
+    )
+    return f"http://{case.container_name}:{config.run.container_port}/v1/models"
+
+
 def build_ready_probe_run_command(config: AutoBenchConfig, case: BenchmarkCase,
-                                  run_dir: Path) -> list[str]:
+                                  run_dir: Path,
+                                  ready_url: str | None = None) -> list[str]:
     require_legacy_case(case)
     resolved_run_dir = Path(run_dir).resolve()
-    url = f"http://{case.container_name}:{config.run.container_port}/v1/models"
+    url = ready_url or (
+        f"http://{case.container_name}:{config.run.container_port}/v1/models"
+    )
     return [
         "docker", "run", "--rm",
         "--name", make_ready_probe_container_name(case),
@@ -1797,8 +1845,10 @@ def wait_for_container_ready(config: AutoBenchConfig, case: BenchmarkCase,
     try:
         if not remove_existing_ready_probe_container_if_owned(runner, case, run_dir):
             return False
+        # Use container IP to avoid IDNA label length limits with long container names.
+        probe_url = _build_ready_probe_url(config, case, runner)
         result = runner.run(
-            build_ready_probe_run_command(config, case, run_dir),
+            build_ready_probe_run_command(config, case, run_dir, ready_url=probe_url),
             check=False,
         )
         return result.returncode == 0
