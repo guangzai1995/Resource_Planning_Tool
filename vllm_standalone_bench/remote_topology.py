@@ -228,6 +228,8 @@ class TopologyProfile:
             _docker_gpus(node.gpus),
             "--network",
             self.network,
+            "--ipc",
+            "host",
             "-v",
             f"{config.mounts.models}:/models:ro",
         ])
