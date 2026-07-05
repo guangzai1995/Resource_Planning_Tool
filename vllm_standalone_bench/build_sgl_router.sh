@@ -61,6 +61,15 @@ PULL_BASE="${PULL_BASE:-false}"
 # 可选：构建完成后导出离线 tar 包；为空则不导出
 SAVE_TAR="${SAVE_TAR:-}"
 
+# sgl-router 基础镜像版本（对应 Dockerfile 的 ARG RUST_VERSION / DEBIAN_VERSION）
+RUST_VERSION="${RUST_VERSION:-1.90}"
+DEBIAN_VERSION="${DEBIAN_VERSION:-bookworm}"
+
+# 可选：内网镜像前缀。设了之后 build 前会用该前缀拉取基础镜像并 retag 成原名，
+# 这样 docker build 不直连 Docker Hub / gcr.io。例如:
+#   MIRROR_PREFIX=xemegpzeib7tis.xuanyuan.run ./build_sgl_router.sh
+MIRROR_PREFIX="${MIRROR_PREFIX:-}"
+
 # =============================================================================
 # ▌ 二、前置检查
 # =============================================================================
@@ -105,12 +114,33 @@ if [[ "${PULL_BASE}" == "true" ]]; then
     CMD+=(--pull)
 fi
 
-# 额外参数原样透传给 docker build，例如 --build-arg RUST_VERSION=... / --network / --progress
+# 固定基础镜像版本（与 MIRROR_PREFIX 预拉的版本一致）
+CMD+=(--build-arg "RUST_VERSION=${RUST_VERSION}" --build-arg "DEBIAN_VERSION=${DEBIAN_VERSION}")
+
+# 额外参数原样透传给 docker build，例如 --network / --progress
 if [[ "$#" -gt 0 ]]; then
     CMD+=("$@")
 fi
 
 CMD+=("${CONTEXT_DIR}")
+
+# =============================================================================
+# ▌ 三点五、(可选) 通过内网镜像前缀预拉基础镜像并 retag 成原名
+# =============================================================================
+if [[ -n "${MIRROR_PREFIX}" ]]; then
+    echo "通过镜像前缀预拉基础镜像并 retag 成原名: ${MIRROR_PREFIX}/"
+    for img in "rust:${RUST_VERSION}-${DEBIAN_VERSION}" "gcr.io/distroless/cc-debian12:nonroot"; do
+        if docker pull "${MIRROR_PREFIX}/${img}"; then
+            docker tag "${MIRROR_PREFIX}/${img}" "${img}"
+            echo "  ✓ ${img}"
+        else
+            echo "  [WARN] 拉取 ${MIRROR_PREFIX}/${img} 失败" >&2
+            echo "         - 若该镜像本地已有，docker build 会直接复用，无碍；" >&2
+            echo "         - 若前缀不支持 gcr.io，需手动: docker pull <别的方式> gcr.io/distroless/cc-debian12:nonroot" >&2
+        fi
+    done
+    echo ""
+fi
 
 # =============================================================================
 # ▌ 四、打印摘要并执行
@@ -122,9 +152,13 @@ echo "╠═══════════════════════�
 printf "║  镜像名称  : %-48s║\n" "${IMAGE_NAME}"
 printf "║  Dockerfile: %-48s║\n" "${DOCKERFILE}"
 printf "║  上下文    : %-48s║\n" "${CONTEXT_DIR}"
+printf "║  Rust 版本 : %-48s║\n" "${RUST_VERSION}-${DEBIAN_VERSION}"
 printf "║  平台      : %-48s║\n" "${PLATFORM:-默认}"
 printf "║  禁用缓存  : %-48s║\n" "${NO_CACHE}"
 printf "║  拉取基镜像: %-48s║\n" "${PULL_BASE}"
+if [[ -n "${MIRROR_PREFIX}" ]]; then
+    printf "║  镜像前缀  : %-48s║\n" "${MIRROR_PREFIX}"
+fi
 if [[ -n "${SAVE_TAR}" ]]; then
     printf "║  导出文件  : %-48s║\n" "${SAVE_TAR}"
 fi
