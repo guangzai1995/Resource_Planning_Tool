@@ -4,7 +4,7 @@
     "results_dir": "vllm_standalone_bench/results",
     "bench_image": "vllm-bench-runner:offline",
     "images": {
-      "sglang": "lmsysorg/sglang:latest"
+      "sglang": "lmsysorg/sglang:latest-0705"
     },
     "api_key": "local-bench-key",
     "ready_timeout_sec": 3600,
@@ -56,7 +56,7 @@
       "transfer_backend": "mooncake",
       "disaggregation_ib_device": "mlx5_0",
       "mount_infiniband": true,
-      "image": "lmsysorg/sglang:latest",
+      "image": "lmsysorg/sglang:latest-0705",
       "router_image": "sglang-router:offline",
       "sglang_hicache": {
         "mode": "full_async_offload",
@@ -69,8 +69,8 @@
         }
       },
       "env": {
-        "MOONCAKE_MASTER": "10.200.1.10:50051",
-        "MOONCAKE_TE_META_DATA_SERVER": "http://10.200.1.10:8080/metadata",
+        "MOONCAKE_MASTER": "10.200.1.14:50051",
+        "MOONCAKE_TE_META_DATA_SERVER": "http://10.200.1.14:8080/metadata",
         "MOONCAKE_PROTOCOL": "rdma",
         "MOONCAKE_DEVICE": "mlx5_0",
         "MOONCAKE_GLOBAL_SEGMENT_SIZE": "64gb"
@@ -195,7 +195,7 @@
       "transfer_backend": "mooncake",
       "disaggregation_ib_device": "mlx5_0",
       "mount_infiniband": true,
-      "image": "lmsysorg/sglang:latest",
+      "image": "lmsysorg/sglang:latest-0705",
       "router_image": "sglang-router:offline",
       "sglang_hicache": {
         "mode": "prefill_only",
@@ -208,8 +208,8 @@
         }
       },
       "env": {
-        "MOONCAKE_MASTER": "10.200.1.10:50051",
-        "MOONCAKE_TE_META_DATA_SERVER": "http://10.200.1.10:8080/metadata",
+        "MOONCAKE_MASTER": "10.200.1.14:50051",
+        "MOONCAKE_TE_META_DATA_SERVER": "http://10.200.1.14:8080/metadata",
         "MOONCAKE_PROTOCOL": "rdma",
         "MOONCAKE_DEVICE": "mlx5_0",
         "MOONCAKE_GLOBAL_SEGMENT_SIZE": "64gb"
