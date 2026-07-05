@@ -109,3 +109,9 @@ sglang-main/
 # ── SQLite WAL files ──────────────────────────────────────
 *.db-shm
 *.db-wal
+
+# ── Benchmark 运行产物（auto_bench run 目录 / 归档 / pid）──不入库 ─
+# 已跟踪的结果文件（顶层 CSV/XLSX 等）不受影响；仅拦新增的 run 目录与归档。
+vllm_standalone_bench/results/*/
+*.tar
+*.pid
