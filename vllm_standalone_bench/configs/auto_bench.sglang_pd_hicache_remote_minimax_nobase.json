@@ -48,7 +48,8 @@
         "MOONCAKE_TE_META_DATA_SERVER": "http://10.200.1.14:8080/metadata",
         "MOONCAKE_PROTOCOL": "rdma",
         "MOONCAKE_DEVICE": "mlx5_0",
-        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4gb"
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4gb",
+        "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false"
       },
       "hosts": {
         "p1": {
@@ -233,7 +234,8 @@
           "--prefill-policy",
           "cache_aware",
           "--decode-policy",
-          "power_of_two"
+          "power_of_two",
+          "--disable-health-check"
         ]
       }
     },
@@ -263,7 +265,8 @@
         "MOONCAKE_TE_META_DATA_SERVER": "http://10.200.1.14:8080/metadata",
         "MOONCAKE_PROTOCOL": "rdma",
         "MOONCAKE_DEVICE": "mlx5_0",
-        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4gb"
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4gb",
+        "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false"
       },
       "hosts": {
         "p1": {
@@ -449,7 +452,8 @@
           "--prefill-policy",
           "cache_aware",
           "--decode-policy",
-          "power_of_two"
+          "power_of_two",
+          "--disable-health-check"
         ]
       }
     },
@@ -479,7 +483,8 @@
         "MOONCAKE_TE_META_DATA_SERVER": "http://10.200.1.14:8080/metadata",
         "MOONCAKE_PROTOCOL": "rdma",
         "MOONCAKE_DEVICE": "mlx5_0",
-        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4gb"
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4gb",
+        "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false"
       },
       "hosts": {
         "p1": {
@@ -663,7 +668,8 @@
           "--prefill-policy",
           "cache_aware",
           "--decode-policy",
-          "power_of_two"
+          "power_of_two",
+          "--disable-health-check"
         ]
       }
     }
