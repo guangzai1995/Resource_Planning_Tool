@@ -1621,6 +1621,34 @@ def cleanup_bench_container_if_owned(runner: Runner, case: BenchmarkCase,
     stop_and_remove_container(runner, container_name, dry_run=False)
 
 
+def cleanup_local_sidecar_containers() -> list[str]:
+    """Remove local sidecar containers (e.g. mooncake-master) listed in the
+    AUTO_BENCH_FINAL_LOCAL_CLEANUP env var (comma-separated names).
+
+    run_auto_bench.sh 在起 mooncake-master 时导出该 env，controller 跑完
+    (成功/中断/失败都走 finally) 时顺带清掉这些本机 sidecar，避免遗留。
+    Best-effort: 失败只 warning，不影响 run 收尾。
+    """
+    names_env = os.environ.get("AUTO_BENCH_FINAL_LOCAL_CLEANUP", "").strip()
+    if not names_env:
+        return []
+    removed: list[str] = []
+    for name in [n.strip() for n in names_env.split(",") if n.strip()]:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", name],
+                check=False,
+                capture_output=True,
+                timeout=60,
+            )
+            removed.append(name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("remove local sidecar container %s failed: %s", name, exc)
+    if removed:
+        logger.info("removed local sidecar container(s): %s", ", ".join(removed))
+    return removed
+
+
 def cleanup_network(config: AutoBenchConfig, runner: Runner,
                     owned: bool, dry_run: bool,
                     run_id: str | None = None) -> bool:
@@ -3854,6 +3882,7 @@ def run_controller(config: AutoBenchConfig, run_id: str,
                 )
                 exit_code = 130
         finally:
+            cleanup_local_sidecar_containers()
             if run_lock is not None:
                 release_run_lock(run_lock)
     logger.info(

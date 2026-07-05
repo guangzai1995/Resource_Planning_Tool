@@ -236,6 +236,8 @@ case "${COMMAND}" in
         # sglang PD + mooncake 配置：按需自动起本地 mooncake_master（幂等；dry-run 跳过）
         if [[ "${DRY_RUN}" != "true" ]] && _config_needs_mooncake; then
             _mooncake_start || echo "[mooncake] [WARN] master 未就绪，sglang worker 可能起不来" >&2
+            # controller 跑完(成功/中断/失败都走 finally)时自动清掉 mooncake_master，避免遗留
+            export AUTO_BENCH_FINAL_LOCAL_CLEANUP="${MOONCAKE_MASTER_NAME}"
         fi
 
         CMD=("${PYTHON_BIN}" "${AUTO_BENCH}" run --config "${CONFIG}")
@@ -310,4 +312,10 @@ echo "  ${CMD[*]}"
 echo ""
 
 cd "${PROJECT_ROOT}"
-exec "${CMD[@]}"
+# stop/cleanup: 跑完顺带停 mooncake_master；其余子命令照常 exec
+if [[ "${COMMAND}" == "stop" || "${COMMAND}" == "cleanup" ]]; then
+    "${CMD[@]}" || true
+    _mooncake_stop || true
+else
+    exec "${CMD[@]}"
+fi
