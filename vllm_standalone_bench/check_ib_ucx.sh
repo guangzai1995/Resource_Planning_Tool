@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# check_ib_ucx.sh — 在测试机上用 vllm 镜像拉起临时容器，确认 PD 容器能否走 IB/RDMA。
-#
-# 三路判定（不依赖 ucx_info，它常不在镜像里）：
-#   A) /dev/infiniband/uverbs* 在容器内是否可见（RDMA 设备有没有挂进来）
-#   B) UCX 是否带 IB/rc 插件 (libuct_ib.so / libuct_rc_verbs.so / libuct_rc_mlx5.so)
-#   C) UCX_LOG_LEVEL=info 下用正确 API(nixl._api) 建 nixl agent，看 UCX 实际加载的传输
-#
-# 用法:
-#   bash check_ib_ucx.sh                          # 默认镜像
-#   bash check_ib_ucx.sh vllm/vllm-openai:0.23.0  # 指定镜像
+# check_ib_ucx.sh — 用 vllm 镜像拉临时容器，确认 PD 容器能否走 IB/RDMA。
+#   A) /dev/infiniband/uverbs* 容器内可见？
+#   B) UCX IB/rc 插件 (libuct_ib.so / rc_verbs / rc_mlx5)
+#   C) UCX_LOG_LEVEL=info 用 nixl._api 建 agent，打印原始+过滤输出，看 UCX 加载的传输
+# 用法: bash check_ib_ucx.sh [image]
 # =============================================================================
 set -euo pipefail
 
@@ -32,9 +27,9 @@ echo; echo "--- B) UCX IB/rc 插件（接受新版合并的 libuct_ib.so）---"
 ibplug=$(find / \( -name 'libuct_ib.so*' -o -name 'libuct_rc_verbs.so*' -o -name 'libuct_rc_mlx5.so*' -o -name 'libuct_rc.so*' \) 2>/dev/null)
 if [ -n "$ibplug" ]; then echo "$ibplug" | sed 's/^/  /'; else echo "  X 没找到任何 IB/rc 插件"; fi
 
-echo; echo "--- C) UCX_LOG_LEVEL=info 建 nixl agent，看实际加载的传输 ---"
+echo; echo "--- C) UCX_LOG_LEVEL=info 建 nixl agent（python3，30s 超时，先打印原始输出）---"
 export UCX_LOG_LEVEL=info
-ucx_log=$(python - <<'PY' 2>&1
+cat > /tmp/nixl_probe.py <<'PY'
 import os
 os.environ.setdefault("UCX_LOG_LEVEL", "info")
 try:
@@ -45,22 +40,31 @@ try:
 except Exception:
     import traceback; traceback.print_exc()
 PY
-)
-echo "$ucx_log" | grep -iE 'mlx5|rc_verbs|rc_mlx5|rdma|verbs|infiniband|transport|\btcp\b|cuda_copy|cuda_ipc|NIXL_AGENT_OK|error|exception|traceback' | head -50
+PYBIN=$(command -v python3 || command -v python || true)
+if [ -z "$PYBIN" ]; then echo "  X 容器内没有 python/python3"; ucx_log=""; else
+  echo "  python: $PYBIN"
+  echo "  --- 原始输出 (head 60) ---"
+  ucx_log=$(timeout 30 "$PYBIN" /tmp/nixl_probe.py 2>&1) || ucx_log="${ucx_log}
+=== TIMEOUT_OR_NONZERO (exit $?) ==="
+  echo "$ucx_log" | head -60 | sed 's/^/    /'
+  echo "  --- 传输相关行 ---"
+  echo "$ucx_log" | grep -iE 'mlx5|rc_verbs|rc_mlx5|rdma|verbs|infiniband|transport|\btcp\b|cuda_copy|cuda_ipc|NIXL_AGENT_OK|error|exception|traceback|module|not found|timeout' | head -30 | sed 's/^/    /'
+fi
 
 echo; echo "=== 判定 ==="
-has_ib_kw=$(echo "$ucx_log" | grep -ciE 'mlx5|rc_verbs|rc_mlx5|\brdma\b|infiniband.*device|verbs.*port')
-has_tcp=$(echo "$ucx_log" | grep -ciE 'transport.*tcp|\btcp\b')
+has_ib_kw=$(echo "$ucx_log" | grep -ciE 'mlx5|rc_verbs|rc_mlx5|\brdma\b|verbs.*port|infiniband.*device')
 if echo "$ucx_log" | grep -qi 'NIXL_AGENT_OK' && [ "$has_ib_kw" -gt 0 ]; then
-  echo "RESULT: PASS — UCX 识别并加载了 IB/rc(RDMA) 传输"
+  echo "RESULT: PASS — UCX 加载了 IB/rc(RDMA) 传输"
 elif echo "$ucx_log" | grep -qi 'NIXL_AGENT_OK' && [ "$has_ib_kw" -eq 0 ]; then
-  echo "RESULT: TCP-ONLY — agent 建好但 UCX 只用 tcp/cuda，没启用 IB（镜像 UCX 没编/没识别 RDMA）"
-elif echo "$ucx_log" | grep -qiE 'error|exception|traceback'; then
-  echo "RESULT: ERROR — nixl agent 创建失败，看 C 段 traceback"
+  echo "RESULT: NO-RDMA-LOG — agent 建好但日志没出现 IB 传输（把 UCX_LOG_LEVEL 改 debug 重跑确认）"
+elif echo "$ucx_log" | grep -qiE 'TIMEOUT_OR_NONZERO'; then
+  echo "RESULT: TIMEOUT/HANG — nixl agent 创建超时或异常退出"
+elif echo "$ucx_log" | grep -qiE 'error|exception|traceback|No module|not found'; then
+  echo "RESULT: ERROR — 看 C 段原始输出"
 elif ! ls /dev/infiniband/uverbs* >/dev/null 2>&1; then
   echo "RESULT: FAIL-DEVICE — 容器内无 /dev/infiniband（UCX 走不了 RDMA）"
 else
-  echo "RESULT: UNCERTAIN — 看 C 段输出人工判断（可把 UCX_LOG_LEVEL 改 debug 重跑）"
+  echo "RESULT: UNCERTAIN — 看 C 段原始输出人工判断"
 fi
 PROBE_EOF
 
@@ -73,7 +77,7 @@ ls /dev/infiniband/uverbs* 2>/dev/null | wc -l | xargs echo "  uverbs:"
 echo "--- ibstat 摘要 ---"
 ibstat 2>/dev/null | grep -iE '^CA |Rate:|State:|Link layer:' || echo "  (ibstat 不可用)"
 
-run_probe() {  # $1 = 段落标题, 其余 = docker run 额外参数
+run_probe() {  # $1 = 段标题, 其余 = docker 额外参数
   local label="$1"; shift
   echo
   echo "########## $label ##########"
@@ -91,6 +95,5 @@ else
 fi
 
 echo
-echo "完成。看每段最后的 RESULT 行。"
-echo "关键：第 2 段 FAIL-DEVICE = 现状(PD 没挂 IB，走 tcp)；"
-echo "      第 3 段 PASS = 挂上 /dev/infiniband 后 UCX 能走 RDMA → 可改 harness 让 PD 走 IB。"
+echo "完成。看每段 RESULT。第 3 段 PASS = 挂 IB 后能走 RDMA → 改 harness；"
+echo "NO-RDMA-LOG/UNCERTAIN = 把 UCX_LOG_LEVEL 改 debug 重跑；ERROR/TIMEOUT = 看原始输出。"
