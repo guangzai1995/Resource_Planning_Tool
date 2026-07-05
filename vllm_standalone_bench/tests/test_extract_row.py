@@ -228,6 +228,40 @@ def test_extract_row_gpu_kv_cache_usage_defaults_when_missing():
     assert row["peak_gpu_kv_cache_usage"] == 0.0
 
 
+def test_extract_row_includes_sglang_cache_source_metrics():
+    result = _result(
+        total_in=1000,
+        total_out=100,
+        total_cached=200,
+        completed=2,
+    )
+    result.update({
+        "cache_hit_rate_metrics": 25.0,
+        "cache_hit_tokens_device": 60,
+        "cache_hit_tokens_host": 45,
+        "cache_hit_tokens_storage": 45,
+        "cache_hit_tokens_storage_mooncake": 45,
+    })
+
+    row = m._extract_row(result, 500, 50, 2, 1, "m", "sglang", has_tokenizer=True)
+
+    assert row["cache_hit_rate_metrics"] == 25.0
+    assert row["cache_hit_tokens_device"] == 60
+    assert row["cache_hit_tokens_host"] == 45
+    assert row["cache_hit_tokens_storage"] == 45
+    assert row["cache_hit_tokens_storage_mooncake"] == 45
+
+
+def test_extract_row_sglang_cache_source_metrics_default_zero():
+    row = m._extract_row(_result(), 100, 10, 1, 1, "m", "sglang")
+
+    assert row["cache_hit_rate_metrics"] == 0.0
+    assert row["cache_hit_tokens_device"] == 0
+    assert row["cache_hit_tokens_host"] == 0
+    assert row["cache_hit_tokens_storage"] == 0
+    assert row["cache_hit_tokens_storage_mooncake"] == 0
+
+
 def test_extract_row_spec_decode_token_aliases_from_serve_result():
     result = {
         **_result(),
@@ -309,6 +343,9 @@ def test_csv_headers_match_row_keys():
                      "input_throughput_tok_s", "prefill_effective_tok_s",
                      "decode_effective_tok_s",
                      "avg_cached_tokens", "cache_hit_rate",
+                     "cache_hit_rate_metrics", "cache_hit_tokens_device",
+                     "cache_hit_tokens_host", "cache_hit_tokens_storage",
+                     "cache_hit_tokens_storage_mooncake",
                      "avg_gpu_kv_cache_usage", "peak_gpu_kv_cache_usage",
                      "spec_decode_acceptance_rate",
                      "spec_decode_system_efficiency",
