@@ -3097,6 +3097,35 @@ def test_controller_default_ready_probe_runs_inside_docker_network(tmp_path, mon
     assert "http://bench-vllm-qwen2_5_1_5b-bf16_default-run123:8000/v1/models" in probes[0]
 
 
+def test_ready_probe_uses_container_ip_when_available(tmp_path):
+    """Long container names exceed urllib's IDNA label length limit; use IP instead."""
+    config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
+    case = ab.expand_cases(config, run_id="run123")[0]
+
+    class IPInspectRunner(FakeRunner):
+        def run(self, args, *, check=False, capture=True, text=True,
+                stdout=None, stderr=None):
+            if (
+                args[:3] == ["docker", "inspect", "--format"]
+                and "NetworkSettings.Networks" in args[3]
+            ):
+                return ab.Completed(list(args), 0, "172.18.0.5\n", "")
+            return super().run(
+                args,
+                check=check,
+                capture=capture,
+                text=text,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+    runner = IPInspectRunner()
+    assert ab.wait_for_container_ready(config, case, runner) is True
+    probes = ready_probe_commands(runner.commands)
+    assert len(probes) == 1
+    assert "http://172.18.0.5:8000/v1/models" in probes[0]
+
+
 @pytest.mark.parametrize("exception_type", [ab.StopRequested, KeyboardInterrupt])
 def test_ready_probe_interruption_removes_owned_probe_container(tmp_path, exception_type):
     config = ab.load_config(write_config(tmp_path, minimal_config(tmp_path)))
