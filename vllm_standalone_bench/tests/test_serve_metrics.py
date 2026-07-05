@@ -251,6 +251,53 @@ def test_parse_runtime_metrics_keeps_spec_decode_metrics():
     assert metrics.spec_decode.accepted_per_pos == {0: 3}
 
 
+def test_parse_runtime_metrics_reads_sglang_cache_source_counters():
+    metrics = serve.parse_runtime_metrics_text(
+        "\n".join([
+            'sglang:prompt_tokens_total{model_name="m"} 1000',
+            'sglang:cached_tokens_total{model_name="m",cache_source="device"} 100',
+            'sglang:cached_tokens_total{model_name="m",cache_source="host"} 50',
+            (
+                'sglang:cached_tokens_total{model_name="m",'
+                'cache_source="storage_mooncake"} 25'
+            ),
+        ])
+    )
+
+    assert metrics.cache_source is not None
+    assert metrics.cache_source.prompt_tokens == 1000
+    assert metrics.cache_source.cached_tokens_by_source == {
+        "device": 100,
+        "host": 50,
+        "storage_mooncake": 25,
+    }
+
+
+def test_cache_source_metrics_delta_calculates_hit_rate():
+    before = serve.CacheSourceMetrics(
+        prompt_tokens=1000,
+        cached_tokens_by_source={"device": 100, "host": 50},
+    )
+    after = serve.CacheSourceMetrics(
+        prompt_tokens=1600,
+        cached_tokens_by_source={
+            "device": 160,
+            "host": 95,
+            "storage_mooncake": 45,
+        },
+    )
+
+    stats = serve.calculate_cache_source_stats(before, after)
+
+    assert stats == {
+        "cache_hit_rate_metrics": 25.0,
+        "cache_hit_tokens_device": 60,
+        "cache_hit_tokens_host": 45,
+        "cache_hit_tokens_storage": 45,
+        "cache_hit_tokens_storage_mooncake": 45,
+    }
+
+
 def test_runtime_metrics_summary_aggregates_avg_and_peak():
     summary = serve.RuntimeMetricsSummary.from_samples([7.0, 11.0, 9.0])
 
