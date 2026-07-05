@@ -86,6 +86,7 @@ class TopologyProfile:
         default_factory=lambda: types.MappingProxyType({})
     )
     disaggregation_ib_device: str | None = None
+    mount_infiniband: bool = False
     vllm_pd: VllmPdConfig | None = None
     env: Mapping[str, str] = field(
         default_factory=lambda: types.MappingProxyType({})
@@ -440,6 +441,13 @@ class TopologyProfile:
             f"{config.mounts.models}:/models:ro",
         ])
         self._append_env_and_volumes(argv, node, extra_env=extra_env)
+        if self.mount_infiniband:
+            # 挂载 IB 设备 + 权限，UCX 才能用 rc_mlx5(RDMA) 传 KV，否则回退 tcp
+            argv.extend([
+                "--device", "/dev/infiniband",
+                "--cap-add", "IPC_LOCK",
+                "--ulimit", "memlock=-1:-1",
+            ])
         argv.extend([
             "--entrypoint",
             "vllm",
@@ -800,6 +808,7 @@ def parse_topology_profiles(
                 f"{path}.disaggregation_ib_device",
                 error,
             ),
+            mount_infiniband=bool(profile.get("mount_infiniband", False)),
             vllm_pd=vllm_pd,
             env=_string_mapping(profile.get("env"), f"{path}.env", error),
             volumes=_string_tuple(profile.get("volumes", []), f"{path}.volumes", error),

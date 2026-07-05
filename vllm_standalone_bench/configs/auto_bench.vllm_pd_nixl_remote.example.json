@@ -31,6 +31,7 @@
       "env": {
         "UCX_TLS": "rc,cuda_copy,tcp"
       },
+      "mount_infiniband": true,
       "hosts": {
         "p1": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
         "p2": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
@@ -146,6 +147,7 @@
       "env": {
         "UCX_TLS": "rc,cuda_copy,tcp"
       },
+      "mount_infiniband": true,
       "hosts": {
         "p1": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
         "p2": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
@@ -259,6 +261,7 @@
       "env": {
         "UCX_TLS": "rc,cuda_copy,tcp"
       },
+      "mount_infiniband": true,
       "hosts": {
         "p1": {"address": "10.200.1.13", "ssh_user": "aipaas_test", "auth": {"type": "key"}},
         "d1": {"address": "10.200.1.14", "ssh_user": "aipaas_test", "auth": {"type": "key"}},

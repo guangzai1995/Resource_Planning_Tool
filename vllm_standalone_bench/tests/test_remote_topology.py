@@ -348,6 +348,53 @@ def test_vllm_pd_nixl_commands_render_side_channel_env(tmp_path):
     }
 
 
+def test_vllm_pd_mount_infiniband_adds_ib_device_flags(tmp_path):
+    # mount_infiniband=true 时，PD worker 节点要挂 /dev/infiniband + IPC_LOCK + memlock，
+    # 否则 UCX 拿不到 verbs 设备、KV 迁移回退 tcp（实测 PD 性能被拖垮的根因）。
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "nixl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+    for i, node in enumerate(topology["prefill"] + topology["decode"]):
+        node["side_channel_port"] = 5600 + i
+    topology["mount_infiniband"] = True
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(
+        config, case, tmp_path / "results" / "run123"
+    )
+
+    worker_argv = list(commands["p1"].argv)
+    assert "--device" in worker_argv
+    assert worker_argv[worker_argv.index("--device") + 1] == "/dev/infiniband"
+    assert "IPC_LOCK" in worker_argv
+    assert "memlock=-1:-1" in worker_argv
+    # router 是 HTTP 代理，不挂 IB 设备
+    assert "--device" not in list(commands["router"].argv)
+
+
+def test_vllm_pd_mount_infiniband_default_off(tmp_path):
+    data = pd_topology_config(tmp_path)
+    topology = data["topology_profiles"][0]
+    topology["engine"] = "vllm"
+    topology["image"] = "vllm:pd"
+    topology["vllm_pd"] = {"connector": "nixl", "proxy": {"kind": "builtin"}}
+    topology["frontend"] = {"kind": "builtin", "host": "router", "port": 8000}
+    for i, node in enumerate(topology["prefill"] + topology["decode"]):
+        node["side_channel_port"] = 5600 + i
+
+    config = ab.load_config(write_config(tmp_path, data))
+    case = ab.expand_cases(config, run_id="run123")[0]
+    commands = case.topology_profile.build_commands(
+        config, case, tmp_path / "results" / "run123"
+    )
+
+    assert "--device" not in list(commands["p1"].argv)
+
+
 def test_vllm_pd_worker_command_renders_kv_template(tmp_path):
     data = pd_topology_config(tmp_path)
     topology = data["topology_profiles"][0]
