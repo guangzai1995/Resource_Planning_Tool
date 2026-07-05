@@ -53,7 +53,7 @@ AUTO_BENCH="${AUTO_BENCH:-${SCRIPT_DIR}/auto_bench.py}"
 # 默认 smoke 配置；可通过 CONFIG=/path/to/config.json 覆盖
 #CONFIG="${CONFIG:-${SCRIPT_DIR}/configs/auto_bench.vllm_pd_nixl_remote_minimax.json}"
 #CONFIG="${CONFIG:-${SCRIPT_DIR}/configs/auto_bench.minimx_compare.json}"
-CONFIG="${CONFIG:-${SCRIPT_DIR}/configs/auto_bench.sglang_pd_hicache_remote_minimax.json}"
+CONFIG="${CONFIG:-${SCRIPT_DIR}/configs/auto_bench.sglang_pd_hicache_remote_minimax_nobase.json}"
 
 # status/logs/stop 使用的结果目录；通常应与配置中的 run.results_dir 一致
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
