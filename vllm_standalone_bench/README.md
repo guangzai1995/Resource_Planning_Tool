@@ -2,6 +2,10 @@
 
 从 `vllm-main/vllm/benchmarks/serve.py` 提取核心指标计算逻辑，**无需安装 vllm 包**即可运行。
 
+![vLLM Standalone Bench 自动化测试工程架构](assets/automation_architecture.svg)
+
+自动化测试工程的架构、运行原理和扩展方式详见 [README_AUTOMATION.md](README_AUTOMATION.md)。
+
 ## 🚀 快速开始
 
 ```bash
