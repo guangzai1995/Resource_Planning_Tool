@@ -1,0 +1,3 @@
+{"prompt":"Say hello in one sentence.","case":"short","metadata":{"case":"short"}}
+{"prompt":"Summarize why latency percentiles matter for API benchmarking.","case":"medium","metadata":{"case":"medium"}}
+{"prompt":"List three signals that a service is overloaded.","case":"diagnostic","metadata":{"case":"diagnostic"}}

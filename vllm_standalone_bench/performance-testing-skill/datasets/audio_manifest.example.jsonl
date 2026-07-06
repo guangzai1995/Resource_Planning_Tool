@@ -1,0 +1,2 @@
+{"audio_path":"samples/hello.wav","prompt":"Transcribe the short greeting.","metadata":{"case":"short"}}
+{"audio_path":"samples/status.wav","prompt":"Transcribe the status update.","metadata":{"case":"status"}}

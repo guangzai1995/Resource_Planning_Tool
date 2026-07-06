@@ -1,0 +1,21 @@
+{
+  "run": {
+    "name": "openai-asr-smoke",
+    "requests": 2,
+    "concurrency": 1,
+    "warmup_requests": 0,
+    "request_timeout_sec": 60,
+    "output_dir": "reports/openai-asr-smoke"
+  },
+  "target": {
+    "type": "openai-asr",
+    "base_url": "http://127.0.0.1:8000",
+    "endpoint": "/v1/audio/transcriptions",
+    "model": "demo-asr-model",
+    "headers": {}
+  },
+  "dataset": {
+    "type": "audio_manifest",
+    "path": "datasets/audio_manifest.example.jsonl"
+  }
+}
