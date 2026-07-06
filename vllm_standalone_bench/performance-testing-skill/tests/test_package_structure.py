@@ -38,7 +38,7 @@ def test_skill_frontmatter_is_valid_and_actionable():
     assert content.startswith("---\n")
     assert "name: generic-performance-testing" in content
     assert "description: Use when" in content
-    assert "## Workflow" in content
+    assert "## 工作流程" in content
     assert "scripts/run_auto.sh" in content
 
 

@@ -1,36 +1,36 @@
 ---
 name: generic-performance-testing
-description: Use when Codex needs to create, run, or troubleshoot standalone HTTP/OpenAI-compatible performance tests, benchmark configs, latency/throughput summaries, or CSV/JSON/Markdown reports without depending on a project-specific benchmark framework.
+description: Use when Codex 需要创建、运行或排查独立的 HTTP/OpenAI 兼容性能测试、压测配置、延迟/吞吐摘要，或生成 CSV/JSON/Markdown 报告，且不能依赖项目专用 benchmark 框架。
 ---
 
-# Generic Performance Testing
+# 通用性能测试
 
-This skill packages a standalone performance testing workflow for HTTP APIs, OpenAI-compatible chat/completion endpoints, and lightweight ASR request planning. It does not import or require the parent benchmark project.
+这个 skill 提供一套独立的性能测试工作流，适用于 HTTP API、OpenAI 兼容的 Chat/Completion 接口，以及轻量级 ASR 请求规划。它不导入、不依赖父级 benchmark 项目，可以作为完整文件夹单独复制和运行。
 
-## Workflow
+## 工作流程
 
-1. Pick a config from `configs/` or copy one close to the target API.
-2. Put prompt or audio manifest samples in `datasets/`.
-3. Run `scripts/run_auto.sh --config configs/openai_chat.json --dry-run` to validate the generated requests before sending traffic.
-4. Run `scripts/run_auto.sh --config <config>` for a benchmark run.
-5. Use `scripts/run_manual.sh --url <url> --body '{"prompt":"hello"}'` for a single request smoke test.
-6. Inspect `reports/results.json`, `reports/results.csv`, and `reports/summary.md`, or pass `--output-dir` to write reports elsewhere.
+1. 从 `configs/` 选择一个接近目标 API 的配置，或复制后按需修改。
+2. 将文本 prompt 或音频 manifest 样本放入 `datasets/`。
+3. 先运行 `scripts/run_auto.sh --config configs/openai_chat.json --dry-run`，在真正发请求前检查生成的请求内容。
+4. 运行 `scripts/run_auto.sh --config <config>` 执行性能测试。
+5. 使用 `scripts/run_manual.sh --url <url> --body '{"prompt":"hello"}'` 做单请求冒烟验证。
+6. 查看 `reports/results.json`、`reports/results.csv` 和 `reports/summary.md`，也可以通过 `--output-dir` 指定其它输出目录。
 
-## Shell Usage
+## Shell 使用方式
 
-Automatic benchmark dry run:
+自动化性能测试 dry-run：
 
 ```bash
 scripts/run_auto.sh --config configs/openai_chat.json --dry-run --limit 3
 ```
 
-Automatic benchmark execution:
+自动化性能测试正式执行：
 
 ```bash
 scripts/run_auto.sh --config configs/generic_http.json --output-dir reports/generic-smoke
 ```
 
-Manual one-shot request:
+手动单请求测试：
 
 ```bash
 scripts/run_manual.sh \
@@ -39,31 +39,31 @@ scripts/run_manual.sh \
   --body '{"model":"demo","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Set `PYTHON_BIN=/path/to/python` when the wrapper should use a specific Python interpreter.
+如果 shell 包装脚本需要使用指定 Python 解释器，设置 `PYTHON_BIN=/path/to/python`。
 
-## Config Files
+## 配置文件
 
-Each config has three top-level sections:
+每个配置文件包含三个顶层字段：
 
-- `run`: benchmark name, request count, concurrency, warmup count, timeout, and output directory.
-- `target`: endpoint type, base URL, path, model name, headers, and optional generic body template.
-- `dataset`: JSONL path containing prompt or audio manifest samples.
+- `run`：测试名称、请求数、并发数、预热请求数、超时时间和输出目录。
+- `target`：接口类型、基础 URL、接口路径、模型名称、请求头，以及可选的通用请求体模板。
+- `dataset`：JSONL 数据集路径，内容可以是文本 prompt，也可以是音频 manifest 样本。
 
-Supported `target.type` values:
+支持的 `target.type`：
 
-- `openai-chat`: builds `/v1/chat/completions` style JSON bodies.
-- `openai-completion`: builds `/v1/completions` style JSON bodies.
-- `openai-asr`: builds JSON request plans for audio transcription endpoints; use dry-run first to verify file paths and payload shape.
-- `generic-http`: renders `body_template` values with sample fields such as `{prompt}`.
+- `openai-chat`：生成 `/v1/chat/completions` 风格的 JSON 请求体。
+- `openai-completion`：生成 `/v1/completions` 风格的 JSON 请求体。
+- `openai-asr`：为音频转写接口生成 JSON 请求计划；建议先用 dry-run 检查文件路径和 payload 结构。
+- `generic-http`：使用样本字段渲染 `body_template`，例如 `{prompt}`。
 
-Relative dataset paths are resolved from the package root, so the skill can be moved as a self-contained folder.
+相对数据集路径会从 skill 包根目录解析，因此整个目录可以作为自包含包移动。
 
-## Reports
+## 报告输出
 
-`scripts/perf_auto.py` writes:
+`scripts/perf_auto.py` 会写入：
 
-- `results.json`: complete summary and per-request records.
-- `results.csv`: per-request rows for spreadsheets.
-- `summary.md`: compact human-readable latency and throughput summary.
+- `results.json`：完整摘要和逐请求记录。
+- `results.csv`：适合导入表格工具的逐请求明细。
+- `summary.md`：便于阅读的延迟和吞吐摘要。
 
-The implementation uses only Python standard library modules.
+脚本实现仅使用 Python 标准库模块。
