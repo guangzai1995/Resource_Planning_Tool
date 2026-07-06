@@ -129,6 +129,130 @@ python3 vllm_standalone_bench/auto_bench.py resume \
 
 默认使用 Docker bridge network `vllm-bench-net`，不使用 `--network host`，也不暴露主机端口。控制器只会清理本次自动创建并带有本次运行标签或元数据的资源，包括 vLLM 容器和 Docker network；`stop` 会请求后台控制器优雅退出并执行这些清理。`stop` 不是容器暂停：中止后当前容器会被删除。需要继续同一 `run_id` 时，使用 `resume`，它会跳过 `manifest.json` 中已 `passed` 的 case，只补跑未成功或未记录的 case。
 
+### 使用 Shell 脚本运行
+
+`run_auto_bench.sh` 是对 `auto_bench.py` 的现场封装，适合在离线机器上反复启动、查看、恢复和清理任务。脚本会自动定位项目根目录，进入项目根目录后再执行 `auto_bench.py`。
+
+> 注意：脚本当前默认 `CONFIG` 指向 `configs/auto_bench.sglang_pd_hicache_remote_minimax_nobase.json`。正式运行前建议显式传入 `CONFIG`，避免误跑默认场景。
+
+```bash
+# 首次使用前确认脚本可执行
+chmod +x vllm_standalone_bench/run_auto_bench.sh
+
+# 只检查配置解析和将要执行的 Docker / SSH Docker 命令，不启动容器
+CONFIG=vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json \
+RUN_ID=qwen_smoke_dry_run \
+DRY_RUN=true \
+./vllm_standalone_bench/run_auto_bench.sh
+
+# 前台运行，适合首次调试
+CONFIG=vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json \
+RUN_ID=qwen_smoke_001 \
+DETACH=false \
+./vllm_standalone_bench/run_auto_bench.sh
+
+# 后台运行，适合长时间压测
+CONFIG=vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json \
+RUN_ID=qwen_smoke_001 \
+./vllm_standalone_bench/run_auto_bench.sh
+```
+
+后台任务控制命令都需要同一个 `RUN_ID`。如果配置中修改了 `run.results_dir`，控制命令也要同步设置 `RESULTS_DIR`，否则脚本会去默认的 `vllm_standalone_bench/results` 查找状态。
+
+```bash
+# 查看状态
+RUN_ID=qwen_smoke_001 ./vllm_standalone_bench/run_auto_bench.sh status
+
+# 查看当前 case 日志；FOLLOW=true 会持续跟随日志
+RUN_ID=qwen_smoke_001 FOLLOW=true ./vllm_standalone_bench/run_auto_bench.sh logs
+
+# 请求后台控制器优雅停止，并清理本次运行拥有的资源
+RUN_ID=qwen_smoke_001 ./vllm_standalone_bench/run_auto_bench.sh stop
+
+# 从 manifest.json 中跳过 passed case，只补跑未成功的 case
+RUN_ID=qwen_smoke_001 ./vllm_standalone_bench/run_auto_bench.sh resume
+
+# 重新执行后处理汇总；适合已有 case 结果但需要补生成汇总文件的场景
+CONFIG=vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json \
+RUN_ID=qwen_smoke_001 \
+./vllm_standalone_bench/run_auto_bench.sh postprocess
+
+# 按 run label 清理残留资源
+RUN_ID=qwen_smoke_001 ./vllm_standalone_bench/run_auto_bench.sh cleanup
+```
+
+常用环境变量如下：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `CONFIG` | 脚本内当前默认配置 | `run` / `postprocess` 使用的自动压测 JSON 配置。建议正式运行时显式指定。 |
+| `RUN_ID` | 空，由 `auto_bench.py` 自动生成 | 指定运行 ID。后台控制、恢复、清理时必须使用同一个值。 |
+| `DETACH` | `true` | `run` / `resume` 是否后台运行。设为 `false` 可前台查看日志。 |
+| `DRY_RUN` | `false` | 设为 `true` 时只打印命令并写入 resolved config preview，不启动容器。 |
+| `RESULTS_DIR` | `vllm_standalone_bench/results` | `status` / `logs` / `stop` / `resume` / `cleanup` 查找运行状态的结果目录。 |
+| `PYTHON_BIN` | `/aipaas_test/miniconda3/bin/python3` | 主机 Python 路径。环境不一致时需要覆盖。 |
+| `PROJECT_ROOT` | `vllm_standalone_bench/..` | 项目根目录。通常不需要覆盖。 |
+| `FOLLOW` | `false` | 仅 `logs` 子命令使用，设为 `true` 后持续跟随日志。 |
+
+SGLang PD + HiCache（Mooncake）配置如果包含 `MOONCAKE_*` 环境变量或 `sglang_hicache.storage_backend: "mooncake"`，脚本的 `run` 子命令会尝试在控制机本地自动启动 `mooncake_master`。也可以手动控制：
+
+```bash
+./vllm_standalone_bench/run_auto_bench.sh mooncake start
+./vllm_standalone_bench/run_auto_bench.sh mooncake status
+./vllm_standalone_bench/run_auto_bench.sh mooncake stop
+./vllm_standalone_bench/run_auto_bench.sh mooncake restart
+```
+
+### 配置文件使用说明
+
+自动化压测配置集中放在 `vllm_standalone_bench/configs/`。建议从最接近目标场景的示例复制一份新文件，再修改模型路径、镜像、主机地址和压测矩阵。
+
+| 配置文件 | 适用场景 |
+|---|---|
+| `auto_bench.qwen2_5_1_5b.smoke.json` | 本地 Docker smoke 验证，适合检查环境和控制器链路。 |
+| `auto_bench.qwen3_asr_1_7b.smoke.json` | OpenAI Audio transcription / ASR 冒烟压测。 |
+| `auto_bench.qwen2_5_1_5b.sglang_compare.json` | 本地 vLLM / SGLang 同台对比。 |
+| `auto_bench.vllm_pd_p2p_remote.example.json` | 远程 vLLM PD P2P/NCCL 示例。 |
+| `auto_bench.vllm_pd_nixl_remote.example.json` | 远程 vLLM PD NIXL 示例。 |
+| `auto_bench.sglang_pd_remote.example.json` | 远程 SGLang PD 基础示例。 |
+| `auto_bench.sglang_pd_hicache_remote.example.json` | 远程 SGLang PD + HiCache 示例。 |
+| `auto_bench.sglang_pd_hicache_remote_minimax*.json` | MiniMax-M2.7 现场压测配置，需要按实际机器和模型路径确认。 |
+
+核心配置段如下：
+
+| 配置段 | 说明 |
+|---|---|
+| `run` | 运行名、结果目录、镜像、Docker network、端口、API key、ready timeout、cooldown 和资源监控。 |
+| `mounts` | 宿主机模型目录和可选数据集目录。容器内模型统一映射到 `/models`，数据集可映射到 `/datasets`。 |
+| `models` | 模型名称、容器内 `model_path`、`tokenizer_path` 和 OpenAI API 中使用的 `served_model_name`。 |
+| `serve_profiles` | 单容器服务配置，适用于本地 vLLM / SGLang。`args` 会原样透传给推理服务启动命令。 |
+| `topology_profiles` | 多节点 PD 拓扑配置，描述远程 hosts、prefill、decode、frontend、KV 传输和 HiCache 参数。 |
+| `bench_profiles` | 压测矩阵，描述 backend、输入/输出长度、并发、epoch、warmup、prefix ratio、SLO 和数据集。 |
+
+修改配置时重点检查这些字段：
+
+- `run.bench_image`：必须是已导入的 bench-runner 镜像，例如 `vllm-bench-runner:offline`。
+- `run.vllm_image` 或 `run.images`：本地或远程推理引擎镜像必须已存在。
+- `run.results_dir`：建议保持在 `vllm_standalone_bench/results` 下，便于脚本默认控制命令查找。
+- `mounts.models`：宿主机模型根目录；`models[].model_path` 是容器内路径，通常以 `/models/` 开头。
+- `models[].served_model_name`：必须和 benchmark 请求中的模型名一致。
+- `serve_profiles[].args`：直接透传给 vLLM / SGLang，不做参数翻译。
+- `topology_profiles[].hosts`：远程模式必须把 host 地址、SSH 用户和 auth 配好。
+- `topology_profiles[].prefill/decode/frontend`：端口和 GPU 分配不能冲突。
+- `bench_profiles[].backend`：支持 `openai`、`openai-chat` 和 `openai-audio`。
+- `bench_profiles[].cross_product`：为 `false` 时按列表位置配对长度；为 `true` 时展开笛卡尔积。
+
+推荐先执行 dry-run，再启动真实压测：
+
+```bash
+CONFIG=vllm_standalone_bench/configs/auto_bench.qwen2_5_1_5b.smoke.json \
+RUN_ID=config_check_001 \
+DRY_RUN=true \
+./vllm_standalone_bench/run_auto_bench.sh
+```
+
+dry-run 会生成 `results/<run_id>/config.resolved.json`，用于确认路径解析、镜像选择、case 展开和命令渲染是否符合预期。确认无误后，把 `DRY_RUN=true` 去掉即可真实运行。
+
 ### 资源监控
 
 `auto_bench.py` 默认在每个 benchmark case 期间采集宿主机全局资源：CPU、内存、网络 IO、磁盘 IO，以及可用时的 NVIDIA GPU 指标。GPU 采集使用宿主机 `nvidia-smi`，不要求 bench-runner 镜像安装监控依赖。
