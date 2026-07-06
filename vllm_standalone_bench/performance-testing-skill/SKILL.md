@@ -1,6 +1,6 @@
 ---
 name: generic-performance-testing
-description: Use when Codex 需要创建、运行或排查独立的 HTTP/OpenAI 兼容性能测试、压测配置、延迟/吞吐摘要，或生成 CSV/JSON/Markdown 报告，且不能依赖项目专用 benchmark 框架。
+description: 需要创建、运行或排查独立的 HTTP/OpenAI 兼容性能测试、压测配置、延迟/吞吐摘要，或生成 CSV/JSON/Markdown 报告，且不能依赖项目专用 benchmark 框架。
 ---
 
 # 通用性能测试
@@ -9,12 +9,13 @@ description: Use when Codex 需要创建、运行或排查独立的 HTTP/OpenAI 
 
 ## 工作流程
 
-1. 从 `configs/` 选择一个接近目标 API 的配置，或复制后按需修改。
-2. 将文本 prompt 或音频 manifest 样本放入 `datasets/`。
-3. 先运行 `scripts/run_auto.sh --config configs/openai_chat.json --dry-run`，在真正发请求前检查生成的请求内容。
-4. 运行 `scripts/run_auto.sh --config <config>` 执行性能测试。
-5. 使用 `scripts/run_manual.sh --url <url> --body '{"prompt":"hello"}'` 做单请求冒烟验证。
-6. 查看 `reports/results.json`、`reports/results.csv` 和 `reports/summary.md`，也可以通过 `--output-dir` 指定其它输出目录。
+1. **运行前确认需求**：先和用户确认测试目标、接口类型、`base_url`、`model`、认证方式、数据集、`requests`、`concurrency`、是否只做 dry-run、输出目录和风险边界。
+2. 在用户确认后，从 `configs/` 选择一个接近目标 API 的配置，或复制后按需修改。配置细节参考 `references/config-guide.md`。
+3. 将文本 prompt 或音频 manifest 样本放入 `datasets/`。
+4. 先运行 `scripts/run_auto.sh --config configs/openai_chat.json --dry-run`，在真正发请求前检查生成的请求内容。
+5. 用户确认 dry-run 结果后，再运行 `scripts/run_auto.sh --config <config>` 执行性能测试。
+6. 使用 `scripts/run_manual.sh --url <url> --body '{"prompt":"hello"}'` 做单请求冒烟验证。
+7. 查看 `reports/results.json`、`reports/results.csv` 和 `reports/summary.md`，也可以通过 `--output-dir` 指定其它输出目录。
 
 ## Shell 使用方式
 
@@ -42,6 +43,8 @@ scripts/run_manual.sh \
 如果 shell 包装脚本需要使用指定 Python 解释器，设置 `PYTHON_BIN=/path/to/python`。
 
 ## 配置文件
+
+更完整的配置说明、字段含义、示例选择和运行前确认清单见 `references/config-guide.md`。
 
 每个配置文件包含三个顶层字段：
 
