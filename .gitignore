@@ -115,3 +115,9 @@ sglang-main/
 vllm_standalone_bench/results/*/
 *.tar
 *.pid
+
+# ── vllm_standalone_bench 已迁移为独立仓库（提升至 project 同级）──
+# 路径：/ai_paas_jf/sunlg/project/vllm_standalone_bench
+# 远端：git@code.tiancloud.com:LLM-v1.0.0/JiuSi-v1.0.0/vllm_standalone_bench.git (dev)
+# 父仓库（Resource_Planning_Tool）不再跟踪其内容。
+vllm_standalone_bench/
