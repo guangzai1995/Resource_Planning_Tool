@@ -23,6 +23,7 @@ def test_skill_package_layout():
         "configs/generic_http.json",
         "datasets/text_prompts.example.jsonl",
         "datasets/audio_manifest.example.jsonl",
+        "references/config-guide.md",
         "reports/.gitkeep",
     ]
 
@@ -37,9 +38,41 @@ def test_skill_frontmatter_is_valid_and_actionable():
 
     assert content.startswith("---\n")
     assert "name: generic-performance-testing" in content
-    assert "description: Use when" in content
+    assert "description: 需要创建" in content
     assert "## 工作流程" in content
+    assert "运行前确认需求" in content
+    assert "references/config-guide.md" in content
     assert "scripts/run_auto.sh" in content
+
+
+def test_config_guide_documents_required_setup_and_confirmation_flow():
+    guide = (PACKAGE_ROOT / "references/config-guide.md").read_text(encoding="utf-8")
+
+    required_sections = [
+        "# 配置文件辅助指南",
+        "## 运行前需求确认清单",
+        "## 配置文件选择",
+        "## 顶层字段说明",
+        "## target.type 配置差异",
+        "## 推荐运行流程",
+    ]
+    for section in required_sections:
+        assert section in guide
+
+    required_terms = [
+        "测试目标",
+        "接口类型",
+        "base_url",
+        "model",
+        "认证",
+        "数据集",
+        "requests",
+        "concurrency",
+        "dry-run",
+        "用户确认后",
+    ]
+    for term in required_terms:
+        assert term in guide
 
 
 def test_package_does_not_depend_on_parent_benchmark_project():
